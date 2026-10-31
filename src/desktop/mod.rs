@@ -25,6 +25,14 @@ const DESTROYED: u32 = WM_APP + 2;
 const OPEN: u32 = WM_APP + 3;
 const LAUNCHED: u32 = WM_APP + 4;
 const TIMER: usize = 1;
+fn hotkey_modifiers(key: &Hotkey, command: Command) -> u32 {
+    key.modifiers
+        | if matches!(command, Command::Opacity(_)) {
+            0
+        } else {
+            MOD_NOREPEAT
+        }
+}
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
@@ -338,6 +346,9 @@ impl App {
             alpha = 255;
         }
         let next = value.unwrap_or_else(|| opacity_step(alpha, direction, self.config.step));
+        if next == alpha {
+            return Ok(());
+        }
         if self.records[i].alpha.is_none() {
             self.records[i].alpha = Some(Alpha {
                 layered,
@@ -472,17 +483,28 @@ impl App {
         c.validate()?;
         let desired = c.bindings();
         let mut added = vec![];
-        for (key, cmd) in &desired {
-            if !self.keys.values().any(|(k, _)| k == key) {
+        let mut changed = vec![];
+        let result = (|| -> Result<(), String> {
+            for (key, cmd) in &desired {
+                let modifiers = hotkey_modifiers(key, *cmd);
+                if let Some((&id, (_, old_cmd))) = self.keys.iter().find(|(_, (k, _))| k == key) {
+                    let old_modifiers = hotkey_modifiers(key, *old_cmd);
+                    if modifiers != old_modifiers {
+                        // Reassigning the same combination can change repeat behavior.
+                        // Windows requires unregistering before replacing an existing ID.
+                        if UnregisterHotKey(self.host, id) == 0 {
+                            return Err("无法更新快捷键的长按设置".into());
+                        }
+                        changed.push((id, key.clone(), old_modifiers));
+                        if RegisterHotKey(self.host, id, modifiers, key.key) == 0 {
+                            return Err("无法更新快捷键的长按设置".into());
+                        }
+                    }
+                    continue;
+                }
                 self.next_id += 1;
                 let id = self.next_id;
-                if id > 0xbfff
-                    || RegisterHotKey(self.host, id, key.modifiers | MOD_NOREPEAT, key.key) == 0
-                {
-                    for id in added {
-                        UnregisterHotKey(self.host, id);
-                        self.keys.remove(&id);
-                    }
+                if id > 0xbfff || RegisterHotKey(self.host, id, modifiers, key.key) == 0 {
                     return Err(format!(
                         "快捷键注册失败：修饰键 {}，键码 {}",
                         key.modifiers, key.key
@@ -491,15 +513,24 @@ impl App {
                 self.keys.insert(id, (key.clone(), *cmd));
                 added.push(id);
             }
-        }
-        if save {
-            if let Err(e) = atomic_json(&self.dir.join("config.json"), c) {
-                for id in added {
-                    UnregisterHotKey(self.host, id);
-                    self.keys.remove(&id);
-                }
-                return Err(e.to_string());
+            if save {
+                atomic_json(&self.dir.join("config.json"), c).map_err(|e| e.to_string())?;
             }
+            Ok(())
+        })();
+        if let Err(mut e) = result {
+            for id in added {
+                UnregisterHotKey(self.host, id);
+                self.keys.remove(&id);
+            }
+            for (id, key, modifiers) in changed.into_iter().rev() {
+                UnregisterHotKey(self.host, id);
+                if RegisterHotKey(self.host, id, modifiers, key.key) == 0 {
+                    self.keys.remove(&id);
+                    e.push_str("；旧快捷键恢复失败，请关闭占用它的程序后重新保存设置");
+                }
+            }
+            return Err(e);
         }
         let obsolete: Vec<_> = self
             .keys
