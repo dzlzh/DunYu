@@ -1,4 +1,28 @@
 use super::*;
+use windows_sys::Win32::System::SystemServices::SS_PATHELLIPSIS;
+use windows_sys::Win32::UI::Controls::Dialogs::*;
+use windows_sys::Win32::UI::Controls::*;
+
+unsafe fn item(window: HWND, id: i32) -> HWND {
+    let direct = GetDlgItem(window, id);
+    if !direct.is_null() {
+        direct
+    } else {
+        GetDlgItem(GetDlgItem(window, 9000), id)
+    }
+}
+
+pub(super) unsafe extern "system" fn content_proc(
+    h: HWND,
+    m: u32,
+    w: WPARAM,
+    l: LPARAM,
+) -> LRESULT {
+    match m {
+        WM_COMMAND | WM_HSCROLL | WM_VSCROLL | WM_MOUSEWHEEL => SendMessageW(GetParent(h), m, w, l),
+        _ => DefWindowProcW(h, m, w, l),
+    }
+}
 
 fn is_hotkey_field(id: i32) -> bool {
     matches!(id, 207 | 300..=307 | 500..=503)
@@ -10,7 +34,7 @@ pub(super) unsafe fn capture_hotkey(window: HWND, msg: &MSG) -> bool {
     let field = GetFocus();
     if GetForegroundWindow() != window
         || field.is_null()
-        || GetParent(field) != window
+        || GetAncestor(field, GA_ROOT) != window
         || IsWindowVisible(field) == 0
         || !is_hotkey_field(GetDlgCtrlID(field))
     {
@@ -127,20 +151,20 @@ pub(super) fn parse_key(s: &str) -> Result<Hotkey, String> {
     Ok(Hotkey::new(mods, key.ok_or("缺少主键")?))
 }
 pub(super) unsafe fn text_at(h: HWND, id: i32) -> String {
-    let e = GetDlgItem(h, id);
+    let e = item(h, id);
     let n = GetWindowTextLengthW(e);
     let mut b = vec![0; n as usize + 1];
     GetWindowTextW(e, b.as_mut_ptr(), b.len() as i32);
     String::from_utf16_lossy(&b[..n as usize])
 }
 pub(super) unsafe fn set_text(h: HWND, id: i32, s: &str) {
-    SetWindowTextW(GetDlgItem(h, id), wide(s).as_ptr());
+    SetWindowTextW(item(h, id), wide(s).as_ptr());
 }
 pub(super) unsafe fn checked(h: HWND, id: i32) -> bool {
-    SendMessageW(GetDlgItem(h, id), BM_GETCHECK, 0, 0) == 1
+    SendMessageW(item(h, id), BM_GETCHECK, 0, 0) == 1
 }
 pub(super) unsafe fn check(h: HWND, id: i32, on: bool) {
-    SendMessageW(GetDlgItem(h, id), BM_SETCHECK, usize::from(on), 0);
+    SendMessageW(item(h, id), BM_SETCHECK, usize::from(on), 0);
 }
 pub(super) unsafe fn control(
     u: &mut Ui,
@@ -154,6 +178,15 @@ pub(super) unsafe fn control(
     h: i32,
     style: u32,
 ) -> HWND {
+    let x = if page == 3 {
+        match x {
+            244 | 245 => 20,
+            380 => 200,
+            _ => x,
+        }
+    } else {
+        x
+    };
     let style = if kind == "EDIT" && is_hotkey_field(id) {
         style | ES_READONLY as u32
     } else {
@@ -168,13 +201,18 @@ pub(super) unsafe fn control(
         y,
         w,
         h,
-        u.window,
+        if page == 99 || matches!(id, 113 | 330 | 506) {
+            u.window
+        } else {
+            u.content
+        },
         id as HMENU,
         GetModuleHandleW(null()),
         null(),
     );
     SendMessageW(c, WM_SETFONT, GetStockObject(DEFAULT_GUI_FONT) as usize, 1);
     u.controls.push((page, c));
+    u.rects.push((x, y, w, h));
     c
 }
 pub(super) unsafe fn field(u: &mut Ui, page: usize, label: &str, id: i32, y: i32, value: &str) {
@@ -197,27 +235,53 @@ impl App {
         if let Some(u) = &self.ui {
             ShowWindow(u.window, SW_SHOW);
             SetForegroundWindow(u.window);
+            self.refresh_state();
             return;
         }
         let target = GetForegroundWindow();
         let h = CreateWindowExW(
-            0,
+            WS_EX_CONTROLPARENT,
             wide("DunYu.Settings.1").as_ptr(),
-            wide("遁鱼 DunYu · 摸鱼有道，隐现自如").as_ptr(),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+            wide("遁鱼 DunYu").as_ptr(),
+            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            800,
-            660,
+            920,
+            640,
             null_mut(),
             null_mut(),
             GetModuleHandleW(null()),
             null(),
         );
+        if h.is_null() {
+            error("无法创建设置窗口");
+            return;
+        }
+        let content = CreateWindowExW(
+            WS_EX_CONTROLPARENT,
+            wide("DunYu.Content.1").as_ptr(),
+            wide("").as_ptr(),
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_CLIPCHILDREN,
+            0,
+            50,
+            900,
+            500,
+            h,
+            9000 as HMENU,
+            GetModuleHandleW(null()),
+            null(),
+        );
+        if content.is_null() {
+            DestroyWindow(h);
+            error("无法创建设置内容区域");
+            return;
+        }
         let mut u = Ui {
             window: h,
+            content,
             page: 0,
             controls: vec![],
+            rects: vec![],
             list: null_mut(),
             selected: None,
             target: self
@@ -227,45 +291,110 @@ impl App {
             opacity: null_mut(),
             dpi: 96,
             font: null_mut(),
+            heading_font: null_mut(),
+            pending_opacity: None,
+            advanced: false,
+            scroll: 0,
+            baseline: vec![],
         };
-        for (i, label) in ["召唤", "绑定", "隐现", "设置"].iter().enumerate() {
-            control(
-                &mut u,
-                99,
-                "BUTTON",
-                label,
-                10 + i as i32,
-                15 + i as i32 * 190,
-                12,
-                180,
-                32,
-                WS_TABSTOP,
-            );
+        let tab = control(
+            &mut u,
+            99,
+            "SysTabControl32",
+            "",
+            9,
+            20,
+            12,
+            860,
+            32,
+            WS_TABSTOP,
+        );
+        SetWindowPos(
+            tab,
+            HWND_TOP,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+        for (i, name) in ["召唤", "绑定", "隐现", "设置"].iter().enumerate() {
+            let mut label = wide(name);
+            let mut entry: TCITEMW = std::mem::zeroed();
+            entry.mask = TCIF_TEXT;
+            entry.pszText = label.as_mut_ptr();
+            SendMessageW(tab, TCM_INSERTITEMW, i, &entry as *const _ as isize);
         }
+        control(
+            &mut u,
+            99,
+            "STATIC",
+            "就绪 · 关闭窗口后继续在托盘运行",
+            9001,
+            20,
+            560,
+            620,
+            30,
+            0,
+        );
         u.list = control(
             &mut u,
             0,
             "LISTBOX",
             "",
             100,
-            15,
-            60,
-            210,
-            420,
+            20,
+            52,
+            200,
+            310,
             WS_BORDER | WS_VSCROLL | LBS_NOTIFY as u32 | WS_TABSTOP,
         );
-        for (id, label, y) in [(110, "新建规则", 490), (111, "删除规则", 530)] {
-            control(&mut u, 0, "BUTTON", label, id, 15, y, 210, 30, WS_TABSTOP);
-        }
+        control(&mut u, 0, "STATIC", "程序召唤", 0, 20, 12, 200, 28, 0);
+        control(
+            &mut u,
+            0,
+            "STATIC",
+            "暂无规则：选择程序并录入快捷键后保存。",
+            114,
+            244,
+            12,
+            620,
+            28,
+            0,
+        );
+        control(
+            &mut u,
+            0,
+            "BUTTON",
+            "新建规则",
+            110,
+            20,
+            378,
+            95,
+            32,
+            WS_TABSTOP,
+        );
+        control(
+            &mut u,
+            0,
+            "BUTTON",
+            "删除规则",
+            111,
+            125,
+            378,
+            95,
+            32,
+            WS_TABSTOP,
+        );
         for (id, label, y) in [
-            (200, "名称", 60),
-            (201, "启动路径 (.exe/.lnk)", 98),
-            (202, "启动参数", 136),
-            (203, "工作目录", 174),
-            (204, "匹配进程完整路径", 212),
-            (205, "窗口类名（可空）", 250),
-            (206, "标题包含（可空）", 288),
-            (207, "快捷键（按键）", 326),
+            (200, "名称", 52),
+            (201, "程序路径", 96),
+            (207, "快捷键", 140),
+            (202, "启动参数", 280),
+            (203, "工作目录", 324),
+            (204, "匹配进程路径", 368),
+            (205, "窗口类名", 412),
+            (206, "标题包含", 456),
         ] {
             field(&mut u, 0, label, id, y, "");
         }
@@ -273,13 +402,37 @@ impl App {
             &mut u,
             0,
             "BUTTON",
-            "启用",
+            "浏览…",
+            115,
+            766,
+            96,
+            90,
+            28,
+            WS_TABSTOP,
+        );
+        control(
+            &mut u,
+            0,
+            "BUTTON",
+            "启用规则",
             208,
-            245,
-            370,
-            130,
+            244,
+            184,
+            180,
             28,
             BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
+        );
+        control(
+            &mut u,
+            0,
+            "BUTTON",
+            "高级选项 ▸",
+            116,
+            244,
+            228,
+            180,
+            32,
+            WS_TABSTOP,
         );
         control(
             &mut u,
@@ -287,9 +440,9 @@ impl App {
             "BUTTON",
             "最小化代替隐藏",
             209,
-            390,
-            370,
-            250,
+            244,
+            500,
+            260,
             28,
             BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
         );
@@ -297,23 +450,11 @@ impl App {
             &mut u,
             0,
             "BUTTON",
-            "捕获窗口信息（3秒后）",
+            "捕获窗口信息（3秒）",
             112,
-            245,
-            415,
-            250,
-            32,
-            WS_TABSTOP,
-        );
-        control(
-            &mut u,
-            0,
-            "BUTTON",
-            "保存规则",
-            113,
-            520,
-            415,
-            230,
+            440,
+            228,
+            260,
             32,
             WS_TABSTOP,
         );
@@ -321,16 +462,44 @@ impl App {
             &mut u,
             0,
             "STATIC",
-            "启动路径请填写完整路径。快捷方式需匹配实际程序路径。\n点击快捷键框后按组合键，如 Ctrl+Alt+A，再保存。",
-            0,
-            245,
-            465,
-            510,
-            60,
+            "点击捕获后切换到目标窗口。快捷键框直接接收组合键。",
+            117,
+            244,
+            544,
+            620,
+            28,
             0,
         );
+        control(
+            &mut u,
+            0,
+            "BUTTON",
+            "保存规则",
+            113,
+            700,
+            560,
+            180,
+            32,
+            WS_TABSTOP | BS_DEFPUSHBUTTON as u32,
+        );
+        control(
+            &mut u,
+            1,
+            "STATIC",
+            "窗口绑定 · 仅在当前会话有效",
+            0,
+            20,
+            12,
+            800,
+            28,
+            0,
+        );
+        for (label, x) in [("槽位", 20), ("绑定快捷键", 130), ("显示／隐藏快捷键", 370)]
+        {
+            control(&mut u, 1, "STATIC", label, 0, x, 52, 220, 24, 0);
+        }
         for i in 0..4 {
-            let y = 80 + i * 100;
+            let y = 88 + i * 94;
             control(
                 &mut u,
                 1,
@@ -340,57 +509,37 @@ impl App {
                 20,
                 y,
                 100,
-                25,
+                28,
                 0,
             );
-            control(
-                &mut u,
-                1,
-                "EDIT",
-                &hotkey_text(
-                    &self
-                        .config
-                        .slots
-                        .get(i as usize)
-                        .map(|s| s.bind.clone())
-                        .unwrap_or(Hotkey::new(7, 49 + i as u32)),
-                ),
-                300 + i * 2,
-                130,
-                y,
-                220,
-                28,
-                WS_TABSTOP,
-            );
-            control(
-                &mut u,
-                1,
-                "EDIT",
-                &hotkey_text(
-                    &self
-                        .config
-                        .slots
-                        .get(i as usize)
-                        .map(|s| s.toggle.clone())
-                        .unwrap_or(Hotkey::new(3, 49 + i as u32)),
-                ),
-                301 + i * 2,
-                370,
-                y,
-                220,
-                28,
-                WS_TABSTOP,
-            );
+            let slot = &self.config.slots[i as usize];
+            for (id, x, key) in [
+                (300 + i * 2, 130, &slot.bind),
+                (301 + i * 2, 370, &slot.toggle),
+            ] {
+                control(
+                    &mut u,
+                    1,
+                    "EDIT",
+                    &hotkey_text(key),
+                    id,
+                    x,
+                    y,
+                    220,
+                    30,
+                    WS_TABSTOP,
+                );
+            }
             control(
                 &mut u,
                 1,
                 "BUTTON",
                 "3秒后绑定",
                 320 + i,
-                610,
+                620,
                 y,
-                140,
-                28,
+                220,
+                32,
                 WS_TABSTOP,
             );
             control(
@@ -400,33 +549,46 @@ impl App {
                 "尚未绑定",
                 340 + i,
                 130,
-                y + 35,
-                610,
-                25,
-                0,
+                y + 38,
+                710,
+                28,
+                SS_PATHELLIPSIS,
             );
         }
-        control(
-            &mut u,
-            1,
-            "STATIC",
-            "左侧为绑定快捷键，右侧为显示／隐藏快捷键；点击框后直接按组合键。",
-            0,
-            20,
-            50,
-            740,
-            24,
-            0,
-        );
         control(
             &mut u,
             1,
             "BUTTON",
             "保存槽位快捷键",
             330,
+            700,
+            560,
+            180,
+            32,
+            WS_TABSTOP,
+        );
+        control(&mut u, 2, "STATIC", "窗口不透明度", 0, 20, 12, 800, 28, 0);
+        control(
+            &mut u,
+            2,
+            "STATIC",
+            "尚未选择窗口",
+            400,
             20,
-            510,
-            220,
+            60,
+            820,
+            30,
+            SS_PATHELLIPSIS,
+        );
+        control(
+            &mut u,
+            2,
+            "BUTTON",
+            "捕获窗口（3秒后）",
+            401,
+            20,
+            108,
+            260,
             32,
             WS_TABSTOP,
         );
@@ -434,11 +596,11 @@ impl App {
             &mut u,
             2,
             "STATIC",
-            "选择目标后调整不透明度（10%～100%），增减热键支持长按连调",
+            "点击后切换到需要调整的窗口",
             0,
-            25,
-            70,
-            700,
+            300,
+            112,
+            500,
             28,
             0,
         );
@@ -446,25 +608,13 @@ impl App {
             &mut u,
             2,
             "STATIC",
-            &title(target),
-            400,
-            25,
-            115,
-            700,
-            30,
-            0,
-        );
-        control(
-            &mut u,
-            2,
-            "BUTTON",
-            "3秒后捕获当前窗口",
-            401,
-            25,
-            165,
-            300,
+            "当前不透明度：—",
+            405,
+            20,
+            172,
+            800,
             32,
-            WS_TABSTOP,
+            0,
         );
         u.opacity = control(
             &mut u,
@@ -472,22 +622,45 @@ impl App {
             "msctls_trackbar32",
             "",
             402,
-            25,
-            230,
-            710,
-            55,
+            20,
+            220,
+            820,
+            48,
             WS_TABSTOP,
         );
-        SendMessageW(u.opacity, WM_USER + 6, 1, (100 << 16) | 10);
-        SendMessageW(u.opacity, WM_USER + 5, 1, 100);
+        SendMessageW(u.opacity, TBM_SETRANGE, 1, (100 << 16) | 10);
+        control(
+            &mut u,
+            2,
+            "STATIC",
+            "10%（更透明）",
+            406,
+            20,
+            280,
+            820,
+            28,
+            0,
+        );
+        control(
+            &mut u,
+            2,
+            "STATIC",
+            "100%（完全不透明）",
+            407,
+            620,
+            280,
+            220,
+            28,
+            0,
+        );
         control(
             &mut u,
             2,
             "BUTTON",
-            "恢复为 100%",
+            "当前窗口恢复 100%",
             403,
-            25,
-            310,
+            20,
+            340,
             300,
             32,
             WS_TABSTOP,
@@ -498,32 +671,45 @@ impl App {
             "BUTTON",
             "恢复全部窗口与透明度",
             404,
-            350,
-            310,
-            385,
+            20,
+            410,
+            300,
             32,
             WS_TABSTOP,
         );
+        control(
+            &mut u,
+            2,
+            "STATIC",
+            "增减快捷键支持长按连续调整；步长可在设置页修改。",
+            0,
+            20,
+            466,
+            820,
+            28,
+            0,
+        );
+        control(&mut u, 3, "STATIC", "全局快捷键", 0, 244, 12, 600, 28, 0);
         for (id, label, y, value) in [
             (
                 500,
                 "降低不透明度",
-                80,
+                60,
                 hotkey_text(&self.config.opacity_down),
             ),
             (
                 501,
                 "提高不透明度",
-                130,
+                104,
                 hotkey_text(&self.config.opacity_up),
             ),
             (
                 502,
                 "恢复 100%",
-                180,
+                148,
                 hotkey_text(&self.config.opacity_reset),
             ),
-            (503, "恢复全部", 230, hotkey_text(&self.config.restore_all)),
+            (503, "恢复全部", 192, hotkey_text(&self.config.restore_all)),
             (504, "步长（1～50）", 280, self.config.step.to_string()),
         ] {
             field(&mut u, 3, label, id, y, &value);
@@ -531,12 +717,36 @@ impl App {
         control(
             &mut u,
             3,
+            "STATIC",
+            "调整步长 · 每次改变的不透明度百分点",
+            0,
+            244,
+            240,
+            600,
+            28,
+            0,
+        );
+        control(
+            &mut u,
+            3,
+            "STATIC",
+            "启动与后台运行",
+            0,
+            244,
+            340,
+            600,
+            28,
+            0,
+        );
+        control(
+            &mut u,
+            3,
             "BUTTON",
             "登录后自动启动",
             505,
-            245,
-            335,
-            400,
+            244,
+            384,
+            500,
             30,
             BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
         );
@@ -544,98 +754,334 @@ impl App {
         control(
             &mut u,
             3,
-            "BUTTON",
-            "保存设置",
-            506,
-            245,
-            390,
-            500,
-            32,
-            WS_TABSTOP,
+            "STATIC",
+            "点击快捷键框后按组合键，Tab 离开。修改后需要保存。",
+            0,
+            244,
+            440,
+            610,
+            48,
+            0,
         );
         control(
             &mut u,
             3,
-            "STATIC",
-            "点击快捷键框后按组合键，Tab 离开，再点击保存。\n增减不透明度支持长按连调；步长越小，调整越细。\n关闭窗口后仍在托盘运行，退出请使用托盘菜单。",
-            0,
-            245,
-            450,
-            500,
-            90,
-            0,
+            "BUTTON",
+            "保存设置",
+            506,
+            700,
+            560,
+            180,
+            32,
+            WS_TABSTOP,
         );
         self.ui = Some(u);
         self.scale_ui(GetDpiForWindow(h).max(96), None);
         self.refresh_list();
+        self.fill_rule(if self.config.rules.is_empty() {
+            None
+        } else {
+            Some(0)
+        });
         self.page(0);
         ShowWindow(h, SW_SHOW);
         SetForegroundWindow(h);
     }
+
     pub(super) unsafe fn scale_ui(&mut self, dpi: u32, suggested: Option<RECT>) {
-        let Some(u) = self.ui.as_mut() else {
-            return;
-        };
-        let previous = u.dpi;
-        if previous == dpi && !u.font.is_null() {
-            return;
-        }
+        let Some(u) = self.ui.as_mut() else { return };
+        u.dpi = dpi;
         let mut font: LOGFONTW = std::mem::zeroed();
         font.lfHeight = -(16 * dpi as i32 / 96);
         font.lfCharSet = DEFAULT_CHARSET;
         let face = wide("Microsoft YaHei UI");
         font.lfFaceName[..face.len()].copy_from_slice(&face);
         let new_font = CreateFontIndirectW(&font);
-        for (_, child) in &u.controls {
-            let mut r: RECT = std::mem::zeroed();
-            GetWindowRect(*child, &mut r);
-            let mut p = POINT {
-                x: r.left,
-                y: r.top,
-            };
-            ScreenToClient(u.window, &mut p);
-            let scale = |n: i32| ((n as i64 * dpi as i64) / previous as i64) as i32;
-            SetWindowPos(
-                *child,
-                null_mut(),
-                scale(p.x),
-                scale(p.y),
-                scale(r.right - r.left),
-                scale(r.bottom - r.top),
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-        }
-        let mut r: RECT = std::mem::zeroed();
-        GetWindowRect(u.window, &mut r);
-        let bounds = suggested.unwrap_or(RECT {
-            left: r.left,
-            top: r.top,
-            right: r.left + 800 * dpi as i32 / 96,
-            bottom: r.top + 660 * dpi as i32 / 96,
-        });
-        SetWindowPos(
-            u.window,
-            null_mut(),
-            bounds.left,
-            bounds.top,
-            bounds.right - bounds.left,
-            bounds.bottom - bounds.top,
-            SWP_NOZORDER | SWP_NOACTIVATE,
-        );
+        font.lfHeight = -(20 * dpi as i32 / 96);
+        font.lfWeight = 600;
+        let heading = CreateFontIndirectW(&font);
         if !new_font.is_null() {
-            for (_, child) in &u.controls {
-                SendMessageW(*child, WM_SETFONT, new_font as usize, 1);
+            for (_, c) in &u.controls {
+                SendMessageW(*c, WM_SETFONT, new_font as usize, 1);
             }
             if !u.font.is_null() {
                 DeleteObject(u.font);
             }
             u.font = new_font;
         }
-        u.dpi = dpi;
+        if !heading.is_null() {
+            for ((page, c), (_, y, _, _)) in u.controls.iter().zip(&u.rects) {
+                if (*page != 99 && *y == 12) || GetDlgCtrlID(*c) == 405 {
+                    SendMessageW(*c, WM_SETFONT, heading as usize, 1);
+                }
+            }
+            if !u.heading_font.is_null() {
+                DeleteObject(u.heading_font);
+            }
+            u.heading_font = heading;
+        }
+        let bounds = suggested.unwrap_or_else(|| {
+            let mut r: RECT = std::mem::zeroed();
+            GetWindowRect(u.window, &mut r);
+            let mut size = RECT {
+                left: 0,
+                top: 0,
+                right: 900 * dpi as i32 / 96,
+                bottom: 600 * dpi as i32 / 96,
+            };
+            AdjustWindowRectExForDpi(&mut size, WS_OVERLAPPEDWINDOW, 0, WS_EX_CONTROLPARENT, dpi);
+            RECT {
+                left: r.left,
+                top: r.top,
+                right: r.left + size.right - size.left,
+                bottom: r.top + size.bottom - size.top,
+            }
+        });
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of_val(&info) as u32;
+        GetMonitorInfoW(
+            MonitorFromWindow(u.window, MONITOR_DEFAULTTONEAREST),
+            &mut info,
+        );
+        let width = (bounds.right - bounds.left).min(info.rcWork.right - info.rcWork.left);
+        let height = (bounds.bottom - bounds.top).min(info.rcWork.bottom - info.rcWork.top);
+        let x = bounds
+            .left
+            .clamp(info.rcWork.left, info.rcWork.right - width);
+        let y = bounds
+            .top
+            .clamp(info.rcWork.top, info.rcWork.bottom - height);
+        SetWindowPos(
+            u.window,
+            null_mut(),
+            x,
+            y,
+            width,
+            height,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        self.layout_ui();
     }
+
+    // Scroll the focused control into view after dialog keyboard navigation.
+    pub(super) unsafe fn reveal_focus(&mut self) {
+        let Some(u) = self.ui.as_mut() else { return };
+        let focus = GetFocus();
+        if GetParent(focus) != u.content {
+            return;
+        }
+        let mut r: RECT = std::mem::zeroed();
+        let mut client: RECT = std::mem::zeroed();
+        GetWindowRect(focus, &mut r);
+        GetClientRect(u.content, &mut client);
+        let mut p = POINT {
+            x: r.left,
+            y: r.top,
+        };
+        ScreenToClient(u.content, &mut p);
+        let adjustment = if p.y < 0 {
+            p.y
+        } else {
+            (p.y + r.bottom - r.top - client.bottom).max(0)
+        };
+        if adjustment != 0 {
+            u.scroll += adjustment * 96 / u.dpi as i32;
+            self.layout_ui();
+        }
+    }
+
+    pub(super) unsafe fn layout_ui(&mut self) {
+        let Some(u) = self.ui.as_mut() else { return };
+        let scale = |v: i32| v * u.dpi as i32 / 96;
+        let mut client: RECT = std::mem::zeroed();
+        GetClientRect(u.window, &mut client);
+        let width = client.right * 96 / u.dpi as i32;
+        let height = client.bottom * 96 / u.dpi as i32;
+        let viewport = (height - 110).max(1);
+        let extent = match u.page {
+            0 if u.advanced => 590,
+            0 => 430,
+            1 => 470,
+            2 => 510,
+            _ => 500,
+        };
+        u.scroll = u.scroll.clamp(0, (extent - viewport).max(0));
+        MoveWindow(u.content, 0, scale(54), client.right, scale(viewport), 1);
+        let si = SCROLLINFO {
+            cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+            fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+            nMin: 0,
+            nMax: extent - 1,
+            nPage: viewport as u32,
+            nPos: u.scroll,
+            nTrackPos: 0,
+        };
+        SetScrollInfo(u.content, SB_VERT, &si, 1);
+        let mut content_rect: RECT = std::mem::zeroed();
+        GetClientRect(u.content, &mut content_rect);
+        let body_width = content_rect.right * 96 / u.dpi as i32;
+        set_text(
+            u.window,
+            116,
+            if u.advanced {
+                "高级选项 ▾"
+            } else {
+                "高级选项 ▸"
+            },
+        );
+        for ((page, c), (x, y, w, h)) in u.controls.iter().zip(&u.rects) {
+            let id = GetDlgCtrlID(*c);
+            let advanced =
+                *page == 0 && (matches!(id, 202..=206 | 209) || (*x == 245 && *y >= 284));
+            let visible = (*page == 99 || *page == u.page) && (!advanced || u.advanced);
+            ShowWindow(*c, if visible { SW_SHOW } else { SW_HIDE });
+            let footer = matches!(id, 113 | 330 | 506 | 9001);
+            let cy = if footer {
+                height - 42
+            } else if *page == 99 {
+                *y
+            } else if id == 117 && !u.advanced {
+                280 - u.scroll
+            } else {
+                *y - u.scroll
+            };
+            let width = if *page == 99 || footer {
+                width
+            } else {
+                body_width
+            };
+            let cx = if id == 407 {
+                width - 240
+            } else if id == 115 {
+                width - 134
+            } else if *page == 1 && *x >= 370 {
+                *x + (width - 900) * if *x >= 620 { 2 } else { 1 } / 3
+            } else if matches!(id, 113 | 330 | 506) {
+                width - 200
+            } else {
+                *x
+            };
+            let cw = if id == 406 {
+                220
+            } else if id == 112 {
+                (width - 460).clamp(120, 260)
+            } else if *page == 1 && *w == 220 {
+                *w + (width - 900) / 3
+            } else if id == 9 {
+                width - 40
+            } else if id == 9001 {
+                width - 240
+            } else if *w >= 370 {
+                (*w + width - 900).max(150)
+            } else {
+                *w
+            };
+            MoveWindow(*c, scale(cx), scale(cy), scale(cw), scale(*h), 1);
+        }
+        InvalidateRect(u.content, null(), 1);
+    }
+
+    pub(super) unsafe fn status(&self, message: &str) {
+        if let Some(u) = &self.ui {
+            set_text(u.window, 9001, message);
+        }
+    }
+
+    unsafe fn rule_snapshot(&self) -> Vec<String> {
+        let h = self.ui.as_ref().unwrap().window;
+        let mut values = (200..=207).map(|id| text_at(h, id)).collect::<Vec<_>>();
+        values.push(checked(h, 208).to_string());
+        values.push(checked(h, 209).to_string());
+        values
+    }
+
+    pub(super) unsafe fn leave_rule(&mut self) -> bool {
+        if self.rule_snapshot() == self.ui.as_ref().unwrap().baseline {
+            return true;
+        }
+        let h = self.ui.as_ref().unwrap().window;
+        match MessageBoxW(
+            h,
+            wide("当前规则尚未保存。是否保存？\n选择“否”放弃修改，选择“取消”继续编辑。").as_ptr(),
+            wide("未保存的修改").as_ptr(),
+            MB_YESNOCANCEL | MB_ICONQUESTION,
+        ) {
+            IDYES => match self.ui_action(113) {
+                Ok(()) => true,
+                Err(e) => {
+                    self.status(&e);
+                    false
+                }
+            },
+            IDNO => true,
+            _ => false,
+        }
+    }
+
+    pub(super) unsafe fn cancel_opacity(&mut self) {
+        KillTimer(self.host, 900);
+        if let Some(u) = self.ui.as_mut() {
+            u.pending_opacity = None;
+        }
+    }
+
+    pub(super) unsafe fn refresh_state(&mut self) {
+        let Some(u) = &self.ui else { return };
+        for i in 0..4 {
+            let label = self
+                .slots
+                .get(i)
+                .and_then(|t| t.as_ref())
+                .filter(|t| t.valid())
+                .map(|t| format!("已绑定 · {}", title(handle(t.hwnd))))
+                .unwrap_or("尚未绑定".into());
+            set_text(u.window, 340 + i as i32, &label);
+        }
+        let target = u
+            .target
+            .as_ref()
+            .filter(|t| t.valid())
+            .map(|t| handle(t.hwnd));
+        let value = target.and_then(|h| {
+            let (mut color, mut alpha, mut flags) = (0, 255, 0);
+            if GetWindowLongPtrW(h, GWL_EXSTYLE) as u32 & WS_EX_LAYERED != 0
+                && GetLayeredWindowAttributes(h, &mut color, &mut alpha, &mut flags) == 0
+            {
+                return None;
+            }
+            Some(if flags & LWA_ALPHA == 0 {
+                100
+            } else {
+                (alpha as u32 * 100 + 127) / 255
+            })
+        });
+        set_text(
+            u.window,
+            400,
+            &target
+                .map(|h| title(h))
+                .unwrap_or("目标窗口不可用，请重新捕获".into()),
+        );
+        for id in [402, 403] {
+            EnableWindow(item(u.window, id), i32::from(value.is_some()));
+        }
+        if value.is_some() && u.pending_opacity.is_some() {
+            return;
+        }
+        if let Some(percent) = value {
+            set_text(u.window, 405, &format!("当前不透明度：{percent}%"));
+            SendMessageW(u.opacity, TBM_SETPOS, 1, percent.clamp(10, 100) as isize);
+        } else {
+            set_text(u.window, 405, "当前不透明度：不可用");
+            self.cancel_opacity();
+        }
+    }
+
     pub(super) unsafe fn page(&mut self, page: usize) {
         if let Some(u) = &mut self.ui {
             u.page = page;
+            u.scroll = 0;
+            SendMessageW(item(u.window, 9), TCM_SETCURSEL, page, 0);
             for (p, h) in &u.controls {
                 ShowWindow(
                     *h,
@@ -657,6 +1103,8 @@ impl App {
                 set_text(u.window, 340 + i as i32, &label);
             }
         }
+        self.layout_ui();
+        self.refresh_state();
     }
     pub(super) unsafe fn refresh_list(&mut self) {
         if let Some(u) = &self.ui {
@@ -674,6 +1122,7 @@ impl App {
                     .as_ptr() as isize,
                 );
             }
+            SendMessageW(u.list, LB_SETCURSEL, u.selected.unwrap_or(usize::MAX), 0);
         }
     }
     pub(super) unsafe fn fill_rule(&mut self, index: Option<usize>) {
@@ -706,6 +1155,27 @@ impl App {
         }
         check(u.window, 208, r.enabled);
         check(u.window, 209, r.minimize);
+        u.advanced = !r.arguments.is_empty()
+            || !r.working_directory.is_empty()
+            || !r.class.is_empty()
+            || !r.title.is_empty()
+            || r.minimize
+            || r.executable.to_lowercase().ends_with(".lnk")
+            || (!r.process_path.is_empty() && r.process_path != r.executable);
+        SendMessageW(u.list, LB_SETCURSEL, index.unwrap_or(usize::MAX), 0);
+        EnableWindow(item(u.window, 111), i32::from(index.is_some()));
+        set_text(
+            u.window,
+            114,
+            if index.is_some() {
+                "编辑召唤规则"
+            } else {
+                "新建规则 · 选择程序并录入快捷键"
+            },
+        );
+        let snapshot = self.rule_snapshot();
+        self.ui.as_mut().unwrap().baseline = snapshot;
+        self.layout_ui();
     }
     pub(super) unsafe fn apply_config(&mut self, c: AppConfig) -> Result<(), String> {
         if !self.pending.is_empty() {
@@ -721,10 +1191,56 @@ impl App {
     pub(super) unsafe fn ui_action(&mut self, id: i32) -> Result<(), String> {
         let h = self.ui.as_ref().unwrap().window;
         match id {
-            10..=13 => self.page((id - 10) as usize),
-            110 => self.fill_rule(None),
+            110 => {
+                if self.leave_rule() {
+                    self.fill_rule(None);
+                }
+            }
+            116 => {
+                let u = self.ui.as_mut().unwrap();
+                u.advanced = !u.advanced;
+                self.layout_ui();
+            }
+            115 => {
+                let mut buffer = vec![0u16; 32768];
+                let filter = wide("程序或快捷方式\0*.exe;*.lnk\0所有文件\0*.*\0");
+                let mut dialog: OPENFILENAMEW = std::mem::zeroed();
+                dialog.lStructSize = std::mem::size_of_val(&dialog) as u32;
+                dialog.hwndOwner = h;
+                dialog.lpstrFilter = filter.as_ptr();
+                dialog.lpstrFile = buffer.as_mut_ptr();
+                dialog.nMaxFile = buffer.len() as u32;
+                dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+                if GetOpenFileNameW(&mut dialog) != 0 {
+                    let end = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
+                    let path = String::from_utf16_lossy(&buffer[..end]);
+                    set_text(h, 201, &path);
+                    if path.to_lowercase().ends_with(".exe") && text_at(h, 204).is_empty() {
+                        set_text(h, 204, &path);
+                    }
+                    if path.to_lowercase().ends_with(".lnk") {
+                        self.ui.as_mut().unwrap().advanced = true;
+                        self.status("快捷方式需要填写目标程序的实际进程路径");
+                    }
+                    self.layout_ui();
+                } else {
+                    let code = CommDlgExtendedError();
+                    if code != 0 {
+                        return Err(format!("无法选择程序文件：{code}"));
+                    }
+                }
+            }
             111 => {
                 if let Some(i) = self.ui.as_ref().unwrap().selected {
+                    if MessageBoxW(
+                        h,
+                        wide("删除当前规则？该规则的未保存修改也会丢弃。").as_ptr(),
+                        wide("删除规则").as_ptr(),
+                        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+                    ) != IDYES
+                    {
+                        return Ok(());
+                    }
                     let mut c = self.config.clone();
                     c.rules.remove(i);
                     self.apply_config(c)?;
@@ -732,12 +1248,21 @@ impl App {
                 }
             }
             112 | 401 | 320..=323 => {
+                self.cancel_opacity();
+                self.status("捕获完成后请核对目标与填写的信息");
                 ShowWindow(h, SW_HIDE);
                 SetTimer(self.host, id as usize, 3000, None);
             }
             113 => {
                 let exe = text_at(h, 201);
                 let path = text_at(h, 204);
+                if path.trim().is_empty() && !exe.to_lowercase().ends_with(".exe") {
+                    self.ui.as_mut().unwrap().advanced = true;
+                    self.layout_ui();
+                    SetFocus(item(h, 204));
+                    self.reveal_focus();
+                    return Err("请填写实际进程路径；快捷方式不能用于匹配进程".into());
+                }
                 let r = SummonRule {
                     name: text_at(h, 200),
                     enabled: checked(h, 208),
@@ -760,8 +1285,15 @@ impl App {
                 } else {
                     c.rules.push(r);
                 }
+                let selected = self
+                    .ui
+                    .as_ref()
+                    .unwrap()
+                    .selected
+                    .unwrap_or(c.rules.len() - 1);
                 self.apply_config(c)?;
-                self.fill_rule(None);
+                self.fill_rule(Some(selected));
+                self.status("规则已保存");
             }
             330 => {
                 let mut c = self.config.clone();
@@ -776,6 +1308,7 @@ impl App {
                 self.apply_config(c)?;
             }
             403 => {
+                self.cancel_opacity();
                 let target = self
                     .ui
                     .as_ref()
@@ -788,7 +1321,10 @@ impl App {
                 self.opacity(target, Some(255), 0)?;
                 SendMessageW(self.ui.as_ref().unwrap().opacity, WM_USER + 5, 1, 100);
             }
-            404 => self.restore_all(),
+            404 => {
+                self.cancel_opacity();
+                self.restore_all();
+            }
             506 => {
                 let mut c = self.config.clone();
                 c.opacity_down = parse_key(&text_at(h, 500))?;
@@ -806,19 +1342,27 @@ impl App {
             }
             _ => {}
         }
+        if matches!(id, 330 | 506) {
+            self.status("修改已保存");
+        }
+        if matches!(id, 403 | 404) {
+            self.refresh_state();
+        }
         Ok(())
     }
     pub(super) unsafe fn capture(&mut self, id: usize) {
         KillTimer(self.host, id);
+        self.cancel_opacity();
         let target = GetForegroundWindow();
         let Some(u) = self.ui.as_ref() else {
             return;
         };
         let h = u.window;
         if !eligible(target) {
-            error("未选中可操作的窗口，请重新捕获");
+            self.status("未选中可操作的窗口，请重新捕获");
         } else if id == 112 {
             if let Some((_, _, p)) = process(target) {
+                self.status("窗口信息已捕获，请核对后保存");
                 set_text(h, 204, &p);
                 if text_at(h, 201).is_empty() {
                     set_text(h, 201, &p);
@@ -828,10 +1372,15 @@ impl App {
                 if text_at(h, 200).is_empty() {
                     set_text(h, 200, &title(target));
                 }
+            } else {
+                self.status("无法读取目标进程，请检查权限并重新捕获");
             }
         } else if id == 401 {
             match self.track(target) {
-                Ok(n) => self.ui.as_mut().unwrap().target = Some(self.records[n].token.clone()),
+                Ok(n) => {
+                    self.ui.as_mut().unwrap().target = Some(self.records[n].token.clone());
+                    self.status("目标窗口已捕获");
+                }
                 Err(e) => {
                     error(&e);
                     self.ui.as_mut().unwrap().target = None;
@@ -852,12 +1401,16 @@ impl App {
             match self.track(target) {
                 Ok(n) => {
                     self.slots[i] = Some(self.records[n].token.clone());
+                    self.status("窗口已绑定到槽位");
                     if let Err(e) = self.journal() {
                         error(&e);
                     }
                 }
                 Err(e) => error(&e),
             }
+        }
+        if id == 112 {
+            self.ui.as_mut().unwrap().advanced = true;
         }
         let page = self.ui.as_ref().unwrap().page;
         self.page(page);
@@ -907,6 +1460,157 @@ pub(super) unsafe fn autostart(enabled: bool) -> Result<(), String> {
 #[cfg(test)]
 mod capture_tests {
     use super::*;
+
+    #[test]
+    fn editor_drafts_selection_layout_and_target_state() {
+        unsafe {
+            let classes: [(&str, WNDPROC); 2] = [
+                ("DunYu.Settings.1", Some(procedure)),
+                ("DunYu.Content.1", Some(content_proc)),
+            ];
+            for (name, proc) in classes {
+                let mut wc: WNDCLASSW = std::mem::zeroed();
+                let name = wide(name);
+                wc.lpszClassName = name.as_ptr();
+                wc.lpfnWndProc = proc;
+                wc.hInstance = GetModuleHandleW(null());
+                wc.hbrBackground = (COLOR_BTNFACE + 1) as HBRUSH;
+                assert_ne!(RegisterClassW(&wc), 0);
+            }
+            InitCommonControls();
+            let create = |label: &str| {
+                CreateWindowExW(
+                    0,
+                    wide("STATIC").as_ptr(),
+                    wide(label).as_ptr(),
+                    WS_OVERLAPPEDWINDOW,
+                    0,
+                    0,
+                    200,
+                    200,
+                    null_mut(),
+                    null_mut(),
+                    GetModuleHandleW(null()),
+                    null(),
+                )
+            };
+            let host = create("UI test host");
+            let external = create("UI test target");
+            let dir = std::env::temp_dir().join(format!("dunyu-ui-test-{}", std::process::id()));
+            struct Fixture {
+                app: App,
+                external: HWND,
+            }
+            impl Drop for Fixture {
+                fn drop(&mut self) {
+                    unsafe {
+                        self.app.restore_all();
+                        for record in &self.app.records {
+                            if record.token.valid() {
+                                RemovePropW(handle(record.token.hwnd), wide(PROP).as_ptr());
+                            }
+                        }
+                        if let Some(u) = &self.app.ui {
+                            DestroyWindow(u.window);
+                            DeleteObject(u.font);
+                            DeleteObject(u.heading_font);
+                        }
+                        DestroyWindow(self.app.host);
+                        if IsWindow(self.external) != 0 {
+                            DestroyWindow(self.external);
+                        }
+                        let _ = std::fs::remove_dir_all(&self.app.dir);
+                    }
+                }
+            }
+            let mut f = Fixture {
+                app: App {
+                    host,
+                    config: AppConfig::default(),
+                    dir,
+                    records: vec![],
+                    slots: vec![None; 4],
+                    targets: HashMap::new(),
+                    keys: HashMap::new(),
+                    next_id: 0,
+                    pending: vec![],
+                    ui: None,
+                    hook: null_mut(),
+                    taskbar: 0,
+                    can_write: true,
+                    launch_results: Default::default(),
+                },
+                external,
+            };
+            let app = &mut f.app;
+            // Pretend unchanged default keys are already registered: this test covers
+            // editor persistence, not registration, and must not reserve global keys.
+            for (i, (key, cmd)) in app.config.bindings().into_iter().enumerate() {
+                app.keys.insert(i as i32 + 1, (key, cmd));
+            }
+            app.open_ui();
+            let h = app.ui.as_ref().unwrap().window;
+            assert!(!item(h, 201).is_null());
+            assert_eq!(GetAncestor(item(h, 201), GA_ROOT), h);
+            assert_eq!(app.rule_snapshot(), app.ui.as_ref().unwrap().baseline);
+            set_text(h, 200, "测试程序");
+            set_text(h, 201, "C:\\测试\\demo.exe");
+            check(h, 208, false);
+            assert_ne!(app.rule_snapshot(), app.ui.as_ref().unwrap().baseline);
+            app.page(1);
+            app.page(0);
+            assert_eq!(text_at(h, 200), "测试程序");
+            app.ui_action(113).unwrap();
+            assert_eq!(app.ui.as_ref().unwrap().selected, Some(0));
+            assert_eq!(
+                SendMessageW(app.ui.as_ref().unwrap().list, LB_GETCURSEL, 0, 0),
+                0
+            );
+            assert_eq!(text_at(h, 200), "测试程序");
+            assert_eq!(app.rule_snapshot(), app.ui.as_ref().unwrap().baseline);
+            set_text(h, 200, "未保存草稿");
+            app.pending.push(Pending {
+                rule: 0,
+                started: Instant::now(),
+            });
+            assert!(app.ui_action(113).is_err());
+            app.pending.clear();
+            assert_eq!(text_at(h, 200), "未保存草稿");
+            assert_eq!(app.config.rules[0].name, "测试程序");
+            assert_ne!(app.rule_snapshot(), app.ui.as_ref().unwrap().baseline);
+            app.ui_action(116).unwrap();
+            assert!(IsWindowVisible(item(h, 204)) != 0);
+            app.ui_action(116).unwrap();
+            assert_eq!(IsWindowVisible(item(h, 204)), 0);
+            let rect = |h: HWND| {
+                let mut r: RECT = std::mem::zeroed();
+                GetWindowRect(h, &mut r);
+                (r.right - r.left, r.bottom - r.top)
+            };
+            app.scale_ui(96, None);
+            let before = rect(item(h, 201));
+            for dpi in [144, 192, 120, 96] {
+                app.scale_ui(dpi, None);
+            }
+            assert_eq!(rect(item(h, 201)), before);
+            let n = app.track(external).unwrap();
+            app.ui.as_mut().unwrap().target = Some(app.records[n].token.clone());
+            app.opacity(external, Some(128), 0).unwrap();
+            app.refresh_state();
+            assert_eq!(text_at(h, 405), "当前不透明度：50%");
+            assert_eq!(
+                SendMessageW(app.ui.as_ref().unwrap().opacity, WM_USER, 0, 0),
+                50
+            );
+            app.ui.as_mut().unwrap().pending_opacity = Some((app.records[n].token.clone(), 30));
+            app.ui_action(403).unwrap();
+            assert!(app.ui.as_ref().unwrap().pending_opacity.is_none());
+            assert_eq!(text_at(h, 405), "当前不透明度：100%");
+            DestroyWindow(external);
+            app.refresh_state();
+            assert_eq!(IsWindowEnabled(item(h, 402)), 0);
+        }
+    }
 
     #[test]
     fn records_keys_and_consumes_existing_bindings() {

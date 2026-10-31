@@ -138,12 +138,20 @@ struct Ui {
     window: HWND,
     page: usize,
     controls: Vec<(usize, HWND)>,
+    content: HWND,
+    // Original 96-DPI rectangles, in the same order as controls.
+    rects: Vec<(i32, i32, i32, i32)>,
+    advanced: bool,
+    scroll: i32,
+    baseline: Vec<String>,
     list: HWND,
     selected: Option<usize>,
     target: Option<Token>,
     opacity: HWND,
     dpi: u32,
     font: HFONT,
+    heading_font: HFONT,
+    pending_opacity: Option<(Token, u8)>,
 }
 struct App {
     host: HWND,
@@ -279,6 +287,7 @@ impl App {
         ok
     }
     unsafe fn restore_all(&mut self) {
+        self.cancel_opacity();
         self.records.retain(|r| r.token.valid());
         for i in 0..self.records.len() {
             self.restore(i);
@@ -286,6 +295,7 @@ impl App {
         if let Err(e) = self.journal() {
             error(&e);
         }
+        self.refresh_state();
     }
     unsafe fn toggle(&mut self, t: Token, minimize: bool) -> Result<(), String> {
         if !t.valid() {
@@ -445,6 +455,9 @@ impl App {
         Ok(())
     }
     unsafe fn execute(&mut self, c: Command) {
+        if matches!(c, Command::Opacity(_) | Command::Opaque | Command::Restore) {
+            self.cancel_opacity();
+        }
         let h = GetForegroundWindow();
         let result = match c {
             Command::Summon(i) => self.summon(i),
@@ -478,6 +491,7 @@ impl App {
         if let Err(e) = result {
             error(&e);
         }
+        self.refresh_state();
     }
     unsafe fn register(&mut self, c: &AppConfig, save: bool) -> Result<(), String> {
         c.validate()?;
@@ -633,6 +647,8 @@ unsafe extern "system" fn procedure(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                     if h == a.host {
                         PostMessageW(h, WM_COMMAND, 3, 0);
                     } else {
+                        a.cancel_opacity();
+                        a.refresh_state();
                         ShowWindow(h, SW_HIDE);
                     }
                     Some(0)
@@ -660,26 +676,106 @@ unsafe extern "system" fn procedure(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                         a.tick();
                     } else if w == 900 {
                         KillTimer(h, 900);
-                        if let Some(u) = &a.ui {
-                            let next = SendMessageW(u.opacity, WM_USER, 0, 0).clamp(10, 100) as u8;
-                            let Some(target) = u
-                                .target
-                                .as_ref()
-                                .filter(|t| t.valid())
-                                .map(|t| handle(t.hwnd))
-                            else {
-                                error("目标窗口已关闭，请重新捕获");
-                                return Some(0);
-                            };
-                            if let Err(e) =
-                                a.opacity(target, Some(((next as u32 * 255 + 50) / 100) as u8), 0)
-                            {
-                                error(&e);
+                        let pending = a.ui.as_mut().and_then(|u| u.pending_opacity.take());
+                        if let Some((token, next)) = pending {
+                            let valid = token.valid()
+                                && a.ui
+                                    .as_ref()
+                                    .and_then(|u| u.target.as_ref())
+                                    .is_some_and(|t| t.tag == token.tag);
+                            if valid {
+                                if let Err(e) = a.opacity(
+                                    handle(token.hwnd),
+                                    Some(((next as u32 * 255 + 50) / 100) as u8),
+                                    0,
+                                ) {
+                                    a.status(&e);
+                                }
+                            } else {
+                                a.status("目标窗口已失效，请重新捕获");
                             }
                         }
+                        a.refresh_state();
                     } else {
                         a.capture(w);
                     }
+                    Some(0)
+                }
+                WM_GETMINMAXINFO if h != a.host && l != 0 => {
+                    let dpi = GetDpiForWindow(h).max(96);
+                    let mut bounds = RECT {
+                        left: 0,
+                        top: 0,
+                        right: 760 * dpi as i32 / 96,
+                        bottom: 420 * dpi as i32 / 96,
+                    };
+                    AdjustWindowRectExForDpi(
+                        &mut bounds,
+                        WS_OVERLAPPEDWINDOW,
+                        0,
+                        WS_EX_CONTROLPARENT,
+                        dpi,
+                    );
+                    let mut monitor: MONITORINFO = std::mem::zeroed();
+                    monitor.cbSize = std::mem::size_of_val(&monitor) as u32;
+                    GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mut monitor);
+                    let info = &mut *(l as *mut MINMAXINFO);
+                    info.ptMinTrackSize = POINT {
+                        x: (bounds.right - bounds.left)
+                            .min(monitor.rcWork.right - monitor.rcWork.left),
+                        y: (bounds.bottom - bounds.top)
+                            .min(monitor.rcWork.bottom - monitor.rcWork.top),
+                    };
+                    Some(0)
+                }
+                WM_SIZE => {
+                    if h != a.host {
+                        a.layout_ui();
+                    }
+                    Some(0)
+                }
+                WM_NOTIFY => {
+                    if l != 0 {
+                        let hdr = &*(l as *const windows_sys::Win32::UI::Controls::NMHDR);
+                        if hdr.idFrom == 9
+                            && hdr.code == windows_sys::Win32::UI::Controls::TCN_SELCHANGE
+                        {
+                            let page = SendMessageW(
+                                hdr.hwndFrom,
+                                windows_sys::Win32::UI::Controls::TCM_GETCURSEL,
+                                0,
+                                0,
+                            );
+                            if page >= 0 {
+                                a.page(page as usize);
+                            }
+                        }
+                    }
+                    Some(0)
+                }
+                WM_VSCROLL | WM_MOUSEWHEEL => {
+                    if let Some(u) = a.ui.as_mut() {
+                        let delta = if msg == WM_MOUSEWHEEL {
+                            -((w >> 16) as i16 as i32) / 120 * 48
+                        } else {
+                            match w as i32 & 0xffff {
+                                SB_LINEUP => -24,
+                                SB_LINEDOWN => 24,
+                                SB_PAGEUP => -200,
+                                SB_PAGEDOWN => 200,
+                                SB_THUMBTRACK | SB_THUMBPOSITION => {
+                                    let mut si: SCROLLINFO = std::mem::zeroed();
+                                    si.cbSize = std::mem::size_of_val(&si) as u32;
+                                    si.fMask = SIF_TRACKPOS;
+                                    GetScrollInfo(u.content, SB_VERT, &mut si);
+                                    si.nTrackPos - u.scroll
+                                }
+                                _ => 0,
+                            }
+                        };
+                        u.scroll += delta;
+                    }
+                    a.layout_ui();
                     Some(0)
                 }
                 WM_DPICHANGED => {
@@ -689,7 +785,16 @@ unsafe extern "system" fn procedure(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                     Some(0)
                 }
                 WM_HSCROLL => {
-                    SetTimer(a.host, 900, 60, None);
+                    if let Some(u) = a.ui.as_mut()
+                        && l == u.opacity as isize
+                    {
+                        let value = SendMessageW(u.opacity, WM_USER, 0, 0);
+                        ui::set_text(u.window, 405, &format!("不透明度：{value}%"));
+                        if let Some(token) = u.target.as_ref().filter(|t| t.valid()) {
+                            u.pending_opacity = Some((token.clone(), value.clamp(10, 100) as u8));
+                            SetTimer(a.host, 900, 60, None);
+                        }
+                    }
                     Some(0)
                 }
                 LAUNCHED => {
@@ -714,6 +819,7 @@ unsafe extern "system" fn procedure(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                     if before != a.records.len() {
                         let _ = a.journal();
                     }
+                    a.refresh_state();
                     Some(0)
                 }
                 WM_COMMAND => {
@@ -738,11 +844,22 @@ unsafe extern "system" fn procedure(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                     } else if id == 100 && (w >> 16) == LBN_SELCHANGE as usize {
                         let n = SendMessageW(a.ui.as_ref().unwrap().list, LB_GETCURSEL, 0, 0);
                         if n >= 0 {
-                            a.fill_rule(Some(n as usize));
+                            if a.ui.as_ref().unwrap().selected != Some(n as usize) && a.leave_rule()
+                            {
+                                a.fill_rule(Some(n as usize));
+                            } else {
+                                let u = a.ui.as_ref().unwrap();
+                                SendMessageW(
+                                    u.list,
+                                    LB_SETCURSEL,
+                                    u.selected.unwrap_or(usize::MAX),
+                                    0,
+                                );
+                            }
                         }
                     } else if (w >> 16) == BN_CLICKED as usize {
                         if let Err(e) = a.ui_action(id) {
-                            error(&e);
+                            a.status(&e);
                         }
                     }
                     Some(0)
@@ -778,9 +895,13 @@ pub fn run() {
             return;
         }
         let instance = GetModuleHandleW(null());
-        for name in [CLASS, "DunYu.Settings.1"] {
+        for name in [CLASS, "DunYu.Settings.1", "DunYu.Content.1"] {
             let mut wc: WNDCLASSW = std::mem::zeroed();
-            wc.lpfnWndProc = Some(procedure);
+            wc.lpfnWndProc = if name == "DunYu.Content.1" {
+                Some(ui::content_proc)
+            } else {
+                Some(procedure)
+            };
             wc.hInstance = instance;
             let n = wide(name);
             wc.lpszClassName = n.as_ptr();
@@ -892,6 +1013,11 @@ pub fn run() {
                     .and_then(|a| a.ui.as_ref().map(|u| u.window))
             });
             if ui.is_some_and(|h| ui::capture_hotkey(h, &msg) || IsDialogMessageW(h, &msg) != 0) {
+                APP.with(|cell| {
+                    if let Some(a) = cell.borrow_mut().as_mut() {
+                        a.reveal_focus();
+                    }
+                });
                 continue;
             }
             TranslateMessage(&msg);
@@ -908,6 +1034,9 @@ pub fn run() {
                 DestroyWindow(u.window);
                 if !u.font.is_null() {
                     DeleteObject(u.font);
+                }
+                if !u.heading_font.is_null() {
+                    DeleteObject(u.heading_font);
                 }
             }
             for r in &a.records {
