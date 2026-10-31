@@ -1,4 +1,74 @@
 use super::*;
+
+fn is_hotkey_field(id: i32) -> bool {
+    matches!(id, 207 | 300..=307 | 500..=503)
+}
+
+// Run before IsDialogMessage/TranslateMessage so arrows, spaces and Alt
+// combinations are recorded instead of navigating or activating controls.
+pub(super) unsafe fn capture_hotkey(window: HWND, msg: &MSG) -> bool {
+    let field = GetFocus();
+    if GetForegroundWindow() != window
+        || field.is_null()
+        || GetParent(field) != window
+        || IsWindowVisible(field) == 0
+        || !is_hotkey_field(GetDlgCtrlID(field))
+    {
+        return false;
+    }
+    capture_key_message(field, msg)
+}
+
+unsafe fn capture_key_message(field: HWND, msg: &MSG) -> bool {
+    let (modifiers, key) = match msg.message {
+        // Registered combinations arrive here instead of as ordinary keydowns.
+        // Consume them so recording an existing binding never executes it.
+        WM_HOTKEY => (msg.lParam as u32 & 15, (msg.lParam as u32 >> 16) & 0xffff),
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
+            let mut modifiers = 0;
+            for (vk, flag) in [
+                (VK_CONTROL, MOD_CONTROL),
+                (VK_MENU, MOD_ALT),
+                (VK_SHIFT, MOD_SHIFT),
+                (VK_LWIN, MOD_WIN),
+                (VK_RWIN, MOD_WIN),
+            ] {
+                if GetKeyState(vk as i32) < 0 {
+                    modifiers |= flag;
+                }
+            }
+            let key = msg.wParam as u32;
+            if key == VK_TAB as u32 && modifiers & !MOD_SHIFT == 0 {
+                return false;
+            }
+            if modifiers == 0 && matches!(key, 0x0d | 0x1b) {
+                SetFocus(GetNextDlgTabItem(GetParent(field), field, 0));
+                return true;
+            }
+            if msg.lParam & (1 << 30) != 0 || matches!(key, 0x10..=0x12 | 0x5b..=0x5c | 0xa0..=0xa5)
+            {
+                return true;
+            }
+            (modifiers, key)
+        }
+        WM_KEYUP | WM_SYSKEYUP | WM_CHAR | WM_SYSCHAR | WM_DEADCHAR | WM_SYSDEADCHAR => {
+            return true;
+        }
+        _ => return false,
+    };
+    if modifiers != 0
+        && matches!(key, 8 | 0x20 | 0x25 | 0x27 | 0x30..=0x39 | 0x41..=0x5a | 0x70..=0x7a)
+    {
+        SetWindowTextW(
+            field,
+            wide(&hotkey_text(&Hotkey::new(modifiers, key))).as_ptr(),
+        );
+    } else {
+        windows_sys::Win32::System::Diagnostics::Debug::MessageBeep(MB_ICONWARNING);
+    }
+    true
+}
+
 pub(super) fn hotkey_text(k: &Hotkey) -> String {
     let mut parts = vec![];
     for (m, s) in [(2, "Ctrl"), (1, "Alt"), (4, "Shift"), (8, "Win")] {
@@ -84,6 +154,11 @@ pub(super) unsafe fn control(
     h: i32,
     style: u32,
 ) -> HWND {
+    let style = if kind == "EDIT" && is_hotkey_field(id) {
+        style | ES_READONLY as u32
+    } else {
+        style
+    };
     let c = CreateWindowExW(
         if kind == "EDIT" { WS_EX_CLIENTEDGE } else { 0 },
         wide(kind).as_ptr(),
@@ -190,7 +265,7 @@ impl App {
             (204, "匹配进程完整路径", 212),
             (205, "窗口类名（可空）", 250),
             (206, "标题包含（可空）", 288),
-            (207, "快捷键", 326),
+            (207, "快捷键（按键）", 326),
         ] {
             field(&mut u, 0, label, id, y, "");
         }
@@ -246,7 +321,7 @@ impl App {
             &mut u,
             0,
             "STATIC",
-            "启动路径请填写完整路径。快捷方式需匹配实际程序路径。\n快捷键示例：Ctrl+Alt+A。保存失败时保留原有配置。",
+            "启动路径请填写完整路径。快捷方式需匹配实际程序路径。\n点击快捷键框后按组合键，如 Ctrl+Alt+A，再保存。",
             0,
             245,
             465,
@@ -335,7 +410,7 @@ impl App {
             &mut u,
             1,
             "STATIC",
-            "左侧为绑定快捷键，右侧为显示／隐藏快捷键。",
+            "左侧为绑定快捷键，右侧为显示／隐藏快捷键；点击框后直接按组合键。",
             0,
             20,
             50,
@@ -482,7 +557,7 @@ impl App {
             &mut u,
             3,
             "STATIC",
-            "关闭本窗口后仍在托盘运行。\n退出请使用托盘菜单，程序会恢复窗口。\n异常终止后重新运行遁鱼可尝试恢复。",
+            "点击快捷键框后按组合键，Tab 离开，再点击保存。\n关闭本窗口后仍在托盘运行，退出请使用托盘菜单。\n异常终止后重新运行遁鱼可尝试恢复。",
             0,
             245,
             450,
@@ -826,5 +901,93 @@ pub(super) unsafe fn autostart(enabled: bool) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("启动项设置失败：{status}"))
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+
+    #[test]
+    fn records_keys_and_consumes_existing_bindings() {
+        unsafe {
+            let field = CreateWindowExW(
+                0,
+                wide("EDIT").as_ptr(),
+                wide("Ctrl+Alt+A").as_ptr(),
+                ES_READONLY as u32,
+                0,
+                0,
+                100,
+                30,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            assert!(!field.is_null());
+            struct Cleanup(HWND, [u8; 256]);
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    unsafe {
+                        SetKeyboardState(self.1.as_ptr());
+                        DestroyWindow(self.0);
+                    }
+                }
+            }
+            let mut cleanup = Cleanup(field, [0; 256]);
+            assert_ne!(GetKeyboardState(cleanup.1.as_mut_ptr()), 0);
+            let mut state = [0u8; 256];
+            assert_ne!(SetKeyboardState(state.as_ptr()), 0);
+            let mut msg: MSG = std::mem::zeroed();
+            msg.hwnd = field;
+            msg.message = WM_KEYDOWN;
+            // Bare keys and incomplete modifier combinations preserve the value.
+            for key in [VK_CONTROL, VK_LWIN, VK_F12, 0x42] {
+                msg.wParam = key as usize;
+                assert!(capture_key_message(field, &msg));
+                assert_eq!(title(field), "Ctrl+Alt+A");
+            }
+            msg.wParam = VK_TAB as usize;
+            assert!(!capture_key_message(field, &msg));
+            state[VK_SHIFT as usize] = 0x80;
+            assert_ne!(SetKeyboardState(state.as_ptr()), 0);
+            assert!(!capture_key_message(field, &msg));
+
+            for (modifier, message, key, expected) in [
+                (VK_CONTROL, WM_KEYDOWN, 0x42, "Ctrl+B"),
+                (VK_MENU, WM_SYSKEYDOWN, VK_LEFT, "Alt+Left"),
+                (VK_SHIFT, WM_KEYDOWN, VK_SPACE, "Shift+Space"),
+                (VK_RWIN, WM_KEYDOWN, VK_F11, "Win+F11"),
+            ] {
+                state = [0; 256];
+                state[modifier as usize] = 0x80;
+                assert_ne!(SetKeyboardState(state.as_ptr()), 0);
+                msg.message = message;
+                msg.wParam = key as usize;
+                assert!(capture_key_message(field, &msg));
+                assert_eq!(title(field), expected);
+                assert_eq!(hotkey_text(&parse_key(&title(field)).unwrap()), expected);
+            }
+            msg.message = WM_KEYDOWN;
+            msg.wParam = VK_F12 as usize;
+            assert!(capture_key_message(field, &msg));
+            assert_eq!(title(field), "Win+F11");
+
+            // WM_HOTKEY carries its own modifiers, independent of current state.
+            state = [0; 256];
+            assert_ne!(SetKeyboardState(state.as_ptr()), 0);
+            msg.message = WM_HOTKEY;
+            msg.lParam = ((VK_BACK as isize) << 16) | 3;
+            assert!(capture_key_message(field, &msg));
+            assert_eq!(title(field), "Ctrl+Alt+Backspace");
+            for message in [WM_KEYUP, WM_SYSKEYUP, WM_CHAR, WM_SYSCHAR] {
+                msg.message = message;
+                assert!(capture_key_message(field, &msg));
+                assert_eq!(title(field), "Ctrl+Alt+Backspace");
+            }
+            msg.message = WM_LBUTTONDOWN;
+            assert!(!capture_key_message(field, &msg));
+        }
     }
 }

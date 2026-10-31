@@ -860,7 +860,7 @@ pub fn run() {
                     .as_ref()
                     .and_then(|a| a.ui.as_ref().map(|u| u.window))
             });
-            if ui.is_some_and(|h| IsDialogMessageW(h, &msg) != 0) {
+            if ui.is_some_and(|h| ui::capture_hotkey(h, &msg) || IsDialogMessageW(h, &msg) != 0) {
                 continue;
             }
             TranslateMessage(&msg);
