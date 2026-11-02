@@ -1,0 +1,5 @@
+Tool: built-in imagegen, transparent_background=true
+Reference: resources/koi-sprite.png
+Prompt:
+Edit this exact orange koi into an animation sprite sheet with 4 equal cells in ONE horizontal row. Each cell contains the SAME fish at IDENTICAL scale and head position, fully visible with clear transparent padding. Preserve orange gradient, long tapered tail, flowing fins, no eyes added, the original graphic silhouette/style. All fish heads point RIGHT horizontally. Frame 1 neutral curved body, frame 2 tail swept gently up, frame 3 neutral (matching frame 1), frame 4 tail swept gently down. Head and forward body remain anchored in same location in each cell; only rear body/tail/fins flex naturally. The sequence loops into gentle lifelike swimming. Actual transparent background, no grid lines, no labels, no text, no water. Four cells, single row, production sprite sheet.
+Runtime: continuous deformation of the neutral cell keeps the head anchored and avoids abrupt frame changes.

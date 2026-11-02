@@ -37,17 +37,16 @@ jobs:
         shell: pwsh
         run: |
           New-Item dist/DunYu -ItemType Directory -Force
-          Copy-Item target/release/dunyu.exe,README.md,docs/USAGE.md dist/DunYu
-          New-Item dist/DunYu/docs,dist/DunYu/resources -ItemType Directory -Force
-          Copy-Item docs/USAGE.md dist/DunYu/docs
-          Copy-Item resources/fish.png,resources/dunyu.ico,resources/icon-prompt.txt dist/DunYu/resources
+          Copy-Item target/release/dunyu.exe dist/DunYu
+          Copy-Item target/release/dunyu.exe dist/dunyu.exe
           Compress-Archive dist/DunYu dist/DunYu-windows-x64.zip
-          (Get-FileHash dist/DunYu-windows-x64.zip -Algorithm SHA256).Hash + '  DunYu-windows-x64.zip' | Set-Content dist/SHA256SUMS.txt
+          @('DunYu-windows-x64.zip', 'dunyu.exe') | ForEach-Object { (Get-FileHash (Join-Path dist $_) -Algorithm SHA256).Hash + '  ' + $_ } | Set-Content dist/SHA256SUMS.txt
       - if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
           name: DunYu-windows-x64
           path: |
             dist/*.zip
+            dist/dunyu.exe
             dist/SHA256SUMS.txt
             Cargo.lock

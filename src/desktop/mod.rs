@@ -1,5 +1,8 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 mod recorder;
+mod rest_art;
+mod rest_ui;
+mod scroll_ui;
 mod theme;
 mod ui;
 use dunyu::*;
@@ -144,6 +147,10 @@ struct Ui {
     content: HWND,
     advanced: bool,
     scroll: i32,
+    list_scroll: i32,
+    motions: [dunyu::scroll::Motion; 2],
+    split_ratio: f64,
+    dragging: bool,
     baseline: Vec<String>,
     list: HWND,
     selected: Option<usize>,
@@ -156,6 +163,7 @@ struct Ui {
     pending_opacity: Option<(Token, u8)>,
 }
 struct App {
+    rest: rest_ui::Runtime,
     host: HWND,
     config: AppConfig,
     dir: PathBuf,
@@ -612,6 +620,17 @@ impl App {
                 );
             }
         }
+        AppendMenuW(m, MF_SEPARATOR, 0, null());
+        AppendMenuW(
+            m,
+            MF_STRING,
+            24,
+            wide(&format!("休憩 · {}", self.rest.status())).as_ptr(),
+        );
+        AppendMenuW(m, MF_STRING, 20, wide("休憩：暂停30分钟").as_ptr());
+        AppendMenuW(m, MF_STRING, 21, wide("休憩：暂停1小时").as_ptr());
+        AppendMenuW(m, MF_STRING, 22, wide("休憩：恢复提醒").as_ptr());
+        AppendMenuW(m, MF_STRING, 23, wide("休憩：预览").as_ptr());
         AppendMenuW(m, MF_STRING, 3, wide("退出并恢复").as_ptr());
         let mut p: POINT = std::mem::zeroed();
         GetCursorPos(&mut p);
@@ -673,8 +692,46 @@ unsafe extern "system" fn procedure(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                     }
                     Some(0)
                 }
+                rest_ui::ACTION => {
+                    a.rest.action(w, Some(l as usize), a.host);
+                    Some(0)
+                }
+                WM_WTSSESSION_CHANGE => {
+                    if matches!(w, 7 | 2 | 4) {
+                        a.rest.locked = true;
+                    }
+                    if matches!(w, 8 | 1 | 3) {
+                        a.rest.locked = false;
+                    }
+                    a.rest.tick(a.host);
+                    Some(0)
+                }
+                WM_POWERBROADCAST => {
+                    if w == PBT_APMSUSPEND as usize {
+                        a.rest.suspended = true;
+                    }
+                    if w == PBT_APMRESUMESUSPEND as usize || w == PBT_APMRESUMEAUTOMATIC as usize {
+                        a.rest.suspended = false;
+                    }
+                    a.rest.tick(a.host);
+                    Some(1)
+                }
+                WM_DISPLAYCHANGE => {
+                    if a.rest.scheduler.phase == dunyu::rest::Phase::Warning {
+                        a.rest.scheduler.phase = dunyu::rest::Phase::Due;
+                    }
+                    a.rest.close();
+                    Some(0)
+                }
                 WM_TIMER => {
-                    if w == TIMER {
+                    if w == scroll_ui::TIMER {
+                        a.scroll_frame();
+                    } else if w == rest_ui::TIMER_ID {
+                        a.rest.tick(a.host);
+                        if let Some(u) = &a.ui {
+                            ui::set_text(u.window, 810, &a.rest.status());
+                        }
+                    } else if w == TIMER {
                         a.tick();
                     } else if w == 900 {
                         KillTimer(h, 900);
@@ -732,7 +789,12 @@ unsafe extern "system" fn procedure(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                 }
                 WM_SIZE => {
                     if h != a.host {
+                        KillTimer(a.host, scroll_ui::TIMER);
                         a.layout_ui();
+                        if let Some(u) = a.ui.as_mut() {
+                            u.motions[0].snap(u.scroll as f64);
+                            u.motions[1].snap(u.list_scroll as f64);
+                        }
                     }
                     Some(0)
                 }
@@ -757,21 +819,24 @@ unsafe extern "system" fn procedure(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                 }
                 WM_VSCROLL if l != 0 && GetDlgCtrlID(l as HWND) == 9004 => {
                     if let Some(u) = &a.ui {
-                        let top = SendMessageW(u.list, LB_GETTOPINDEX, 0, 0) as i32;
                         let mut si: SCROLLINFO = std::mem::zeroed();
                         si.cbSize = std::mem::size_of_val(&si) as u32;
                         si.fMask = SIF_ALL;
                         GetScrollInfo(l as HWND, SB_CTL, &mut si);
                         let next = match w as i32 & 0xffff {
-                            SB_LINEUP => top - 1,
-                            SB_LINEDOWN => top + 1,
-                            SB_PAGEUP => top - si.nPage as i32,
-                            SB_PAGEDOWN => top + si.nPage as i32,
+                            SB_LINEUP => u.list_scroll - 64,
+                            SB_LINEDOWN => u.list_scroll + 64,
+                            SB_PAGEUP => u.list_scroll - si.nPage as i32,
+                            SB_PAGEDOWN => u.list_scroll + si.nPage as i32,
                             SB_THUMBTRACK | SB_THUMBPOSITION => si.nTrackPos,
-                            _ => top,
+                            _ => u.list_scroll,
                         };
-                        SendMessageW(u.list, LB_SETTOPINDEX, next.max(0) as usize, 0);
-                        theme::sync_list_scroll(u.list);
+                        let _ = u;
+                        if let Some(u) = a.ui.as_mut() {
+                            u.list_scroll = next;
+                            u.motions[1].snap(next as f64);
+                        }
+                        a.layout_ui();
                     }
                     Some(0)
                 }
@@ -796,6 +861,7 @@ unsafe extern "system" fn procedure(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                             }
                         };
                         u.scroll += delta;
+                        u.motions[0].snap(u.scroll as f64);
                     }
                     a.layout_ui();
                     Some(0)
@@ -849,6 +915,11 @@ unsafe extern "system" fn procedure(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                     if h == a.host {
                         match id {
                             1 => a.open_ui(),
+                            24 => {
+                                a.open_ui();
+                                a.page(3);
+                            }
+                            20..=23 => a.rest.action(w, None, a.host),
                             2 => a.restore_all(),
                             3 => {
                                 a.restore_all();
@@ -1003,6 +1074,7 @@ pub fn run() {
             taskbar: RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),
             can_write,
             launch_results: Default::default(),
+            rest: Default::default(),
         };
         app.restore_all();
         if let Err(e) = app.register(&config, first) {
@@ -1018,6 +1090,8 @@ pub fn run() {
             0,
             WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
         );
+        app.rest.configure(config.rest.clone(), host);
+        windows_sys::Win32::System::RemoteDesktop::WTSRegisterSessionNotification(host, 0);
         app.tray();
         APP.with(|a| *a.borrow_mut() = Some(app));
         if first || config_error {
@@ -1034,6 +1108,12 @@ pub fn run() {
                     .as_ref()
                     .and_then(|a| a.ui.as_ref().map(|u| u.window))
             });
+            if scroll_ui::filter(&msg) {
+                continue;
+            }
+            if rest_ui::Runtime::filter(&msg) {
+                continue;
+            }
             if ui.is_some_and(|h| ui::capture_hotkey(h, &msg) || IsDialogMessageW(h, &msg) != 0) {
                 APP.with(|cell| {
                     if let Some(a) = cell.borrow_mut().as_mut() {
@@ -1051,6 +1131,9 @@ pub fn run() {
             for id in a.keys.keys() {
                 UnregisterHotKey(host, *id);
             }
+            a.rest.close();
+            KillTimer(host, rest_ui::TIMER_ID);
+            windows_sys::Win32::System::RemoteDesktop::WTSUnRegisterSessionNotification(host);
             UnhookWinEvent(a.hook);
             if let Some(u) = &a.ui {
                 DestroyWindow(u.window);
@@ -1126,6 +1209,7 @@ mod tests {
                 taskbar: 0,
                 can_write: true,
                 launch_results: Default::default(),
+                rest: Default::default(),
             };
             app.opacity(h, Some(128), 0).unwrap();
             let (mut color, mut alpha, mut flags) = (0, 0, 0);

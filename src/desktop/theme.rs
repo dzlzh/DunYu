@@ -11,7 +11,7 @@ const WHITE: u32 = 0xffffff;
 const INK: u32 = 0xe5e7eb;
 const MUTED: u32 = 0xa1aab8;
 const BLUE: u32 = 0x2563eb;
-const ACCENT_TEXT: u32 = 0x79b8ff;
+const ACCENT_TEXT: u32 = 0x73bda8;
 const LINE: u32 = 0x343d4b;
 const PALE: u32 = 0x203658;
 fn rgb(hex: u32) -> u32 {
@@ -208,55 +208,49 @@ unsafe fn icon(dc: HDC, r: RECT, index: usize, value: u32) {
     let argb = 0xff000000 | (c & 255) << 16 | c & 0xff00 | c >> 16;
     let unit = (r.right - r.left) as f32 / 24.;
     GdipCreatePen1(argb, 2. * unit, UnitPixel, &mut pen);
-    let paths: &[&[(f32, f32)]] = match index {
-        0 => &[
-            &[(13., 4.), (4., 4.), (4., 20.), (13., 20.)],
-            &[(10., 12.), (21., 12.), (17., 8.)],
-            &[(21., 12.), (17., 16.)],
-        ],
-        1 => &[
-            &[
-                (8., 3.),
-                (16., 3.),
-                (15., 10.),
-                (19., 16.),
-                (5., 16.),
-                (9., 10.),
-                (8., 3.),
-            ],
-            &[(12., 16.), (12., 22.)],
-        ],
-        2 => &[&[
-            (12., 2.),
-            (19., 5.),
-            (22., 12.),
-            (19., 19.),
-            (12., 22.),
-            (5., 19.),
-            (2., 12.),
-            (5., 5.),
-            (12., 2.),
-            (12., 22.),
-        ]],
-        _ => &[
-            &[(3., 6.), (21., 6.)],
-            &[(3., 12.), (21., 12.)],
-            &[(3., 18.), (21., 18.)],
-            &[(8., 3.), (8., 9.)],
-            &[(16., 9.), (16., 15.)],
-            &[(8., 15.), (8., 21.)],
-        ],
-    };
-    for path in paths {
-        for segment in path.windows(2) {
-            GdipDrawLine(
-                graphics,
-                pen,
-                r.left as f32 + segment[0].0 * unit,
-                r.top as f32 + segment[0].1 * unit,
-                r.left as f32 + segment[1].0 * unit,
-                r.top as f32 + segment[1].1 * unit,
-            );
+    GdipSetPenStartCap(pen, LineCapRound);
+    GdipSetPenEndCap(pen, LineCapRound);
+    GdipSetPenLineJoin(pen, LineJoinRound);
+    GdipTranslateWorldTransform(graphics, r.left as f32, r.top as f32, MatrixOrderPrepend);
+    GdipScaleWorldTransform(graphics, unit, unit, MatrixOrderPrepend);
+    GdipSetPenWidth(pen, 1.8);
+    match index {
+        0 => {
+            GdipDrawRectangle(graphics, pen, 3., 4., 18., 16.);
+            GdipDrawLine(graphics, pen, 3., 9., 21., 9.);
+            GdipDrawLine(graphics, pen, 10., 15., 16., 15.);
+            GdipDrawLine(graphics, pen, 13., 12., 16., 15.);
+            GdipDrawLine(graphics, pen, 13., 18., 16., 15.);
+        }
+        1 => {
+            GdipDrawArc(graphics, pen, 2., 7., 13., 10., 70., 250.);
+            GdipDrawArc(graphics, pen, 9., 7., 13., 10., 250., 250.);
+            GdipDrawLine(graphics, pen, 9., 12., 15., 12.);
+        }
+        2 => {
+            GdipDrawBezier(graphics, pen, 2., 12., 7., 3., 17., 3., 22., 12.);
+            GdipDrawBezier(graphics, pen, 2., 12., 7., 21., 17., 21., 22., 12.);
+            GdipDrawEllipse(graphics, pen, 9., 9., 6., 6.);
+        }
+        3 => {
+            GdipDrawBezier(graphics, pen, 5., 19., -1., 8., 12., 4., 21., 3.);
+            GdipDrawBezier(graphics, pen, 21., 3., 21., 15., 17., 23., 5., 19.);
+            GdipDrawBezier(graphics, pen, 3., 22., 7., 16., 12., 12., 17., 8.);
+        }
+        _ => {
+            GdipDrawEllipse(graphics, pen, 5., 5., 14., 14.);
+            GdipDrawEllipse(graphics, pen, 9., 9., 6., 6.);
+            for i in 0..8 {
+                let a = i as f32 * std::f32::consts::FRAC_PI_4;
+                GdipDrawLine(
+                    graphics,
+                    pen,
+                    12. + a.cos() * 7.,
+                    12. + a.sin() * 7.,
+                    12. + a.cos() * 10.,
+                    12. + a.sin() * 10.,
+                );
+            }
         }
     }
     GdipDeletePen(pen);
@@ -299,7 +293,7 @@ unsafe fn paint(h: HWND, dc: HDC, s: &PaintState) {
                 left: px(2),
                 top,
                 right: px(18),
-                bottom: top + px(16),
+                bottom: top + px(20),
             };
             let checked = SendMessageW(h, BM_GETCHECK, 0, 0) != 0;
             rounded(dc, box_rect, px(4), if checked { BLUE } else { MUTED });
@@ -407,6 +401,7 @@ unsafe fn paint(h: HWND, dc: HDC, s: &PaintState) {
             } else {
                 SURFACE
             };
+            let bg = s.tint.unwrap_or(bg);
             let outer = inset(r, px(2));
             rounded(
                 dc,
@@ -441,41 +436,40 @@ unsafe fn paint(h: HWND, dc: HDC, s: &PaintState) {
         Role::Tab => {
             fill(dc, r, BACKGROUND);
             let selected = SendMessageW(h, TCM_GETCURSEL, 0, 0);
-            for i in 0..4 {
+            for i in 0..super::ui::PAGES.len() {
                 let mut item: RECT = std::mem::zeroed();
                 SendMessageW(h, TCM_GETITEMRECT, i, &mut item as *mut _ as isize);
                 if selected == i as isize {
                     rounded(dc, inset(item, px(2)), px(8), PALE);
                 }
                 if selected == i as isize && GetFocus() == h {
-                    let mut line = item;
-                    line.top = line.bottom - px(3);
-                    fill(dc, line, BLUE);
+                    rounded(dc, inset(item, px(2)), px(8), 0x73bda8);
+                    rounded(dc, inset(item, px(4)), px(6), PALE);
                 }
                 let fg = if selected == i as isize {
                     ACCENT_TEXT
                 } else {
                     MUTED
                 };
-                let label = ["召唤", "绑定", "隐现", "设置"][i];
+                let label = super::ui::PAGES[i];
                 let font = SelectObject(dc, SendMessageW(h, WM_GETFONT, 0, 0) as _);
                 let mut size: SIZE = std::mem::zeroed();
                 GetTextExtentPoint32W(dc, wide(label).as_ptr(), 2, &mut size);
                 SelectObject(dc, font);
-                let left = (item.left + item.right - px(24) - size.cx) / 2;
-                let top = (item.top + item.bottom - px(16)) / 2;
+                let left = (item.left + item.right - px(28) - size.cx) / 2;
+                let top = (item.top + item.bottom - px(20)) / 2;
                 icon(
                     dc,
                     RECT {
                         left,
                         top,
-                        right: left + px(16),
-                        bottom: top + px(16),
+                        right: left + px(20),
+                        bottom: top + px(20),
                     },
                     i,
                     fg,
                 );
-                item.left = left + px(24);
+                item.left = left + px(28);
                 item.right = item.left + size.cx;
                 text(dc, h, label, item, fg, DT_LEFT);
             }

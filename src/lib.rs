@@ -1,4 +1,6 @@
+pub mod scroll;
 use serde::{Deserialize, Serialize};
+pub mod rest;
 use std::{collections::HashSet, fs, io, path::Path};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -40,6 +42,8 @@ pub struct AppConfig {
     pub restore_all: Hotkey,
     pub step: u8,
     pub autostart: bool,
+    #[serde(default)]
+    pub rest: rest::RestConfig,
 }
 impl Default for AppConfig {
     fn default() -> Self {
@@ -58,6 +62,7 @@ impl Default for AppConfig {
             restore_all: Hotkey::new(3, 8),
             step: 10,
             autostart: false,
+            rest: Default::default(),
         }
     }
 }
@@ -92,6 +97,7 @@ impl AppConfig {
         b
     }
     pub fn validate(&self) -> Result<(), String> {
+        self.rest.validate()?;
         if self.version != 1 {
             return Err("不支持的配置版本".into());
         }

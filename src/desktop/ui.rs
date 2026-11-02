@@ -1,9 +1,13 @@
 use super::*;
+pub(super) const PAGES: [&str; 5] = ["召唤", "绑定", "隐现", "休憩", "设置"];
 use windows_sys::Win32::System::SystemServices::SS_PATHELLIPSIS;
 use windows_sys::Win32::UI::Controls::Dialogs::*;
 use windows_sys::Win32::UI::Controls::*;
 
-unsafe fn item(window: HWND, id: i32) -> HWND {
+pub(super) unsafe fn item(window: HWND, id: i32) -> HWND {
+    if id == 100 {
+        return GetDlgItem(GetDlgItem(GetDlgItem(window, 9000), 119), 100);
+    }
     let direct = GetDlgItem(window, id);
     if !direct.is_null() {
         direct
@@ -178,6 +182,7 @@ pub(super) unsafe fn control(
     h: i32,
     style: u32,
 ) -> HWND {
+    let page = if page == 3 { 4 } else { page };
     let id = if id == 0 {
         match label {
             "程序召唤" => 7000,
@@ -194,7 +199,7 @@ pub(super) unsafe fn control(
     } else {
         id
     };
-    let x = if page == 3 {
+    let x = if page == 4 {
         match x {
             244 | 245 => 20,
             380 => 200,
@@ -230,6 +235,7 @@ pub(super) unsafe fn control(
     let role = match kind {
         "STATIC" if id == 9002 => theme::Role::Brand,
         "SCROLLBAR" => theme::Role::Scrollbar,
+        "DunYu.Content.1" => theme::Role::Surface,
         "BUTTON" if style & 15 == BS_AUTOCHECKBOX as u32 => theme::Role::Checkbox,
         "EDIT" => theme::Role::Edit,
         "SysTabControl32" => theme::Role::Tab,
@@ -334,6 +340,14 @@ impl App {
             pending_opacity: None,
             advanced: false,
             scroll: 0,
+            list_scroll: 0,
+            motions: Default::default(),
+            split_ratio: std::fs::read(self.dir.join("ui-state.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<f64>(&b).ok())
+                .filter(|v| v.is_finite() && (0.1..=0.8).contains(v))
+                .unwrap_or(0.36),
+            dragging: false,
             baseline: vec![],
         };
         let tab = control(
@@ -358,7 +372,7 @@ impl App {
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
-        for (i, name) in ["召唤", "绑定", "隐现", "设置"].iter().enumerate() {
+        for (i, name) in PAGES.iter().enumerate() {
             let mut label = wide(name);
             let mut entry: TCITEMW = std::mem::zeroed();
             entry.mask = TCIF_TEXT;
@@ -377,6 +391,31 @@ impl App {
             30,
             0,
         );
+        let clip = control(
+            &mut u,
+            0,
+            "DunYu.Content.1",
+            "",
+            119,
+            36,
+            76,
+            180,
+            268,
+            WS_CLIPCHILDREN,
+        );
+        SetWindowLongPtrW(clip, GWL_EXSTYLE, WS_EX_CONTROLPARENT as isize);
+        control(
+            &mut u,
+            0,
+            "STATIC",
+            "",
+            120,
+            244,
+            12,
+            16,
+            400,
+            windows_sys::Win32::System::SystemServices::SS_NOTIFY,
+        );
         u.list = control(
             &mut u,
             0,
@@ -387,8 +426,13 @@ impl App {
             52,
             200,
             310,
-            LBS_NOTIFY as u32 | LBS_OWNERDRAWFIXED as u32 | LBS_HASSTRINGS as u32 | WS_TABSTOP,
+            LBS_NOTIFY as u32
+                | LBS_OWNERDRAWFIXED as u32
+                | LBS_HASSTRINGS as u32
+                | LBS_NOINTEGRALHEIGHT as u32
+                | WS_TABSTOP,
         );
+        SetParent(u.list, clip);
         control(
             &mut u,
             99,
@@ -846,6 +890,103 @@ impl App {
             32,
             WS_TABSTOP,
         );
+        let start = u.controls.len();
+        control(
+            &mut u,
+            5,
+            "STATIC",
+            "提前30秒预告，小憩与舒展分别设置。",
+            811,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+        control(&mut u, 5, "STATIC", "", 810, 0, 0, 0, 0, 0);
+        for (id, label, on) in [
+            (
+                800,
+                "启用小憩",
+                self.config.rest.enabled && self.config.rest.short_enabled,
+            ),
+            (
+                817,
+                "启用舒展",
+                self.config.rest.enabled && self.config.rest.long_enabled,
+            ),
+            (
+                815,
+                "小憩到点自动开始（关闭则只提醒）",
+                self.config.rest.short_auto_start,
+            ),
+            (
+                816,
+                "舒展到点自动开始（关闭则只提醒）",
+                self.config.rest.long_auto_start,
+            ),
+            (
+                805,
+                "休息时全屏显示（所有显示器）",
+                self.config.rest.fullscreen,
+            ),
+            (
+                806,
+                "离开电脑5分钟后重新计时",
+                self.config.rest.natural_breaks,
+            ),
+            (
+                807,
+                "全屏应用或演示时暂缓提醒",
+                self.config.rest.defer_fullscreen,
+            ),
+        ] {
+            let c = control(
+                &mut u,
+                5,
+                "BUTTON",
+                label,
+                id,
+                0,
+                0,
+                0,
+                0,
+                BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
+            );
+            SendMessageW(c, BM_SETCHECK, usize::from(on), 0);
+        }
+        for (id, label, value) in [
+            (801, "小憩间隔（分钟）", self.config.rest.interval_minutes),
+            (802, "小憩时长（秒）", self.config.rest.short_seconds),
+            (803, "舒展时长（分钟）", self.config.rest.long_minutes),
+            (804, "舒展间隔（分钟）", self.config.rest.long_interval()),
+        ] {
+            control(&mut u, 5, "STATIC", label, id + 6000, 0, 0, 0, 0, 0);
+            control(
+                &mut u,
+                5,
+                "EDIT",
+                &value.to_string(),
+                id,
+                0,
+                0,
+                0,
+                0,
+                WS_TABSTOP | ES_NUMBER as u32,
+            );
+        }
+        for (id, label) in [
+            (808, "保存休憩"),
+            (809, "预览提醒"),
+            (812, "现在休息"),
+            (813, "暂停30分钟"),
+            (814, "恢复提醒"),
+        ] {
+            control(&mut u, 5, "BUTTON", label, id, 0, 0, 0, 0, WS_TABSTOP);
+        }
+        for (page, _) in &mut u.controls[start..] {
+            *page = 3;
+        }
         self.ui = Some(u);
         self.scale_ui(GetDpiForWindow(h).max(96), None);
         self.refresh_list();
@@ -860,7 +1001,10 @@ impl App {
     }
 
     pub(super) unsafe fn scale_ui(&mut self, dpi: u32, suggested: Option<RECT>) {
+        KillTimer(self.host, super::scroll_ui::TIMER);
         let Some(u) = self.ui.as_mut() else { return };
+        u.motions[0].snap(u.scroll as f64);
+        u.motions[1].snap(u.list_scroll as f64);
         u.dpi = dpi;
         for (kind, logical) in [(ICON_SMALL, 16), (ICON_BIG, 32)] {
             let size = logical * dpi as i32 / 96;
@@ -960,6 +1104,23 @@ impl App {
     pub(super) unsafe fn reveal_focus(&mut self) {
         let Some(u) = self.ui.as_mut() else { return };
         let focus = GetFocus();
+        if focus == u.list {
+            let selected = SendMessageW(u.list, LB_GETCURSEL, 0, 0) as i32;
+            if selected >= 0 {
+                let mut bounds: RECT = std::mem::zeroed();
+                GetClientRect(item(u.window, 119), &mut bounds);
+                let height = bounds.bottom * 96 / u.dpi as i32;
+                if selected * 64 < u.list_scroll {
+                    u.list_scroll = selected * 64;
+                }
+                if (selected + 1) * 64 > u.list_scroll + height {
+                    u.list_scroll = (selected + 1) * 64 - height;
+                }
+                u.motions[1].snap(u.list_scroll as f64);
+                self.layout_ui();
+            }
+            return;
+        }
         if GetParent(focus) != u.content {
             return;
         }
@@ -979,6 +1140,7 @@ impl App {
         };
         if adjustment != 0 {
             u.scroll += adjustment * 96 / u.dpi as i32;
+            u.motions[0].snap(u.scroll as f64);
             self.layout_ui();
         }
     }
@@ -1026,6 +1188,7 @@ impl App {
             }
             1 => 64 + (4 / columns) * (192 + slot_extra),
             2 => 520,
+            3 => 810,
             _ => 580,
         };
         u.scroll = u.scroll.clamp(0, (extent - viewport).max(0));
@@ -1053,7 +1216,9 @@ impl App {
         GetClientRect(u.content, &mut content);
         let bw = content.right * 96 / u.dpi as i32;
         let right = bw - 24;
-        let form = 284;
+        let left_width = ((bw - 64) as f64 * u.split_ratio)
+            .clamp(240., (bw - 64 - 420).clamp(240, 480) as f64) as i32;
+        let form = 24 + left_width + 16 + 20;
         let fw = (right - form - 20).max(160);
         let card_width = (bw - 48 - 16 * (columns - 1)) / columns;
         let slot = |i: i32| {
@@ -1065,12 +1230,12 @@ impl App {
         let mut cards = vec![];
         match u.page {
             0 => {
-                cards.push(rect(24, 12 - u.scroll, 220, 400));
+                cards.push(rect(24, 12, left_width, (viewport - 24).max(180)));
                 cards.push(rect(
-                    264,
+                    24 + left_width + 16,
                     12 - u.scroll,
-                    bw - 288,
-                    if u.advanced { 864 } else { 404 },
+                    bw - left_width - 64,
+                    (if u.advanced { 864 } else { 404 }).max(viewport - 24),
                 ));
             }
             1 => {
@@ -1084,27 +1249,60 @@ impl App {
                 cards.push(rect(24, 204 - u.scroll, bw - 48, 204));
                 cards.push(rect(24, 424 - u.scroll, bw - 48, 72));
             }
+            3 => {
+                cards.push(rect(24, 12 - u.scroll, bw - 48, 780));
+            }
             _ => {
                 cards.push(rect(24, 12 - u.scroll, bw - 48, 296));
                 cards.push(rect(24, 324 - u.scroll, bw - 48, 100));
                 cards.push(rect(24, 440 - u.scroll, bw - 48, 116));
             }
         }
+        let list_height = (viewport - 160).max(64);
+        let count = SendMessageW(u.list, LB_GETCOUNT, 0, 0).max(0) as i32;
+        u.list_scroll = u.list_scroll.clamp(0, (count * 64 - list_height).max(0));
+        let list_info = SCROLLINFO {
+            cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+            fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+            nMin: 0,
+            nMax: (count * 64 - 1).max(0),
+            nPage: list_height as u32,
+            nPos: u.list_scroll,
+            nTrackPos: 0,
+        };
+        SetScrollInfo(item(u.window, 9004), SB_CTL, &list_info, 0);
+        SendMessageW(u.list, LB_SETTOPINDEX, (u.list_scroll / 64) as usize, 0);
         let mut fields = vec![];
         let mut placements = vec![];
         for (page, c) in &u.controls {
             let id = GetDlgCtrlID(*c);
             let area: Option<(i32, i32, i32, i32)> = match id {
-                9 => Some((148, 18, 500, 40)),
+                9 => Some((148, 18, width - 172, 40)),
                 9002 => Some((24, 22, 112, 32)),
-                9003 => Some((width - 16, 76, 14, viewport)),
-                9004 => Some((220, 76, 12, 268)),
+                9003 if extent > viewport => Some((width - 16, 76, 14, viewport)),
+                9003 => None,
+                9004 if count * 64 > list_height => {
+                    Some((24 + left_width - 24, 76, 12, list_height))
+                }
+                9004 => None,
+                119 => Some((36, 76, left_width - 40, (viewport - 160).max(64))),
+                120 => Some((24 + left_width, 12, 16, (viewport - 24).max(180))),
                 9001 => Some((24, height - 48, width - save_width - 64, 40)),
                 113 | 330 | 506 => Some((width - save_width - 24, height - 54, save_width, 44)),
-                7000 => Some((44, 32, 180, 28)),
-                100 => Some((36, 76, 180, 268)),
-                110 => Some((40, 360, 100, 36)),
-                111 => Some((144, 360, 84, 36)),
+                7000 => Some((44, 32, left_width - 40, 28)),
+                100 => Some((
+                    0,
+                    -(u.list_scroll % 64),
+                    left_width - 40,
+                    (viewport - 160).max(64) + u.list_scroll % 64,
+                )),
+                110 => Some((40, viewport - 68, (left_width - 40) / 2 - 4, 36)),
+                111 => Some((
+                    40 + (left_width - 40) / 2 + 4,
+                    viewport - 68,
+                    (left_width - 40) / 2 - 4,
+                    36,
+                )),
                 118 if self.config.rules.is_empty() => Some((56, 148, 156, 28)),
                 114 => Some((form, 32, fw, 28)),
                 112 => Some((form, 76, 220, 36)),
@@ -1203,14 +1401,59 @@ impl App {
                 504 => Some((244, 374, 160, 36)),
                 7050 => Some((44, 456, bw - 88, 28)),
                 505 => Some((44, 502, bw - 88, 30)),
+                800 => Some((44, 92, bw - 88, 32)),
+                811 => Some((44, 32, bw - 88, 30)),
+                810 => Some((44, 62, bw - 88, 28)),
+                801..=804 => Some((
+                    284,
+                    match id {
+                        801 => 140,
+                        802 => 192,
+                        803 => 400,
+                        _ => 348,
+                    },
+                    bw - 328,
+                    36,
+                )),
+                6801..=6804 => Some((
+                    44,
+                    match id {
+                        6801 => 144,
+                        6802 => 196,
+                        6803 => 404,
+                        _ => 352,
+                    },
+                    224,
+                    30,
+                )),
+                805..=807 => Some((44, 510 + (id - 805) * 42, bw - 88, 32)),
+                815..=816 => Some((44, if id == 815 { 244 } else { 452 }, bw - 88, 32)),
+                817 => Some((44, 304, bw - 88, 32)),
+                808 => Some((44, 714, 180, 44)),
+                809 => Some((244, 714, 180, 44)),
+                812..=814 => Some((44 + (id - 812) * 180, 650, 168, 44)),
                 7051 => None,
                 _ => None,
             };
             let visible = (*page == 99 || *page == u.page) && area.is_some();
-            ShowWindow(*c, if visible { SW_SHOW } else { SW_HIDE });
+            if !visible {
+                ShowWindow(*c, SW_HIDE);
+            }
             if let Some((x, y, w, h)) = area {
                 let root = *page == 99 || matches!(id, 113 | 330 | 506);
-                let mut r = rect(x, if root { y } else { y - u.scroll }, w, h);
+                let mut r = rect(
+                    x,
+                    if root
+                        || (u.page == 0
+                            && matches!(id, 100 | 110 | 111 | 118 | 119 | 120 | 7000 | 9004))
+                    {
+                        y
+                    } else {
+                        y - u.scroll
+                    },
+                    w,
+                    h,
+                );
                 if class(*c).eq_ignore_ascii_case("button")
                     && GetWindowLongPtrW(*c, GWL_STYLE) as u32 & 15 != BS_AUTOCHECKBOX as u32
                 {
@@ -1233,7 +1476,9 @@ impl App {
                     r.top += scale(8);
                     r.bottom -= scale(6);
                 }
-                placements.push((*c, r));
+                if visible {
+                    placements.push((*c, r));
+                }
                 theme::scene(*c, u.dpi, vec![], vec![]);
             }
         }
@@ -1250,18 +1495,19 @@ impl App {
             item(u.window, 9),
             TCM_SETITEMSIZE,
             0,
-            ((scale(40) as isize) << 16) | scale(112) as isize,
+            ((scale(40) as isize) << 16) | scale(((width - 172) / 5).min(112)) as isize,
         );
         SendMessageW(u.list, LB_SETITEMHEIGHT, 0, scale(64) as isize);
         theme::sync_list_scroll(u.list);
         theme::scene(u.content, u.dpi, cards, fields);
         theme::scene(u.window, u.dpi, vec![], vec![]);
-        for parent in [u.window, u.content] {
+        for parent in [u.window, u.content, item(u.window, 119)] {
             let group: Vec<_> = placements
                 .iter()
                 .filter(|(h, _)| GetParent(*h) == parent)
                 .collect();
-            let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOCOPYBITS;
+            let flags =
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOCOPYBITS | SWP_SHOWWINDOW;
             let mut batch = BeginDeferWindowPos(group.len() as i32);
             for (child, r) in &group {
                 if batch.is_null() {
@@ -1292,6 +1538,7 @@ impl App {
                 }
             }
         }
+        SendMessageW(u.list, LB_SETTOPINDEX, (u.list_scroll / 64) as usize, 0);
         theme::sync_list_scroll(u.list);
         SendMessageW(u.content, WM_SETREDRAW, 1, 0);
         RedrawWindow(
@@ -1413,17 +1660,9 @@ impl App {
         if let Some(u) = &mut self.ui {
             u.page = page;
             u.scroll = 0;
+            u.motions[0].snap(0.);
+            u.motions[1].snap(u.list_scroll as f64);
             SendMessageW(item(u.window, 9), TCM_SETCURSEL, page, 0);
-            for (p, h) in &u.controls {
-                ShowWindow(
-                    *h,
-                    if *p == 99 || *p == page {
-                        SW_SHOW
-                    } else {
-                        SW_HIDE
-                    },
-                );
-            }
             for i in 0..4 {
                 let label = self
                     .slots
@@ -1434,6 +1673,9 @@ impl App {
                     .unwrap_or("尚未绑定".into());
                 set_text(u.window, 340 + i as i32, &label);
             }
+        }
+        if let Some(u) = &self.ui {
+            set_text(u.window, 810, &self.rest.status());
         }
         self.layout_ui();
         self.refresh_state();
@@ -1524,6 +1766,47 @@ impl App {
     pub(super) unsafe fn ui_action(&mut self, id: i32) -> Result<(), String> {
         let h = self.ui.as_ref().unwrap().window;
         match id {
+            808 => {
+                let value = |id| {
+                    text_at(h, id)
+                        .parse::<u32>()
+                        .map_err(|_| "请填写正整数".to_string())
+                };
+                let rest = dunyu::rest::RestConfig {
+                    enabled: checked(h, 800) || checked(h, 817),
+                    short_enabled: checked(h, 800),
+                    long_enabled: checked(h, 817),
+                    long_interval_minutes: Some(value(804)?),
+                    interval_minutes: value(801)?,
+                    short_seconds: value(802)?,
+                    long_minutes: value(803)?,
+                    long_every: self.config.rest.long_every,
+                    fullscreen: checked(h, 805),
+                    short_auto_start: checked(h, 815),
+                    long_auto_start: checked(h, 816),
+                    natural_breaks: checked(h, 806),
+                    defer_fullscreen: checked(h, 807),
+                };
+                rest.validate()?;
+                let mut next = self.config.clone();
+                next.rest = rest.clone();
+                atomic_json(&self.dir.join("config.json"), &next).map_err(|e| e.to_string())?;
+                self.config = next;
+                self.rest.configure(rest, self.host);
+                self.status_success("休憩设置已保存");
+            }
+            809 | 812..=814 => {
+                self.rest.action(
+                    match id {
+                        809 => 23,
+                        812 => 1,
+                        813 => 20,
+                        _ => 22,
+                    },
+                    None,
+                    self.host,
+                );
+            }
             110 => {
                 if self.leave_rule() {
                     self.fill_rule(None);
@@ -1674,6 +1957,9 @@ impl App {
                 }
             }
             _ => {}
+        }
+        if (808..=814).contains(&id) {
+            set_text(h, 810, &self.rest.status());
         }
         if matches!(id, 330 | 506) {
             self.status_success("修改已保存");
@@ -1873,6 +2159,7 @@ mod capture_tests {
                     taskbar: 0,
                     can_write: true,
                     launch_results: Default::default(),
+                    rest: Default::default(),
                 },
                 external,
             };
@@ -1887,12 +2174,43 @@ mod capture_tests {
             app.ui.as_mut().unwrap().target = None;
             app.refresh_state();
             assert!(!item(h, 201).is_null());
+            assert_eq!(
+                IsWindowVisible(item(h, 9004)),
+                0,
+                "empty list must not show scrollbar"
+            );
             assert_eq!(GetAncestor(item(h, 201), GA_ROOT), h);
             assert_eq!(app.rule_snapshot(), app.ui.as_ref().unwrap().baseline);
             set_text(h, 200, "测试程序");
             set_text(h, 201, "C:\\测试\\demo.exe");
             check(h, 208, false);
             assert_ne!(app.rule_snapshot(), app.ui.as_ref().unwrap().baseline);
+            let saved_rest = app.config.rest.clone();
+            set_text(h, 801, "0");
+            assert!(app.ui_action(808).is_err());
+            assert_eq!(app.config.rest, saved_rest);
+            set_text(h, 801, "30");
+            check(h, 815, false);
+            check(h, 816, true);
+            app.ui_action(808).unwrap();
+            assert_eq!(app.config.rest.interval_minutes, 30);
+            assert!(!app.config.rest.short_auto_start);
+            assert!(app.config.rest.long_auto_start);
+            check(h, 800, false);
+            check(h, 817, true);
+            set_text(h, 804, "45");
+            app.ui_action(808).unwrap();
+            assert!(!app.config.rest.short_enabled);
+            assert!(app.config.rest.long_enabled);
+            assert_eq!(app.config.rest.long_interval(), 45);
+            assert!(app.rest.scheduler.long());
+            check(h, 817, false);
+            app.ui_action(808).unwrap();
+            assert_eq!(app.rest.scheduler.phase, dunyu::rest::Phase::Disabled);
+            let saved_interval = app.rest.scheduler.remaining_ms;
+            app.refresh_state();
+            assert_eq!(app.rest.scheduler.remaining_ms, saved_interval);
+
             app.page(1);
             app.page(0);
             assert_eq!(text_at(h, 200), "测试程序");
@@ -1916,7 +2234,13 @@ mod capture_tests {
             assert_ne!(app.rule_snapshot(), app.ui.as_ref().unwrap().baseline);
             if std::env::var_os("DUNYU_UI_SCREENSHOTS").is_some() {
                 std::fs::create_dir_all("target/ui-preview").unwrap();
-                for (page, name) in [(0, "summon"), (1, "bind"), (2, "opacity"), (3, "settings")] {
+                for (page, name) in [
+                    (0, "summon"),
+                    (1, "bind"),
+                    (2, "opacity"),
+                    (3, "rest"),
+                    (4, "settings"),
+                ] {
                     app.page(page);
                     theme::capture(h, &format!("target/ui-preview/{name}.bmp")).unwrap();
                 }
@@ -1941,6 +2265,51 @@ mod capture_tests {
             assert!(IsWindowVisible(item(h, 204)) != 0);
             if std::env::var_os("DUNYU_UI_SCREENSHOTS").is_some() {
                 theme::capture(h, "target/ui-preview/advanced.bmp").unwrap();
+            }
+            if std::env::var_os("DUNYU_UI_TRANSITION_CHECK").is_some() {
+                std::fs::create_dir_all("target/ui-preview").unwrap();
+                let address = h as usize;
+                let recorder = std::thread::spawn(move || {
+                    for frame in 0..40 {
+                        let path = format!("target/ui-preview/transition-{frame:02}.bmp");
+                        theme::capture_screen(address as HWND, &path).unwrap();
+                        let bytes = std::fs::read(&path).unwrap();
+                        let width = i32::from_le_bytes(bytes[18..22].try_into().unwrap()) as usize;
+                        let height = i32::from_le_bytes(bytes[22..26].try_into().unwrap())
+                            .unsigned_abs() as usize;
+                        // A broad bright rectangle in the dark content area is not text.
+                        let mut rows = 0;
+                        for y in 100..height.saturating_sub(40) {
+                            let mut run = 0;
+                            let mut broad = false;
+                            for x in 20..width.saturating_sub(20) {
+                                let offset = 54 + (y * width + x) * 4;
+                                if bytes[offset..offset + 3].iter().all(|c| *c > 235) {
+                                    run += 1;
+                                } else {
+                                    run = 0;
+                                }
+                                if run >= 160 {
+                                    broad = true;
+                                }
+                            }
+                            rows = if broad { rows + 1 } else { 0 };
+                            assert!(rows < 20, "white flash in {path}");
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(16));
+                    }
+                });
+                for page in [0, 2, 1, 2, 3, 2, 4, 2].into_iter().cycle().take(32) {
+                    app.page(page);
+                    let mut message: MSG = std::mem::zeroed();
+                    while PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                        TranslateMessage(&message);
+                        DispatchMessageW(&message);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                recorder.join().unwrap();
+                app.page(0);
             }
             // Opt in on an interactive Windows desktop: compare the actual displayed
             // pixels after scrolling with a complete repaint at identical geometry.
@@ -1976,6 +2345,24 @@ mod capture_tests {
                 (r.right - r.left, r.bottom - r.top)
             };
             app.scale_ui(96, None);
+            let normal_list = rect(item(h, 119));
+            SetWindowPos(
+                h,
+                null_mut(),
+                0,
+                0,
+                1400,
+                900,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            app.layout_ui();
+            assert!(rect(item(h, 119)).0 > normal_list.0);
+            assert!(rect(item(h, 119)).1 > normal_list.1);
+            app.ui.as_mut().unwrap().split_ratio = 0.5;
+            app.layout_ui();
+            assert!(rect(item(h, 119)).0 > normal_list.0);
+            app.ui.as_mut().unwrap().split_ratio = 0.36;
+            app.scale_ui(96, None);
             let before = rect(item(h, 201));
             for dpi in [144, 192, 120, 96] {
                 app.scale_ui(dpi, None);
@@ -2001,7 +2388,7 @@ mod capture_tests {
                             SendMessageW(*child, WM_SETFONT, large_font as usize, 0);
                         }
                     }
-                    for page in 0..4 {
+                    for page in 0..5 {
                         app.page(page);
                         for (_, child) in &app.ui.as_ref().unwrap().controls {
                             if IsWindowVisible(*child) == 0
