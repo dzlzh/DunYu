@@ -1,5 +1,5 @@
 use super::*;
-pub(super) const PAGES: [&str; 5] = ["召唤", "绑定", "隐现", "休憩", "设置"];
+pub(super) const PAGES: [&str; 6] = ["召唤", "绑定", "隐现", "休憩", "传讯", "设置"];
 use windows_sys::Win32::System::SystemServices::SS_PATHELLIPSIS;
 use windows_sys::Win32::UI::Controls::Dialogs::*;
 use windows_sys::Win32::UI::Controls::*;
@@ -182,14 +182,14 @@ pub(super) unsafe fn control(
     h: i32,
     style: u32,
 ) -> HWND {
-    let page = if page == 3 { 4 } else { page };
+    let page = if page == 3 { 5 } else { page };
     let id = if id == 0 {
         match label {
             "程序召唤" => 7000,
             "窗口绑定 · 仅在当前会话有效" => 7001,
             "窗口不透明度" => 7002,
             "全局快捷键" => 7003,
-            "调整步长 · 每次改变的不透明度百分点" => 7040,
+            "调整步长" => 7040,
             "启动与后台运行" => 7050,
             "点击后切换到需要调整的窗口" => 7010,
             "增减快捷键支持长按连续调整；步长可在设置页修改。" => 7011,
@@ -199,7 +199,7 @@ pub(super) unsafe fn control(
     } else {
         id
     };
-    let x = if page == 4 {
+    let x = if page == 5 {
         match x {
             244 | 245 => 20,
             380 => 200,
@@ -234,6 +234,11 @@ pub(super) unsafe fn control(
     SendMessageW(c, WM_SETFONT, GetStockObject(DEFAULT_GUI_FONT) as usize, 1);
     let role = match kind {
         "STATIC" if id == 9002 => theme::Role::Brand,
+        "STATIC" if matches!(id, 7000..=7003 | 7012 | 7040 | 7050 | 820..=823 | 350..=353 | 114) => {
+            theme::Role::Heading
+        }
+        "msctls_trackbar32" => theme::Role::Slider,
+        "STATIC" if id == 120 => theme::Role::Gutter,
         "SCROLLBAR" => theme::Role::Scrollbar,
         "DunYu.Content.1" => theme::Role::Surface,
         "BUTTON" if style & 15 == BS_AUTOCHECKBOX as u32 => theme::Role::Checkbox,
@@ -298,6 +303,19 @@ impl App {
         }
         let dark: i32 = 1;
         windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute(h, 20, &dark as *const _ as _, 4);
+        for (attribute, value) in [
+            (35, theme::BACKGROUND),
+            (36, theme::INK),
+            (34, theme::POND_RIPPLE),
+        ] {
+            let color = (value & 255) << 16 | value & 0xff00 | value >> 16;
+            windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+                h,
+                attribute,
+                &color as *const _ as _,
+                4,
+            );
+        }
         let content = CreateWindowExW(
             WS_EX_CONTROLPARENT,
             wide("DunYu.Content.1").as_ptr(),
@@ -829,18 +847,7 @@ impl App {
         ] {
             field(&mut u, 3, label, id, y, &value);
         }
-        control(
-            &mut u,
-            3,
-            "STATIC",
-            "调整步长 · 每次改变的不透明度百分点",
-            0,
-            244,
-            240,
-            600,
-            28,
-            0,
-        );
+        control(&mut u, 3, "STATIC", "调整步长", 0, 244, 240, 600, 28, 0);
         control(
             &mut u,
             3,
@@ -915,16 +922,8 @@ impl App {
                 "启用舒展",
                 self.config.rest.enabled && self.config.rest.long_enabled,
             ),
-            (
-                815,
-                "小憩到点自动开始（关闭则只提醒）",
-                self.config.rest.short_auto_start,
-            ),
-            (
-                816,
-                "舒展到点自动开始（关闭则只提醒）",
-                self.config.rest.long_auto_start,
-            ),
+            (815, "小憩到点自动开始", self.config.rest.short_auto_start),
+            (816, "舒展到点自动开始", self.config.rest.long_auto_start),
             (
                 805,
                 "休息时全屏显示（所有显示器）",
@@ -987,6 +986,16 @@ impl App {
         for (page, _) in &mut u.controls[start..] {
             *page = 3;
         }
+        control(&mut u, 3, "STATIC", "设置", 7012, 0, 0, 0, 0, 0);
+        for (id, label) in [
+            (820, "休憩提醒"),
+            (821, "小憩"),
+            (822, "舒展"),
+            (823, "通用选项"),
+        ] {
+            control(&mut u, 6, "STATIC", label, id, 0, 0, 0, 0, 0);
+            u.controls.last_mut().unwrap().0 = 3;
+        }
         self.ui = Some(u);
         self.scale_ui(GetDpiForWindow(h).max(96), None);
         self.refresh_list();
@@ -1022,11 +1031,14 @@ impl App {
         let mut font: LOGFONTW = std::mem::zeroed();
         font.lfHeight = -(14 * dpi as i32 / 96);
         font.lfCharSet = DEFAULT_CHARSET;
-        let face = wide("Microsoft YaHei UI");
+        let face = wide("Source Han Serif SC");
         font.lfFaceName[..face.len()].copy_from_slice(&face);
         let new_font = CreateFontIndirectW(&font);
         font.lfHeight = -(22 * dpi as i32 / 96);
         font.lfWeight = 600;
+        font.lfFaceName = [0; 32];
+        let heading_face = wide("Source Han Serif SC");
+        font.lfFaceName[..heading_face.len()].copy_from_slice(&heading_face);
         let heading = CreateFontIndirectW(&font);
         if !new_font.is_null() {
             for (_, c) in &u.controls {
@@ -1039,7 +1051,8 @@ impl App {
         }
         if !heading.is_null() {
             for (_, c) in &u.controls {
-                if matches!(GetDlgCtrlID(*c), 7000..=7003 | 7040 | 7050 | 350..=353 | 114 | 9002) {
+                if matches!(GetDlgCtrlID(*c), 9 | 7000..=7003 | 7012 | 7040 | 7050 | 820..=823 | 350..=353 | 114 | 9002)
+                {
                     SendMessageW(*c, WM_SETFONT, heading as usize, 1);
                 }
             }
@@ -1063,8 +1076,8 @@ impl App {
             let mut size = RECT {
                 left: 0,
                 top: 0,
-                right: 900 * dpi as i32 / 96,
-                bottom: 600 * dpi as i32 / 96,
+                right: 1024 * dpi as i32 / 96,
+                bottom: 650 * dpi as i32 / 96,
             };
             AdjustWindowRectExForDpi(&mut size, WS_OVERLAPPEDWINDOW, 0, WS_EX_CONTROLPARENT, dpi);
             RECT {
@@ -1147,6 +1160,11 @@ impl App {
 
     pub(super) unsafe fn layout_ui(&mut self) {
         let Some(u) = self.ui.as_mut() else { return };
+        for (toggle, ids) in [(800, [801, 802, 815]), (817, [804, 803, 816])] {
+            for id in ids {
+                EnableWindow(item(u.window, id), i32::from(checked(u.window, toggle)));
+            }
+        }
         let scale = |v: i32| v * u.dpi as i32 / 96;
         let rect = |x, y, w, h| RECT {
             left: scale(x),
@@ -1177,7 +1195,14 @@ impl App {
         let width = client.right * 96 / u.dpi as i32;
         let height = client.bottom * 96 / u.dpi as i32;
         let viewport = (height - 140).max(1);
-        let columns = if width >= 840 { 2 } else { 1 };
+        let columns = if width >= 960 { 2 } else { 1 };
+        let action_width = [808, 809, 812, 813, 814]
+            .into_iter()
+            .map(|id| button_width(id, 148))
+            .max()
+            .unwrap();
+        let action_columns = ((width - 104 + 12) / (action_width + 12)).clamp(1, 5);
+        let action_rows = (5 + action_columns - 1) / action_columns;
         let extent = match u.page {
             0 => {
                 if u.advanced {
@@ -1188,8 +1213,21 @@ impl App {
             }
             1 => 64 + (4 / columns) * (192 + slot_extra),
             2 => 520,
-            3 => 810,
-            _ => 580,
+            3 => {
+                if columns == 2 {
+                    490 + action_rows * 56 + 12
+                } else {
+                    738 + action_rows * 56 + 12
+                }
+            }
+            4 => 0,
+            _ => {
+                if columns == 2 {
+                    390
+                } else {
+                    660
+                }
+            }
         };
         u.scroll = u.scroll.clamp(0, (extent - viewport).max(0));
         // Suppress intermediate paints; child geometry and paint snapshots form one frame.
@@ -1250,12 +1288,31 @@ impl App {
                 cards.push(rect(24, 424 - u.scroll, bw - 48, 72));
             }
             3 => {
-                cards.push(rect(24, 12 - u.scroll, bw - 48, 780));
+                let group_width = (bw - 88 - 16 * (columns - 1)) / columns;
+                let common_y = if columns == 2 { 318 } else { 566 };
+                cards.push(rect(24, 12 - u.scroll, bw - 48, extent - 24));
+                for i in 0..2 {
+                    cards.push(rect(
+                        44 + (i % columns) * (group_width + 16),
+                        112 + (i / columns) * 248 - u.scroll,
+                        group_width,
+                        232,
+                    ));
+                }
+                cards.push(rect(44, common_y + 42 - u.scroll, bw - 88, 128));
             }
+            4 => {}
             _ => {
-                cards.push(rect(24, 12 - u.scroll, bw - 48, 296));
-                cards.push(rect(24, 324 - u.scroll, bw - 48, 100));
-                cards.push(rect(24, 440 - u.scroll, bw - 48, 116));
+                if columns == 2 {
+                    let left = (bw - 64) * 3 / 5;
+                    cards.push(rect(24, 64 - u.scroll, left, 296));
+                    cards.push(rect(40 + left, 64 - u.scroll, bw - left - 64, 156));
+                    cards.push(rect(40 + left, 236 - u.scroll, bw - left - 64, 124));
+                } else {
+                    cards.push(rect(24, 64 - u.scroll, bw - 48, 296));
+                    cards.push(rect(24, 376 - u.scroll, bw - 48, 140));
+                    cards.push(rect(24, 532 - u.scroll, bw - 48, 116));
+                }
             }
         }
         let list_height = (viewport - 160).max(64);
@@ -1277,8 +1334,8 @@ impl App {
         for (page, c) in &u.controls {
             let id = GetDlgCtrlID(*c);
             let area: Option<(i32, i32, i32, i32)> = match id {
-                9 => Some((148, 18, width - 172, 40)),
-                9002 => Some((24, 22, 112, 32)),
+                9 => Some((206, 14, width - 230, 52)),
+                9002 => Some((24, 10, 174, 56)),
                 9003 if extent > viewport => Some((width - 16, 76, 14, viewport)),
                 9003 => None,
                 9004 if count * 64 > list_height => {
@@ -1303,7 +1360,12 @@ impl App {
                     (left_width - 40) / 2 - 4,
                     36,
                 )),
-                118 if self.config.rules.is_empty() => Some((56, 148, 156, 28)),
+                118 if self.config.rules.is_empty() => Some((
+                    44,
+                    76 + (viewport - 160).max(64) / 2 + 28,
+                    left_width - 40,
+                    28,
+                )),
                 114 => Some((form, 32, fw, 28)),
                 112 => Some((form, 76, 220, 36)),
                 200 | 201 | 207 | 6200 | 6201 | 6207 => {
@@ -1385,53 +1447,97 @@ impl App {
                 403 => Some((44, 360, 220, 36)),
                 404 => Some((44, 442, 240, 36)),
                 7011 => None,
-                7003 => Some((44, 32, bw - 88, 28)),
+                7012 => Some((24, 12, bw - 48, 32)),
+                7003 => Some((
+                    44,
+                    80,
+                    if columns == 2 {
+                        (bw - 64) * 3 / 5 - 40
+                    } else {
+                        bw - 88
+                    },
+                    32,
+                )),
                 500..=503 | 6500..=6503 => {
                     let field = if id >= 6000 { id - 6000 } else { id };
-                    let y = 84 + (field - 500) * 50;
+                    let left = if columns == 2 {
+                        (bw - 64) * 3 / 5
+                    } else {
+                        bw - 48
+                    };
                     Some((
-                        if id >= 6000 { 44 } else { 244 },
-                        y,
-                        if id >= 6000 { 180 } else { bw - 288 },
+                        if id >= 6000 { 44 } else { 184 },
+                        138 + (field - 500) * 50,
+                        if id >= 6000 { 132 } else { left - 180 },
                         36,
                     ))
                 }
-                7040 => Some((44, 340, bw - 88, 24)),
-                6504 => Some((44, 378, 180, 24)),
-                504 => Some((244, 374, 160, 36)),
-                7050 => Some((44, 456, bw - 88, 28)),
-                505 => Some((44, 502, bw - 88, 30)),
-                800 => Some((44, 92, bw - 88, 32)),
-                811 => Some((44, 32, bw - 88, 30)),
-                810 => Some((44, 62, bw - 88, 28)),
-                801..=804 => Some((
-                    284,
+                7040 | 6504 | 504 | 7050 | 505 => {
+                    let x = if columns == 2 {
+                        60 + (bw - 64) * 3 / 5
+                    } else {
+                        44
+                    };
+                    let w = bw - x - 44;
+                    let y = if columns == 2 { 80 } else { 392 };
                     match id {
-                        801 => 140,
-                        802 => 192,
-                        803 => 400,
-                        _ => 348,
-                    },
-                    bw - 328,
-                    36,
-                )),
-                6801..=6804 => Some((
-                    44,
+                        7040 => Some((x, y, w, 32)),
+                        6504 => Some((x, y + 48, w, 24)),
+                        504 => Some((x, y + 80, w.min(160), 36)),
+                        7050 => Some((x, if columns == 2 { 252 } else { 548 }, w, 32)),
+                        _ => Some((x, if columns == 2 { 300 } else { 594 }, w, 32)),
+                    }
+                }
+                820 => Some((44, 24, bw - 88, 32)),
+                811 => Some((44, 62, bw - 88, 24)),
+                810 => Some((44, 86, bw - 88, 24)),
+                800..=804 | 815..=817 | 6801..=6804 | 821..=822 => {
+                    let long = matches!(id, 803 | 804 | 816 | 817 | 6803 | 6804 | 822);
+                    let group = i32::from(long);
+                    let gw = (bw - 88 - 16 * (columns - 1)) / columns;
+                    let x = 60 + (group % columns) * (gw + 16);
+                    let y = 124 + (group / columns) * 248;
+                    let w = gw - 32;
                     match id {
-                        6801 => 144,
-                        6802 => 196,
-                        6803 => 404,
-                        _ => 352,
-                    },
-                    224,
-                    30,
+                        821 | 822 => Some((x, y, w, 32)),
+                        800 | 817 => Some((x, y + 40, w, 28)),
+                        815 | 816 => Some((x, y + 178, w, 30)),
+                        _ => {
+                            let field = if id >= 6000 { id - 6000 } else { id };
+                            let row = i32::from(matches!(field, 802 | 803));
+                            Some((
+                                if id >= 6000 { x } else { x + 164 },
+                                y + 78 + row * 46,
+                                if id >= 6000 { 156 } else { w - 164 },
+                                34,
+                            ))
+                        }
+                    }
+                }
+                823 => Some((60, if columns == 2 { 366 } else { 614 }, bw - 120, 28)),
+                805..=807 => Some((
+                    60,
+                    (if columns == 2 { 400 } else { 648 }) + (id - 805) * 28,
+                    bw - 120,
+                    28,
                 )),
-                805..=807 => Some((44, 510 + (id - 805) * 42, bw - 88, 32)),
-                815..=816 => Some((44, if id == 815 { 244 } else { 452 }, bw - 88, 32)),
-                817 => Some((44, 304, bw - 88, 32)),
-                808 => Some((44, 714, 180, 44)),
-                809 => Some((244, 714, 180, 44)),
-                812..=814 => Some((44 + (id - 812) * 180, 650, 168, 44)),
+                808 | 809 | 812..=814 => {
+                    let i = match id {
+                        812 => 0,
+                        813 => 1,
+                        814 => 2,
+                        809 => 3,
+                        _ => 4,
+                    };
+                    let lanes = action_columns;
+                    let w = (bw - 88 - (lanes - 1) * 12) / lanes;
+                    Some((
+                        44 + (i % lanes) * (w + 12),
+                        (if columns == 2 { 490 } else { 738 }) + (i / lanes) * 56,
+                        w,
+                        40,
+                    ))
+                }
                 7051 => None,
                 _ => None,
             };
@@ -1495,7 +1601,8 @@ impl App {
             item(u.window, 9),
             TCM_SETITEMSIZE,
             0,
-            ((scale(40) as isize) << 16) | scale(((width - 172) / 5).min(112)) as isize,
+            ((scale(40) as isize) << 16)
+                | scale(((width - 230) / PAGES.len() as i32).min(128)) as isize,
         );
         SendMessageW(u.list, LB_SETITEMHEIGHT, 0, scale(64) as isize);
         theme::sync_list_scroll(u.list);
@@ -1766,6 +1873,9 @@ impl App {
     pub(super) unsafe fn ui_action(&mut self, id: i32) -> Result<(), String> {
         let h = self.ui.as_ref().unwrap().window;
         match id {
+            800 | 817 => {
+                self.layout_ui();
+            }
             808 => {
                 let value = |id| {
                     text_at(h, id)
@@ -2185,6 +2295,32 @@ mod capture_tests {
             set_text(h, 201, "C:\\测试\\demo.exe");
             check(h, 208, false);
             assert_ne!(app.rule_snapshot(), app.ui.as_ref().unwrap().baseline);
+            // Switching through the reserved page must not expose settings controls.
+            app.page(4);
+            for (_, child) in &app.ui.as_ref().unwrap().controls {
+                if GetParent(*child) == app.ui.as_ref().unwrap().content {
+                    assert_eq!(
+                        IsWindowVisible(*child),
+                        0,
+                        "content leaked into message page"
+                    );
+                }
+            }
+            app.page(5);
+            assert_ne!(IsWindowVisible(item(h, 500)), 0);
+            assert_ne!(IsWindowVisible(item(h, 506)), 0);
+            app.page(3);
+            let draft = text_at(h, 801);
+            check(h, 800, false);
+            app.ui_action(800).unwrap();
+            for id in [801, 802, 815] {
+                assert_eq!(IsWindowEnabled(item(h, id)), 0);
+            }
+            check(h, 800, true);
+            app.ui_action(800).unwrap();
+            assert_ne!(IsWindowEnabled(item(h, 801)), 0);
+            assert_eq!(text_at(h, 801), draft);
+            app.page(0);
             let saved_rest = app.config.rest.clone();
             set_text(h, 801, "0");
             assert!(app.ui_action(808).is_err());
@@ -2239,11 +2375,17 @@ mod capture_tests {
                     (1, "bind"),
                     (2, "opacity"),
                     (3, "rest"),
-                    (4, "settings"),
+                    (4, "message"),
+                    (5, "settings"),
                 ] {
                     app.page(page);
                     theme::capture(h, &format!("target/ui-preview/{name}.bmp")).unwrap();
                 }
+                app.page(4);
+                assert_eq!(IsWindowVisible(item(h, 506)), 0);
+                assert_eq!(IsWindowVisible(item(h, 500)), 0);
+                app.page(5);
+                assert_ne!(IsWindowVisible(item(h, 500)), 0);
                 app.page(0);
                 let saved = app.config.rules.clone();
                 app.config.rules.clear();
@@ -2299,7 +2441,7 @@ mod capture_tests {
                         std::thread::sleep(std::time::Duration::from_millis(16));
                     }
                 });
-                for page in [0, 2, 1, 2, 3, 2, 4, 2].into_iter().cycle().take(32) {
+                for page in [0, 2, 1, 2, 3, 4, 5, 2].into_iter().cycle().take(32) {
                     app.page(page);
                     let mut message: MSG = std::mem::zeroed();
                     while PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
@@ -2388,7 +2530,7 @@ mod capture_tests {
                             SendMessageW(*child, WM_SETFONT, large_font as usize, 0);
                         }
                     }
-                    for page in 0..5 {
+                    for page in 0..PAGES.len() {
                         app.page(page);
                         for (_, child) in &app.ui.as_ref().unwrap().controls {
                             if IsWindowVisible(*child) == 0
@@ -2436,6 +2578,41 @@ mod capture_tests {
                 SendMessageW(app.ui.as_ref().unwrap().opacity, WM_USER, 0, 0),
                 50
             );
+            if std::env::var_os("DUNYU_UI_OPACITY_CHECK").is_some() {
+                std::fs::create_dir_all("target/ui-preview").unwrap();
+                let slider = app.ui.as_ref().unwrap().opacity;
+                SetFocus(slider);
+                let mut track: RECT = std::mem::zeroed();
+                SendMessageW(slider, TBM_GETCHANNELRECT, 0, &mut track as *mut _ as isize);
+                for value in [10, 90, 20, 100, 40, 10] {
+                    let x = track.left + (track.right - track.left) * (value - 10) / 90;
+                    let y = (track.top + track.bottom) / 2;
+                    let point = ((y as isize) << 16) | x as isize;
+                    let mut thumb: RECT = std::mem::zeroed();
+                    SendMessageW(slider, TBM_GETTHUMBRECT, 0, &mut thumb as *mut _ as isize);
+                    let start = (((thumb.top + thumb.bottom) / 2) as isize) << 16
+                        | ((thumb.left + thumb.right) / 2) as isize;
+                    SendMessageW(slider, WM_LBUTTONDOWN, 1, start);
+                    SendMessageW(slider, WM_MOUSEMOVE, 1, point);
+                    SendMessageW(slider, WM_LBUTTONUP, 0, point);
+                    UpdateWindow(slider);
+                    windows_sys::Win32::Graphics::Dwm::DwmFlush();
+                    theme::capture_screen(slider, "target/ui-preview/opacity-actual.bmp").unwrap();
+                    RedrawWindow(
+                        slider,
+                        null(),
+                        null_mut(),
+                        RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW,
+                    );
+                    windows_sys::Win32::Graphics::Dwm::DwmFlush();
+                    theme::capture_screen(slider, "target/ui-preview/opacity-redrawn.bmp").unwrap();
+                    assert_eq!(
+                        std::fs::read("target/ui-preview/opacity-actual.bmp").unwrap(),
+                        std::fs::read("target/ui-preview/opacity-redrawn.bmp").unwrap(),
+                        "opacity residue at {value}"
+                    );
+                }
+            }
             app.ui.as_mut().unwrap().pending_opacity = Some((app.records[n].token.clone(), 30));
             app.ui_action(403).unwrap();
             assert!(app.ui.as_ref().unwrap().pending_opacity.is_none());

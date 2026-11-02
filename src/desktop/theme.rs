@@ -5,27 +5,23 @@ use std::rc::Rc;
 use windows_sys::Win32::Graphics::GdiPlus::*;
 use windows_sys::Win32::UI::Controls::*;
 
-// 玄墨朱砂: Inkstone Xuanmo's ink surfaces and warm text, with vermilion actions.
-// Reference: https://github.com/Konata9/inkstone/blob/main/docs/palette.md
-// Neutral shades and mineral colors below come from Xuanmo; the accent state
-// and selection shades are DunYu adaptations rather than historical color names.
-pub(super) const BACKGROUND: u32 = 0x14131a;
-const SURFACE: u32 = 0x1a1922;
-const ON_ACCENT: u32 = 0x0f0e14;
-pub(super) const INK: u32 = 0xd4cec4;
-pub(super) const MUTED: u32 = 0xada599;
-pub(super) const ACCENT: u32 = 0xd8574a; // 鱼鳃红 · 降彩
-const ACCENT_HOVER: u32 = 0xe06b5f;
-const ACCENT_PRESSED: u32 = 0xcf5548;
-const ACCENT_TEXT: u32 = 0xe99587;
-const LINE: u32 = 0x343240;
-const SELECTION: u32 = 0x392728;
-const SURFACE_HOVER: u32 = 0x24222e;
-const SURFACE_PRESSED: u32 = 0x302e3c;
-pub(super) const SUCCESS: u32 = 0x2bae85; // 铜绿
-pub(super) const DANGER: u32 = 0xe25737; // 银朱 · 降彩
-pub(super) const POND_RIPPLE: u32 = LINE;
-pub(super) const POND_LEAF: u32 = 0x22212c;
+// Design palette: deep teal paper, warm ink and vermilion accents.
+pub(super) const BACKGROUND: u32 = 0x061e1d;
+const SURFACE: u32 = 0x102826;
+const ON_ACCENT: u32 = 0xffe7c5;
+pub(super) const INK: u32 = 0xf0ddbd;
+pub(super) const MUTED: u32 = 0xa99f89;
+pub(super) const ACCENT: u32 = 0xc9432b;
+const ACCENT_HOVER: u32 = 0xdd5136;
+const ACCENT_PRESSED: u32 = 0xa53423;
+const ACCENT_TEXT: u32 = 0xe76b4f;
+const LINE: u32 = 0x526b65;
+const SELECTION: u32 = 0x263c35;
+const SURFACE_HOVER: u32 = 0x1b3531;
+const SURFACE_PRESSED: u32 = 0x253f39;
+pub(super) const SUCCESS: u32 = 0x6fb897;
+pub(super) const DANGER: u32 = 0xee795e;
+pub(super) const POND_RIPPLE: u32 = 0x8a9078;
 fn rgb(hex: u32) -> u32 {
     (hex & 255) << 16 | hex & 0xff00 | hex >> 16
 }
@@ -53,6 +49,7 @@ pub(super) struct Theme {
 }
 impl Theme {
     pub(super) unsafe fn new() -> Rc<Self> {
+        super::fonts::ensure();
         let mut token = 0;
         let input = GdiplusStartupInput {
             GdiplusVersion: 1,
@@ -83,6 +80,9 @@ pub(super) enum Role {
     Checkbox,
     Scrollbar,
     Brand,
+    Heading,
+    Slider,
+    Gutter,
 }
 struct PaintState {
     _theme: Rc<Theme>,
@@ -90,9 +90,20 @@ struct PaintState {
     hot: bool,
     tint: Option<u32>,
     button_style: Option<(bool, u32)>,
+    outline: bool,
+    edit_font: HFONT,
     dpi: u32,
     cards: Vec<RECT>,
     fields: Vec<(HWND, RECT)>,
+}
+impl Drop for PaintState {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.edit_font.is_null() {
+                DeleteObject(self.edit_font);
+            }
+        }
+    }
 }
 const SUBCLASS: usize = 0x44554e59;
 pub(super) unsafe fn attach(h: HWND, role: Role, theme: Rc<Theme>) {
@@ -102,6 +113,8 @@ pub(super) unsafe fn attach(h: HWND, role: Role, theme: Rc<Theme>) {
         hot: false,
         tint: None,
         button_style: None,
+        outline: false,
+        edit_font: null_mut(),
         dpi: 96,
         cards: vec![],
         fields: vec![],
@@ -127,6 +140,12 @@ pub(super) unsafe fn button_style(h: HWND, primary: bool, backdrop: u32) {
     InvalidateRect(h, null(), 0);
 }
 
+pub(super) unsafe fn outline(h: HWND) {
+    let mut ptr = 0;
+    if GetWindowSubclass(h, Some(procedure), SUBCLASS, &mut ptr) != 0 {
+        (*(ptr as *mut PaintState)).outline = true;
+    }
+}
 pub(super) unsafe fn scene(h: HWND, dpi: u32, cards: Vec<RECT>, fields: Vec<(HWND, RECT)>) {
     let mut ptr = 0;
     if GetWindowSubclass(h, Some(procedure), SUBCLASS, &mut ptr) != 0 {
@@ -137,7 +156,65 @@ pub(super) unsafe fn scene(h: HWND, dpi: u32, cards: Vec<RECT>, fields: Vec<(HWN
     }
     InvalidateRect(h, null(), 0);
 }
+struct Paper(HBRUSH);
+impl Drop for Paper {
+    fn drop(&mut self) {
+        unsafe {
+            DeleteObject(self.0);
+        }
+    }
+}
+thread_local! {
+    static PAPER: RefCell<HashMap<(i32,i32), Paper>> = RefCell::new(HashMap::new());
+    static CANVAS: std::cell::Cell<(i32,i32)> = const { std::cell::Cell::new((1024,650)) };
+}
+pub(super) unsafe fn canvas(h: HWND) {
+    let mut r: RECT = std::mem::zeroed();
+    GetClientRect(GetAncestor(h, GA_ROOT), &mut r);
+    CANVAS.set((r.right.max(1), r.bottom.max(1)));
+}
+unsafe fn paper_brush(dc: HDC) -> HBRUSH {
+    let size = CANVAS.get();
+    PAPER.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if !cache.contains_key(&size) {
+            if cache.len() >= 4 {
+                cache.clear();
+            }
+            let memory = CreateCompatibleDC(dc);
+            let bitmap = CreateCompatibleBitmap(dc, size.0, size.1);
+            let old = SelectObject(memory, bitmap);
+            super::assets::background(memory, size.0, size.1);
+            let brush = CreatePatternBrush(bitmap);
+            SelectObject(memory, old);
+            DeleteObject(bitmap);
+            DeleteDC(memory);
+            cache.insert(size, Paper(brush));
+        }
+        cache[&size].0
+    })
+}
+pub(super) unsafe fn background_brush(dc: HDC) -> HBRUSH {
+    if high_contrast() {
+        GetSysColorBrush(COLOR_WINDOW)
+    } else {
+        paper_brush(dc)
+    }
+}
+pub(super) unsafe fn paper(dc: HDC, r: RECT) {
+    if high_contrast() {
+        let b = CreateSolidBrush(color(BACKGROUND));
+        FillRect(dc, &r, b);
+        DeleteObject(b);
+    } else {
+        FillRect(dc, &r, paper_brush(dc));
+    }
+}
 unsafe fn fill(dc: HDC, r: RECT, value: u32) {
+    if value == BACKGROUND {
+        paper(dc, r);
+        return;
+    }
     let b = CreateSolidBrush(color(value));
     FillRect(dc, &r, b);
     DeleteObject(b);
@@ -204,6 +281,32 @@ pub(super) unsafe fn label_size(h: HWND) -> SIZE {
 }
 
 unsafe fn text(dc: HDC, h: HWND, s: &str, mut r: RECT, value: u32, flags: u32) {
+    let symbol = match s {
+        "×" => Some(5),
+        "✓" => Some(6),
+        "▴" => Some(7),
+        "▾" => Some(8),
+        _ => None,
+    };
+    if let Some(index) = symbol {
+        let side = (r.right - r.left)
+            .min(r.bottom - r.top)
+            .min(20 * GetDpiForWindow(h).max(96) as i32 / 96);
+        let left = (r.left + r.right - side) / 2;
+        let top = (r.top + r.bottom - side) / 2;
+        icon(
+            dc,
+            RECT {
+                left,
+                top,
+                right: left + side,
+                bottom: top + side,
+            },
+            index,
+            value,
+        );
+        return;
+    }
     let old = SelectObject(dc, SendMessageW(h, WM_GETFONT, 0, 0) as _);
     SetBkMode(dc, TRANSPARENT as i32);
     SetTextColor(dc, color(value));
@@ -217,6 +320,55 @@ unsafe fn text(dc: HDC, h: HWND, s: &str, mut r: RECT, value: u32, flags: u32) {
     );
     if !old.is_null() {
         SelectObject(dc, old);
+    }
+}
+// Hand-drawn animation contour: bold silhouette with restrained pressure changes.
+unsafe fn ink_curve(g: *mut GpGraphics, pen: *mut GpPen, p: [(f32, f32); 4]) {
+    let mut previous = p[0];
+    for i in 1..=24 {
+        let t = i as f32 / 24.;
+        let u = 1. - t;
+        let point = (
+            u * u * u * p[0].0
+                + 3. * u * u * t * p[1].0
+                + 3. * u * t * t * p[2].0
+                + t * t * t * p[3].0,
+            u * u * u * p[0].1
+                + 3. * u * u * t * p[1].1
+                + 3. * u * t * t * p[2].1
+                + t * t * t * p[3].1,
+        );
+        GdipSetPenWidth(pen, 1.25 + 1.0 * (std::f32::consts::PI * t).sin());
+        GdipDrawLine(g, pen, previous.0, previous.1, point.0, point.1);
+        previous = point;
+    }
+}
+unsafe fn ink_line(g: *mut GpGraphics, pen: *mut GpPen, x: f32, y: f32, xx: f32, yy: f32) {
+    ink_curve(
+        g,
+        pen,
+        [
+            (x, y),
+            (x + (xx - x) * 0.3, y + (yy - y) * 0.3),
+            (x + (xx - x) * 0.7, y + (yy - y) * 0.7),
+            (xx, yy),
+        ],
+    );
+}
+unsafe fn ink_arc(g: *mut GpGraphics, pen: *mut GpPen, r: [f32; 4], start: f32, sweep: f32) {
+    let mut previous = (0., 0.);
+    for i in 0..=40 {
+        let t = i as f32 / 40.;
+        let angle = (start + sweep * t).to_radians();
+        let point = (
+            r[0] + r[2] * 0.5 * (1. + angle.cos()),
+            r[1] + r[3] * 0.5 * (1. + angle.sin()),
+        );
+        if i > 0 {
+            GdipSetPenWidth(pen, 1.25 + 1.0 * (std::f32::consts::PI * t).sin());
+            GdipDrawLine(g, pen, previous.0, previous.1, point.0, point.1);
+        }
+        previous = point;
     }
 }
 unsafe fn icon(dc: HDC, r: RECT, index: usize, value: u32) {
@@ -238,33 +390,64 @@ unsafe fn icon(dc: HDC, r: RECT, index: usize, value: u32) {
     GdipSetPenWidth(pen, 1.8);
     match index {
         0 => {
-            GdipDrawRectangle(graphics, pen, 3., 4., 18., 16.);
-            GdipDrawLine(graphics, pen, 3., 9., 21., 9.);
-            GdipDrawLine(graphics, pen, 10., 15., 16., 15.);
-            GdipDrawLine(graphics, pen, 13., 12., 16., 15.);
-            GdipDrawLine(graphics, pen, 13., 18., 16., 15.);
+            for (x, y, xx, yy) in [
+                (3., 4., 21., 4.),
+                (21., 4., 21., 20.),
+                (21., 20., 3., 20.),
+                (3., 20., 3., 4.),
+            ] {
+                ink_line(graphics, pen, x, y, xx, yy);
+            }
+            ink_line(graphics, pen, 3., 9., 21., 9.);
+            ink_line(graphics, pen, 10., 15., 16., 15.);
+            ink_line(graphics, pen, 13., 12., 16., 15.);
+            ink_line(graphics, pen, 13., 18., 16., 15.);
         }
         1 => {
-            GdipDrawArc(graphics, pen, 2., 7., 13., 10., 70., 250.);
-            GdipDrawArc(graphics, pen, 9., 7., 13., 10., 250., 250.);
-            GdipDrawLine(graphics, pen, 9., 12., 15., 12.);
+            ink_arc(graphics, pen, [2., 7., 13., 10.], 70., 250.);
+            ink_arc(graphics, pen, [9., 7., 13., 10.], 250., 250.);
+            ink_line(graphics, pen, 9., 12., 15., 12.);
         }
         2 => {
-            GdipDrawBezier(graphics, pen, 2., 12., 7., 3., 17., 3., 22., 12.);
-            GdipDrawBezier(graphics, pen, 2., 12., 7., 21., 17., 21., 22., 12.);
-            GdipDrawEllipse(graphics, pen, 9., 9., 6., 6.);
+            ink_curve(graphics, pen, [(2., 12.), (7., 3.), (17., 3.), (22., 12.)]);
+            ink_curve(
+                graphics,
+                pen,
+                [(2., 12.), (7., 21.), (17., 21.), (22., 12.)],
+            );
+            ink_arc(graphics, pen, [9., 9., 6., 6.], 0., 355.);
         }
         3 => {
-            GdipDrawBezier(graphics, pen, 5., 19., -1., 8., 12., 4., 21., 3.);
-            GdipDrawBezier(graphics, pen, 21., 3., 21., 15., 17., 23., 5., 19.);
-            GdipDrawBezier(graphics, pen, 3., 22., 7., 16., 12., 12., 17., 8.);
+            ink_curve(graphics, pen, [(5., 19.), (-1., 8.), (12., 4.), (21., 3.)]);
+            ink_curve(
+                graphics,
+                pen,
+                [(21., 3.), (21., 15.), (17., 23.), (5., 19.)],
+            );
+            ink_curve(graphics, pen, [(3., 22.), (7., 16.), (12., 12.), (17., 8.)]);
+        }
+        5 => {
+            ink_line(graphics, pen, 6., 6., 18., 18.);
+            ink_line(graphics, pen, 18., 6., 6., 18.);
+        }
+        6 => {
+            ink_line(graphics, pen, 4., 12., 10., 18.);
+            ink_line(graphics, pen, 10., 18., 21., 5.);
+        }
+        7 => {
+            ink_line(graphics, pen, 5., 16., 12., 8.);
+            ink_line(graphics, pen, 12., 8., 19., 16.);
+        }
+        8 => {
+            ink_line(graphics, pen, 5., 8., 12., 16.);
+            ink_line(graphics, pen, 12., 16., 19., 8.);
         }
         _ => {
-            GdipDrawEllipse(graphics, pen, 5., 5., 14., 14.);
-            GdipDrawEllipse(graphics, pen, 9., 9., 6., 6.);
+            ink_arc(graphics, pen, [5., 5., 14., 14.], 0., 355.);
+            ink_arc(graphics, pen, [9., 9., 6., 6.], 0., 355.);
             for i in 0..8 {
                 let a = i as f32 * std::f32::consts::FRAC_PI_4;
-                GdipDrawLine(
+                ink_line(
                     graphics,
                     pen,
                     12. + a.cos() * 7.,
@@ -275,38 +458,150 @@ unsafe fn icon(dc: HDC, r: RECT, index: usize, value: u32) {
             }
         }
     }
+    if index < 5 && !high_contrast() {
+        let mut pigment = null_mut();
+        GdipCreateSolidFill(0xffc9a45a, &mut pigment);
+        match index {
+            0 => {
+                GdipFillRectangle(graphics, pigment as _, 5., 5., 2., 2.);
+            }
+            1 => {
+                GdipFillEllipse(graphics, pigment as _, 10.5, 10.5, 3., 3.);
+            }
+            2 => {
+                GdipFillEllipse(graphics, pigment as _, 10.5, 10.5, 3., 3.);
+            }
+            3 => {
+                GdipSetPenColor(pen, 0xff7faf9b);
+                ink_line(graphics, pen, 7., 17., 16., 8.);
+            }
+            _ => {
+                GdipFillEllipse(graphics, pigment as _, 10.5, 10.5, 3., 3.);
+            }
+        }
+        GdipDeleteBrush(pigment as _);
+    }
     GdipDeletePen(pen);
     GdipDeleteGraphics(graphics);
 }
 unsafe fn paint(h: HWND, dc: HDC, s: &PaintState) {
+    canvas(h);
     let mut r: RECT = std::mem::zeroed();
     GetClientRect(h, &mut r);
     let px = |v: i32| v * s.dpi as i32 / 96;
+    let mut origin = POINT { x: 0, y: 0 };
+    MapWindowPoints(h, GetAncestor(h, GA_ROOT), &mut origin, 1);
+    SetBrushOrgEx(dc, -origin.x, -origin.y, null_mut());
     match s.role {
+        Role::Gutter => fill(dc, r, BACKGROUND),
+        Role::Slider => {
+            fill(dc, r, SURFACE);
+            let mut channel: RECT = std::mem::zeroed();
+            let mut thumb: RECT = std::mem::zeroed();
+            SendMessageW(h, TBM_GETCHANNELRECT, 0, &mut channel as *mut _ as isize);
+            SendMessageW(h, TBM_GETTHUMBRECT, 0, &mut thumb as *mut _ as isize);
+            let middle = (channel.top + channel.bottom) / 2;
+            channel.top = middle - px(3);
+            channel.bottom = middle + px(3);
+            rounded(dc, channel, px(3), LINE);
+            if IsWindowEnabled(h) != 0 {
+                let value = SendMessageW(h, WM_USER, 0, 0).clamp(10, 100);
+                let mut active = channel;
+                active.right = active.left
+                    + ((active.right - active.left) as isize * (value - 10) / 90) as i32;
+                if active.right > active.left {
+                    rounded(dc, active, px(3), ACCENT);
+                }
+            }
+            rounded(
+                dc,
+                thumb,
+                px(8),
+                if IsWindowEnabled(h) != 0 {
+                    ACCENT
+                } else {
+                    MUTED
+                },
+            );
+            rounded(dc, inset(thumb, px(3)), px(5), ON_ACCENT);
+            if GetFocus() == h {
+                DrawFocusRect(dc, &inset(r, px(2)));
+            }
+        }
+        Role::Heading => {
+            let background = if matches!(GetDlgCtrlID(h), 7001 | 7002 | 7012) {
+                BACKGROUND
+            } else {
+                SURFACE
+            };
+            fill(dc, r, background);
+            let mut label = r;
+            label.bottom -= px(4);
+            text(dc, h, &title(h), label, INK, DT_LEFT);
+            let mut g = null_mut();
+            if GdipCreateFromHDC(dc, &mut g) == 0 {
+                let c = color(MUTED);
+                let argb = 0xff000000 | (c & 255) << 16 | c & 0xff00 | c >> 16;
+                let mut pen = null_mut();
+                GdipCreatePen1(argb, 1., UnitPixel, &mut pen);
+                ink_curve(
+                    g,
+                    pen,
+                    [
+                        (0., (r.bottom - px(1)) as f32),
+                        (px(24) as f32, (r.bottom - px(4)) as f32),
+                        (px(60) as f32, (r.bottom - px(2)) as f32),
+                        (px(94).min(r.right) as f32, (r.bottom - px(3)) as f32),
+                    ],
+                );
+                GdipDeletePen(pen);
+                GdipDeleteGraphics(g);
+            }
+        }
         Role::Brand => {
             fill(dc, r, BACKGROUND);
             let logo = LoadImageW(
                 GetModuleHandleW(null()),
                 101usize as _,
                 IMAGE_ICON,
-                px(32),
-                px(32),
+                px(48),
+                px(48),
                 LR_SHARED,
             );
             DrawIconEx(
                 dc,
                 0,
-                (r.bottom - px(32)) / 2,
+                (r.bottom - px(48)) / 2,
                 logo,
-                px(32),
-                px(32),
+                px(48),
+                px(48),
                 0,
                 null_mut(),
                 DI_NORMAL,
             );
             let mut label = r;
-            label.left += px(38);
+            label.left += px(58);
+            label.bottom -= px(18);
             text(dc, h, "遁鱼", label, INK, DT_LEFT);
+            label.top = r.bottom - px(22);
+            label.bottom = r.bottom;
+            let mut lf: LOGFONTW = std::mem::zeroed();
+            lf.lfHeight = -px(11);
+            let face = wide("Source Han Serif SC");
+            lf.lfFaceName[..face.len()].copy_from_slice(&face);
+            let small = CreateFontIndirectW(&lf);
+            let old = SelectObject(dc, small);
+            SetTextColor(dc, color(MUTED));
+            SetBkMode(dc, TRANSPARENT as i32);
+            DrawTextW(
+                dc,
+                wide("摸鱼有道 · 隐现自如").as_ptr(),
+                -1,
+                &mut label,
+                DT_SINGLELINE | DT_VCENTER,
+            );
+            SelectObject(dc, old);
+            DeleteObject(small);
         }
         Role::Checkbox => {
             fill(dc, r, SURFACE);
@@ -315,12 +610,32 @@ unsafe fn paint(h: HWND, dc: HDC, s: &PaintState) {
                 left: px(2),
                 top,
                 right: px(18),
-                bottom: top + px(20),
+                bottom: top + px(16),
             };
             let checked = SendMessageW(h, BM_GETCHECK, 0, 0) != 0;
-            rounded(dc, box_rect, px(4), if checked { ACCENT } else { MUTED });
+            rounded(
+                dc,
+                box_rect,
+                px(4),
+                if checked && IsWindowEnabled(h) != 0 {
+                    ACCENT
+                } else {
+                    MUTED
+                },
+            );
             if checked {
-                text(dc, h, "✓", box_rect, ON_ACCENT, DT_CENTER);
+                text(
+                    dc,
+                    h,
+                    "✓",
+                    box_rect,
+                    if IsWindowEnabled(h) != 0 {
+                        BACKGROUND
+                    } else {
+                        MUTED
+                    },
+                    DT_CENTER,
+                );
             } else {
                 rounded(dc, inset(box_rect, px(1).max(1)), px(3), SURFACE);
             }
@@ -378,6 +693,23 @@ unsafe fn paint(h: HWND, dc: HDC, s: &PaintState) {
         }
         Role::Surface => {
             fill(dc, r, BACKGROUND);
+            if GetDlgCtrlID(h) == 119
+                && SendMessageW(GetDlgItem(h, 100), LB_GETCOUNT, 0, 0) == 0
+                && !high_contrast()
+            {
+                let cx = r.right / 2;
+                let cy = r.bottom / 2;
+                super::assets::navigation(
+                    dc,
+                    RECT {
+                        left: cx - px(42),
+                        top: cy - px(50),
+                        right: cx + px(42),
+                        bottom: cy + px(18),
+                    },
+                    0,
+                );
+            }
             for card in &s.cards {
                 rounded(dc, *card, px(12), LINE);
                 rounded(dc, inset(*card, px(1).max(1)), px(11), SURFACE);
@@ -394,7 +726,7 @@ unsafe fn paint(h: HWND, dc: HDC, s: &PaintState) {
             }
         }
         Role::Button => {
-            let default_primary = matches!(GetDlgCtrlID(h), 113 | 330 | 506);
+            let default_primary = matches!(GetDlgCtrlID(h), 113 | 330 | 506 | 808 | 401);
             let (primary, backdrop) = s.button_style.unwrap_or((
                 default_primary,
                 if default_primary { BACKGROUND } else { SURFACE },
@@ -429,6 +761,8 @@ unsafe fn paint(h: HWND, dc: HDC, s: &PaintState) {
                 px(8),
                 if GetFocus() == h {
                     ACCENT_TEXT
+                } else if s.outline {
+                    ACCENT
                 } else if primary {
                     bg
                 } else {
@@ -460,40 +794,56 @@ unsafe fn paint(h: HWND, dc: HDC, s: &PaintState) {
                 let mut item: RECT = std::mem::zeroed();
                 SendMessageW(h, TCM_GETITEMRECT, i, &mut item as *mut _ as isize);
                 if selected == i as isize {
-                    rounded(dc, inset(item, px(2)), px(8), SELECTION);
+                    if high_contrast() {
+                        rounded(dc, inset(item, px(2)), px(8), SELECTION);
+                    }
+                    let mark = RECT {
+                        left: item.left + px(12),
+                        right: item.right - px(12),
+                        top: item.bottom - px(6),
+                        bottom: item.bottom - px(3),
+                    };
+                    rounded(dc, mark, px(2), ACCENT);
                 }
                 if selected == i as isize && GetFocus() == h {
                     rounded(dc, inset(item, px(2)), px(8), ACCENT_TEXT);
                     rounded(dc, inset(item, px(4)), px(6), SELECTION);
                 }
                 let fg = if selected == i as isize {
-                    if high_contrast() {
-                        ON_ACCENT
-                    } else {
-                        ACCENT_TEXT
-                    }
+                    if high_contrast() { ON_ACCENT } else { INK }
                 } else {
-                    MUTED
+                    INK
                 };
                 let label = super::ui::PAGES[i];
                 let font = SelectObject(dc, SendMessageW(h, WM_GETFONT, 0, 0) as _);
                 let mut size: SIZE = std::mem::zeroed();
                 GetTextExtentPoint32W(dc, wide(label).as_ptr(), 2, &mut size);
                 SelectObject(dc, font);
-                let left = (item.left + item.right - px(28) - size.cx) / 2;
+                let left = (item.left + item.right - px(44) - size.cx) / 2;
                 let top = (item.top + item.bottom - px(20)) / 2;
-                icon(
-                    dc,
-                    RECT {
-                        left,
-                        top,
-                        right: left + px(20),
-                        bottom: top + px(20),
-                    },
-                    i,
-                    fg,
-                );
-                item.left = left + px(28);
+                let icon_rect = RECT {
+                    left,
+                    top: top - px(4),
+                    right: left + px(36),
+                    bottom: top + px(22),
+                };
+                if high_contrast() {
+                    icon(
+                        dc,
+                        icon_rect,
+                        if i == 5 {
+                            4
+                        } else if i == 4 {
+                            0
+                        } else {
+                            i
+                        },
+                        fg,
+                    );
+                } else {
+                    super::assets::navigation(dc, icon_rect, i);
+                }
+                item.left = left + px(44);
                 item.right = item.left + size.cx;
                 text(dc, h, label, item, fg, DT_LEFT);
             }
@@ -518,6 +868,27 @@ unsafe extern "system" fn procedure(
     }
     let role = (*ptr).role;
     match m {
+        WM_SETFONT if role == Role::Edit && w != 0 => {
+            let mut lf: LOGFONTW = std::mem::zeroed();
+            GetObjectW(
+                w as _,
+                std::mem::size_of::<LOGFONTW>() as i32,
+                &mut lf as *mut _ as _,
+            );
+            lf.lfFaceName = [0; 32];
+            let face = wide("Microsoft YaHei UI");
+            lf.lfFaceName[..face.len()].copy_from_slice(&face);
+            let font = CreateFontIndirectW(&lf);
+            if !font.is_null() {
+                let old = (*ptr).edit_font;
+                (*ptr).edit_font = font;
+                let result = DefSubclassProc(h, m, font as usize, l);
+                if !old.is_null() {
+                    DeleteObject(old);
+                }
+                return result;
+            }
+        }
         WM_ACTIVATE if role == Role::Surface && GetAncestor(h, GA_ROOT) == h => {
             if w & 0xffff == WA_INACTIVE as usize {
                 super::recorder::stop();
@@ -575,6 +946,9 @@ unsafe extern "system" fn procedure(
                     | Role::Checkbox
                     | Role::Scrollbar
                     | Role::Brand
+                    | Role::Heading
+                    | Role::Slider
+                    | Role::Gutter
             ) =>
         {
             return 1;
@@ -588,6 +962,9 @@ unsafe extern "system" fn procedure(
                     | Role::Checkbox
                     | Role::Scrollbar
                     | Role::Brand
+                    | Role::Heading
+                    | Role::Slider
+                    | Role::Gutter
             ) =>
         {
             let mut ps: PAINTSTRUCT = std::mem::zeroed();
@@ -622,6 +999,7 @@ unsafe extern "system" fn procedure(
             return 0;
         }
         WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
+            canvas(h);
             let dc = w as HDC;
             SetBkMode(dc, TRANSPARENT as i32);
             let child = l as HWND;
@@ -634,15 +1012,27 @@ unsafe extern "system" fn procedure(
             };
             SetTextColor(
                 dc,
-                color(tint.unwrap_or(if id == 9001 { MUTED } else { INK })),
+                color(
+                    tint.unwrap_or(if id == 9001 || IsWindowEnabled(child) == 0 {
+                        MUTED
+                    } else {
+                        INK
+                    }),
+                ),
             );
-            let backdrop = if matches!(id, 9001 | 9002 | 7001 | 7002) {
+            let backdrop = if matches!(id, 9001 | 9002 | 7001 | 7002 | 7012 | 120) {
                 BACKGROUND
             } else {
                 SURFACE
             };
             SetBkColor(dc, color(backdrop));
             SetDCBrushColor(dc, color(backdrop));
+            if backdrop == BACKGROUND && !high_contrast() {
+                let mut origin = POINT { x: 0, y: 0 };
+                MapWindowPoints(child, GetAncestor(child, GA_ROOT), &mut origin, 1);
+                SetBrushOrgEx(dc, -origin.x, -origin.y, null_mut());
+                return paper_brush(dc) as isize;
+            }
             return GetStockObject(DC_BRUSH) as isize;
         }
         WM_DRAWITEM if l != 0 => {
@@ -704,45 +1094,6 @@ unsafe extern "system" fn procedure(
                 return 1;
             }
         }
-        WM_NOTIFY if l != 0 => {
-            let hdr = &*(l as *const NMHDR);
-            if hdr.idFrom == 402 && hdr.code == NM_CUSTOMDRAW {
-                let draw = &*(l as *const NMCUSTOMDRAW);
-                if draw.dwDrawStage == CDDS_PREPAINT {
-                    return CDRF_NOTIFYITEMDRAW as isize;
-                }
-                if draw.dwDrawStage == CDDS_ITEMPREPAINT {
-                    let px = |v: i32| v * (*ptr).dpi as i32 / 96;
-                    if draw.dwItemSpec == TBCD_CHANNEL as usize {
-                        let mut r = draw.rc;
-                        let mid = (r.top + r.bottom) / 2;
-                        r.top = mid - px(3);
-                        r.bottom = mid + px(3);
-                        rounded(draw.hdc, r, px(3), LINE);
-                        let value = SendMessageW(hdr.hwndFrom, WM_USER, 0, 0).clamp(10, 100);
-                        r.right = r.left + ((r.right - r.left) as isize * (value - 10) / 90) as i32;
-                        if r.right > r.left {
-                            rounded(draw.hdc, r, px(3), ACCENT);
-                        }
-                        return CDRF_SKIPDEFAULT as isize;
-                    }
-                    if draw.dwItemSpec == TBCD_THUMB as usize {
-                        rounded(
-                            draw.hdc,
-                            draw.rc,
-                            px(8),
-                            if IsWindowEnabled(hdr.hwndFrom) != 0 {
-                                ACCENT
-                            } else {
-                                MUTED
-                            },
-                        );
-                        rounded(draw.hdc, inset(draw.rc, px(3)), px(5), ON_ACCENT);
-                        return CDRF_SKIPDEFAULT as isize;
-                    }
-                }
-            }
-        }
         _ => {}
     }
     let result = DefSubclassProc(h, m, w, l);
@@ -758,6 +1109,23 @@ unsafe extern "system" fn procedure(
         )
     {
         sync_list_scroll(h);
+    }
+    if role == Role::Slider
+        && matches!(
+            m,
+            WM_MOUSEMOVE
+                | WM_MOUSEWHEEL
+                | WM_LBUTTONDOWN
+                | WM_LBUTTONUP
+                | WM_KEYDOWN
+                | WM_KEYUP
+                | TBM_SETPOS
+                | TBM_SETRANGE
+                | WM_SIZE
+                | WM_ENABLE
+        )
+    {
+        InvalidateRect(h, null(), 0);
     }
     if role == Role::Scrollbar
         && matches!(

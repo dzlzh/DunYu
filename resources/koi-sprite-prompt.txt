@@ -1,4 +1,0 @@
-Tool: built-in imagegen, transparent_background=true
-Edit target: resources/fish.png
-Prompt:
-Edit the provided DunYu app icon. Extract ONLY its single orange koi fish as a transparent-background sprite. Preserve the original orange gradient colors, curved body silhouette, two flowing pectoral fins and tapered tail exactly as closely as possible. Remove all water, lily pads, glows, icon frame and shadows. No redesign, no eyes or scales added. Center the complete fish with a little transparent padding, head pointing to the right so it can be rotated tangentially along a circular progress indicator. Output actual alpha transparency. This is a production asset, not an icon mockup.

@@ -1,8 +1,11 @@
 #![allow(unsafe_op_in_unsafe_fn)]
+mod assets;
+mod fonts;
 mod recorder;
 mod rest_art;
 mod rest_ui;
 mod scroll_ui;
+mod swim;
 mod theme;
 mod ui;
 use dunyu::*;

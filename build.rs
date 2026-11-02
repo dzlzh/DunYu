@@ -1,4 +1,5 @@
 fn main() {
+    println!("cargo:rerun-if-changed=resources/fonts/OFL.txt");
     println!("cargo:rerun-if-changed=resources/dunyu.rc");
     println!("cargo:rerun-if-changed=resources/dunyu.manifest");
     println!("cargo:rerun-if-changed=resources/dunyu.ico");

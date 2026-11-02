@@ -39,6 +39,10 @@ jobs:
           New-Item dist/DunYu -ItemType Directory -Force
           Copy-Item target/release/dunyu.exe dist/DunYu
           Copy-Item target/release/dunyu.exe dist/dunyu.exe
+          Copy-Item LICENSE dist/DunYu/LICENSE
+          Copy-Item LICENSE dist/LICENSE
+          Copy-Item resources/fonts/OFL.txt dist/DunYu/OFL.txt
+          Copy-Item resources/fonts/OFL.txt dist/OFL.txt
           Compress-Archive dist/DunYu dist/DunYu-windows-x64.zip
           @('DunYu-windows-x64.zip', 'dunyu.exe') | ForEach-Object { (Get-FileHash (Join-Path dist $_) -Algorithm SHA256).Hash + '  ' + $_ } | Set-Content dist/SHA256SUMS.txt
       - if: runner.os == 'Windows'
@@ -49,4 +53,6 @@ jobs:
             dist/*.zip
             dist/dunyu.exe
             dist/SHA256SUMS.txt
+            dist/OFL.txt
+            dist/LICENSE
             Cargo.lock

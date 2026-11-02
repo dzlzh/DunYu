@@ -13,6 +13,7 @@ pub(super) struct Runtime {
     pub locked: bool,
     pub suspended: bool,
     preview_until: u64,
+    motion_start: u64,
     natural: bool,
     display_failed: bool,
     dismissed: Option<bool>,
@@ -27,6 +28,7 @@ impl Default for Runtime {
             locked: false,
             suspended: false,
             preview_until: 0,
+            motion_start: 0,
             natural: false,
             display_failed: false,
             dismissed: None,
@@ -39,15 +41,13 @@ unsafe extern "system" fn procedure(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LR
         WM_TIMER if w == ANIMATION_TIMER => {
             let mut r: RECT = std::mem::zeroed();
             GetClientRect(h, &mut r);
-            let scale = GetPropW(h, wide("DunYu.LayoutDpi").as_ptr()) as usize as f32 / 96.;
-            let top = ((r.bottom as f32 - 520. * scale) / 2.).max(16. * scale);
-            let center = (r.right as f32 / 2., top + 196. * scale);
-            let radius = 166. * scale;
+            let layout = super::swim::Layout::new(r.right as f32, r.bottom as f32);
+            let area = layout.rect(586., 186., 500., 500.);
             let dirty = RECT {
-                left: (center.0 - radius).floor() as i32,
-                top: (center.1 - radius).floor() as i32,
-                right: (center.0 + radius).ceil() as i32,
-                bottom: (center.1 + radius).ceil() as i32,
+                left: area[0].floor() as i32,
+                top: area[1].floor() as i32,
+                right: (area[0] + area[2]).ceil() as i32,
+                bottom: (area[1] + area[3]).ceil() as i32,
             };
             InvalidateRect(h, &dirty, 0);
             0
@@ -62,7 +62,9 @@ unsafe extern "system" fn procedure(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LR
             0
         }
         WM_CTLCOLORSTATIC => {
+            theme::canvas(h);
             let dc = w as HDC;
+            SetBkMode(dc, TRANSPARENT as i32);
             SetTextColor(
                 dc,
                 pond_color(
@@ -76,7 +78,10 @@ unsafe extern "system" fn procedure(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LR
             );
             SetBkColor(dc, pond_color(theme::BACKGROUND, COLOR_WINDOW));
             SetDCBrushColor(dc, pond_color(theme::BACKGROUND, COLOR_WINDOW));
-            GetStockObject(DC_BRUSH) as isize
+            let mut origin = POINT { x: 0, y: 0 };
+            MapWindowPoints(l as HWND, h, &mut origin, 1);
+            SetBrushOrgEx(dc, -origin.x, -origin.y, null_mut());
+            theme::background_brush(dc) as isize
         }
 
         WM_COMMAND | WM_CLOSE => {
@@ -131,7 +136,7 @@ pub(super) unsafe fn motion_enabled() -> bool {
 unsafe fn update_animation(h: HWND) {
     KillTimer(h, ANIMATION_TIMER);
     if !GetPropW(h, wide("DunYu.Full").as_ptr()).is_null() && motion_enabled() {
-        SetTimer(h, ANIMATION_TIMER, 50, None);
+        SetTimer(h, ANIMATION_TIMER, 33, None);
     }
 }
 unsafe fn pond_color(value: u32, system: i32) -> u32 {
@@ -181,7 +186,9 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
         right: dirty.right - dirty.left,
         bottom: dirty.bottom - dirty.top,
     };
-    FillRect(memory, &buffer, brush);
+    SetBrushOrgEx(memory, -dirty.left, -dirty.top, null_mut());
+    theme::canvas(h);
+    theme::paper(memory, buffer);
     DeleteObject(brush);
     let full = !GetPropW(h, wide("DunYu.Full").as_ptr()).is_null();
     let scale = GetPropW(h, wide("DunYu.LayoutDpi").as_ptr()) as usize as f32 / 96.;
@@ -205,39 +212,6 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
             UnitPixel,
             &mut pen,
         );
-        // Quiet water ripples at the edges; the center remains clear.
-        if full {
-            for i in 0..3 {
-                let d = (160. + i as f32 * 56.) * scale;
-                GdipDrawEllipse(g, pen, -d / 2., r.bottom as f32 - d / 2., d, d);
-                GdipDrawEllipse(g, pen, r.right as f32 - d / 2., -d / 2., d, d);
-            }
-        }
-        if full {
-            let mut leaf = null_mut();
-            GdipCreateSolidFill(argb(theme::POND_LEAF, COLOR_WINDOW), &mut leaf);
-            GdipFillPie(
-                g,
-                leaf as _,
-                r.right as f32 - 140. * scale,
-                32. * scale,
-                100. * scale,
-                76. * scale,
-                30.,
-                305.,
-            );
-            GdipFillPie(
-                g,
-                leaf as _,
-                35. * scale,
-                r.bottom as f32 - 112. * scale,
-                76. * scale,
-                60. * scale,
-                210.,
-                305.,
-            );
-            GdipDeleteBrush(leaf as _);
-        }
         let duration = GetPropW(h, wide("DunYu.Duration").as_ptr()) as usize as u64;
         let left = GetPropW(h, wide("DunYu.Left").as_ptr()) as usize as u64;
         let stamp = GetPropW(h, wide("DunYu.Stamp").as_ptr()) as usize as u64;
@@ -247,14 +221,18 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
         } else {
             0
         };
-        let progress = 1. - left.saturating_sub(elapsed) as f32 / duration.max(1) as f32;
+        let progress = super::swim::progress(duration, left, elapsed);
         let percent = (progress * 100.).clamp(0., 100.);
+        let layout = super::swim::Layout::new(r.right as f32, r.bottom as f32);
         if full {
-            let d = 260. * scale;
-            let x = (r.right as f32 - d) / 2.;
-            let y = top + 66. * scale;
-            GdipSetPenWidth(pen, 3. * scale);
-            GdipDrawEllipse(g, pen, x, y, d, d);
+            let [x, y, d, _] = layout.rect(661., 261., 350., 350.);
+            GdipSetPenColor(pen, argb(theme::INK, COLOR_WINDOWTEXT));
+            GdipSetPenWidth(pen, 2. * scale);
+            if moving {
+                super::assets::ring(g, [x, y, d, d]);
+            } else {
+                GdipDrawEllipse(g, pen, x, y, d, d);
+            }
             GdipSetPenColor(pen, argb(theme::ACCENT, COLOR_HIGHLIGHT));
             if percent > 0. {
                 GdipDrawArc(g, pen, x, y, d, d, -90., percent * 3.6);
@@ -276,9 +254,11 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
         if full {
             rest_art::koi(
                 g,
-                (r.right as f32 / 2., top + 196. * scale),
-                scale,
-                progress.clamp(0., 1.),
+                (r.right as f32 / 2., layout.y + 436. * layout.scale),
+                layout.scale,
+                progress,
+                GetTickCount64().saturating_sub(GetPropW(h, wide("DunYu.MotionStart").as_ptr()) as usize as u64),
+                moving,
             );
         }
         GdipDeletePen(pen);
@@ -529,6 +509,7 @@ impl Runtime {
         if self.shown != Some((phase, fullscreen, self.scheduler.long())) {
             self.close();
             self.shown = Some((phase, fullscreen, self.scheduler.long()));
+            self.motion_start = GetTickCount64();
             let mut wc: WNDCLASSW = std::mem::zeroed();
             wc.hInstance = GetModuleHandleW(null());
             wc.lpfnWndProc = Some(procedure);
@@ -621,6 +602,7 @@ impl Runtime {
                 "站起来走几步，喝口水。",
             ][(self.scheduler.round % 3) as usize]
         };
+        let stamp = GetTickCount64();
         for h in &self.windows {
             SetWindowTextW(GetDlgItem(*h, 10), wide(&counter).as_ptr());
             SetWindowTextW(GetDlgItem(*h, 12), wide(&heading).as_ptr());
@@ -639,7 +621,7 @@ impl Runtime {
             };
             SetPropW(*h, wide("DunYu.Duration").as_ptr(), duration as HANDLE);
             SetPropW(*h, wide("DunYu.Left").as_ptr(), left as HANDLE);
-            SetPropW(*h, wide("DunYu.Stamp").as_ptr(), GetTickCount64() as HANDLE);
+            SetPropW(*h, wide("DunYu.Stamp").as_ptr(), stamp as HANDLE);
             InvalidateRect(*h, null(), 0);
         }
     }
@@ -662,6 +644,11 @@ impl Runtime {
             return;
         }
         SetWindowLongPtrW(h, GWLP_USERDATA, self.generation as isize);
+        SetPropW(
+            h,
+            wide("DunYu.MotionStart").as_ptr(),
+            self.motion_start as HANDLE,
+        );
         SetPropW(h, wide("DunYu.RestHost").as_ptr(), host);
         let dpi = if full {
             GetDpiForWindow(h)
@@ -706,7 +693,13 @@ impl Runtime {
         let make_font = |size: i32, name: &str| {
             let mut lf: LOGFONTW = std::mem::zeroed();
             lf.lfHeight = -px(size);
-            let face = wide("Microsoft YaHei UI");
+            let face = wide(if name == "DunYu.RestTitle" {
+                "Source Han Serif SC"
+            } else if name == "DunYu.RestTimer" {
+                "Segoe UI Light"
+            } else {
+                "Source Han Serif SC"
+            });
             lf.lfFaceName[..face.len()].copy_from_slice(&face);
             let font = CreateFontIndirectW(&lf);
             SetPropW(h, wide(name).as_ptr(), font);
@@ -818,6 +811,62 @@ impl Runtime {
             theme::button_style(b, *id == 1, theme::BACKGROUND);
         }
 
+        if full {
+            let layout = super::swim::Layout::new(width as f32, height as f32);
+            let put = |id, area: [f32; 4]| {
+                MoveWindow(
+                    GetDlgItem(h, id),
+                    area[0].round() as i32,
+                    area[1].round() as i32,
+                    area[2].round() as i32,
+                    area[3].round() as i32,
+                    0,
+                );
+            };
+            for (id, area) in [
+                (12, [510., 165., 652., 64.]),
+                (10, [686., 374., 300., 128.]),
+                (13, [500., 647., 672., 54.]),
+                (3, [699., 737., 274., 64.]),
+            ] {
+                put(id, layout.rect(area[0], area[1], area[2], area[3]));
+            }
+            put(
+                4,
+                [
+                    width as f32 - 76. * layout.scale,
+                    28. * layout.scale,
+                    48. * layout.scale,
+                    48. * layout.scale,
+                ],
+            );
+            for (id, size, name) in [
+                (12, 36., "DunYu.RestTitle"),
+                (10, 96., "DunYu.RestTimer"),
+                (13, 28., "DunYu.RestFont"),
+            ] {
+                let mut lf: LOGFONTW = std::mem::zeroed();
+                lf.lfHeight = -(size * layout.scale).round() as i32;
+                let face = wide(if id == 10 {
+                    "Segoe UI Light"
+                } else {
+                    "Source Han Serif SC"
+                });
+                lf.lfFaceName[..face.len()].copy_from_slice(&face);
+                let font = CreateFontIndirectW(&lf);
+                let old = GetPropW(h, wide(name).as_ptr());
+                SetPropW(h, wide(name).as_ptr(), font);
+                SendMessageW(GetDlgItem(h, id), WM_SETFONT, font as usize, 0);
+                if id == 13 {
+                    SendMessageW(GetDlgItem(h, 3), WM_SETFONT, font as usize, 0);
+                }
+                if id == 12 {
+                    SendMessageW(GetDlgItem(h, 4), WM_SETFONT, font as usize, 0);
+                }
+                DeleteObject(old);
+            }
+            theme::outline(GetDlgItem(h, 3));
+        }
         update_animation(h);
         ShowWindow(h, SW_SHOWNOACTIVATE);
         self.windows.push(h);

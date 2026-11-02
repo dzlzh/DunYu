@@ -1,5 +1,18 @@
-Tool: built-in imagegen, transparent_background=true
-Reference: resources/koi-sprite.png
-Prompt:
-Edit this exact orange koi into an animation sprite sheet with 4 equal cells in ONE horizontal row. Each cell contains the SAME fish at IDENTICAL scale and head position, fully visible with clear transparent padding. Preserve orange gradient, long tapered tail, flowing fins, no eyes added, the original graphic silhouette/style. All fish heads point RIGHT horizontally. Frame 1 neutral curved body, frame 2 tail swept gently up, frame 3 neutral (matching frame 1), frame 4 tail swept gently down. Head and forward body remain anchored in same location in each cell; only rear body/tail/fins flex naturally. The sequence loops into gentle lifelike swimming. Actual transparent background, no grid lines, no labels, no text, no water. Four cells, single row, production sprite sheet.
-Runtime: continuous deformation of the neutral cell keeps the head anchored and avoids abrupt frame changes.
+Generator: built-in imagegen; transparent_background=true
+Style source: art-style.md (共同前缀、固定色盘及固定结尾均引用此文件)
+Reference: fish.png (同一条鱼的造型与色盘)
+Output: koi-ink.png
+
+Atlas brief:
+制作参考图中同一条鱼的二维骨骼动画素材图集。画布横向2:1，精确2行2列四个等大的横向单元，无网格线、无标签、无背景，所有空白真正透明。
+左上：鱼身和分叉尾，保留眼睛、腹部与尾纹，去掉两片侧鳍；头向右，尾向左，主体完整且留足透明余量。
+右上：仅上侧胸鳍，根部尖端朝右，扇面向左上展开。
+左下：仅下侧胸鳍，同色同尺度，根部尖端朝右，扇面向左下展开。
+右下：同一条完整鱼，含两片侧鳍，供造型对照。
+所有单元相互独立。不画荷叶、水或额外背景。
+
+Rig measurements (normalized within each cell):
+Upper fin root (0.66,0.61), lower fin root (0.65,0.39).
+Body renders from upper-left cell; fins rotate around roots before body is drawn over their attachment.
+Continuous longitudinal deformation, 1.2-second tail/fin cycle; 12-second orbit independent of countdown.
+Fourth cell is a reference illustration, not an animation frame.

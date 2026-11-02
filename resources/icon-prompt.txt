@@ -1,5 +1,13 @@
-Generator: built-in imagegen
-Reference: user-provided dunyu.jpg (orange koi and green lily pads on a teal pond)
-Output: fish.png; packaged as dunyu.ico at 16, 20, 24, 32, 40, 48, 64, 128, 256 pixels
+Generator: built-in imagegen; transparent_background=true
+Style source: art-style.md (共同前缀、固定色盘及固定结尾均引用此文件)
+Outputs: fish.png, fish-small.png, dunyu.ico
 
-Use case: logo-brand. Reference image: the provided dunyu.jpg is the visual identity and composition reference for the DunYu Windows app icon. Generate a polished square app icon faithfully based on it: an orange koi fish viewed from above curving diagonally toward the upper right through deep teal pond water, bright green lily pads entering at the upper right and lower left. Preserve this arrangement, natural palette, gentle rounded-square silhouette and calm painterly flat illustration style. Simplify small details for a legible 16px taskbar/tray icon; strong orange fish silhouette, clean broad leaves, very few subtle light flecks, no tiny texture. The rounded-square tile should occupy about 94 percent of the square canvas, centered; ONLY outside its rounded corners is transparent, the pond inside remains solid dark teal. No white surround, no mockup, no text, no letters, no extra borders or cast shadow. Produce one finished icon, not an icon sheet.
+Main asset brief:
+为Windows应用「遁鱼」重新设计一个精炼、雅致的正方形应用图标，无文字。实色圆角方形底，圆角以外真正透明。只画一条概括化锦鲤，头略大，圆眼极简，弧形鱼身朝右上，手工粗轮廓，腹部留白，扇形分叉尾，鳍里一两条装饰线。左下角只画一片小巧荷叶，用轮廓和一条叶脉概括。鱼和荷叶总体占画面约55%，不加边框、圆环、印章或汉字。16像素时剪影仍好认。
+
+Small asset brief (reference: fish.png):
+把参考应用图标改为16至32像素专用简化版本。保留同一条锦鲤的体形、眼睛、朝右上姿态、粗轮廓和腹部，尾纹合并成一条，删掉细小鱼须和所有荷叶。只有一条简练鱼形与实色圆角背景，鱼占画面约65%，周围留白，圆角以外真正透明。不加文字或边框。
+
+Packaging:
+16,20,24,32 pixels use fish-small.png; 40,48,64,128,256 use fish.png.
+ICO resizing uses Lanczos through ImageMagick; no runtime external image dependency.

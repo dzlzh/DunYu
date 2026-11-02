@@ -1,6 +1,9 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 #[cfg(windows)]
 mod desktop;
+#[cfg(all(test, not(windows)))]
+#[path = "desktop/swim.rs"]
+mod swim;
 fn main() {
     #[cfg(windows)]
     desktop::run();
