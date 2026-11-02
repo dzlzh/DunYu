@@ -719,6 +719,11 @@ pub(super) unsafe fn capture(h: HWND, path: &str) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
+pub(super) unsafe fn capture_screen(h: HWND, path: &str) -> std::io::Result<()> {
+    capture_impl(h, path, true)
+}
+
+#[cfg(test)]
 unsafe fn capture_impl(h: HWND, path: &str, actual: bool) -> std::io::Result<()> {
     use std::io::Write;
     let mut r: RECT = std::mem::zeroed();

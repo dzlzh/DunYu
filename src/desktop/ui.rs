@@ -1029,13 +1029,15 @@ impl App {
             _ => 580,
         };
         u.scroll = u.scroll.clamp(0, (extent - viewport).max(0));
+        // Suppress intermediate paints; child geometry and paint snapshots form one frame.
+        SendMessageW(u.content, WM_SETREDRAW, 0, 0);
         MoveWindow(
             u.content,
             0,
             scale(76),
             client.right - scale(16),
             scale(viewport),
-            1,
+            0,
         );
         let si = SCROLLINFO {
             cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
@@ -1046,7 +1048,7 @@ impl App {
             nPos: u.scroll,
             nTrackPos: 0,
         };
-        SetScrollInfo(item(u.window, 9003), SB_CTL, &si, 1);
+        SetScrollInfo(item(u.window, 9003), SB_CTL, &si, 0);
         let mut content: RECT = std::mem::zeroed();
         GetClientRect(u.content, &mut content);
         let bw = content.right * 96 / u.dpi as i32;
@@ -1089,6 +1091,7 @@ impl App {
             }
         }
         let mut fields = vec![];
+        let mut placements = vec![];
         for (page, c) in &u.controls {
             let id = GetDlgCtrlID(*c);
             let area: Option<(i32, i32, i32, i32)> = match id {
@@ -1211,14 +1214,7 @@ impl App {
                     r.top += scale(8);
                     r.bottom -= scale(6);
                 }
-                MoveWindow(
-                    *c,
-                    r.left,
-                    r.top,
-                    (r.right - r.left).max(1),
-                    (r.bottom - r.top).max(1),
-                    1,
-                );
+                placements.push((*c, r));
                 theme::scene(*c, u.dpi, vec![], vec![]);
             }
         }
@@ -1241,6 +1237,50 @@ impl App {
         theme::sync_list_scroll(u.list);
         theme::scene(u.content, u.dpi, cards, fields);
         theme::scene(u.window, u.dpi, vec![], vec![]);
+        for parent in [u.window, u.content] {
+            let group: Vec<_> = placements
+                .iter()
+                .filter(|(h, _)| GetParent(*h) == parent)
+                .collect();
+            let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOCOPYBITS;
+            let mut batch = BeginDeferWindowPos(group.len() as i32);
+            for (child, r) in &group {
+                if batch.is_null() {
+                    break;
+                }
+                batch = DeferWindowPos(
+                    batch,
+                    *child,
+                    null_mut(),
+                    r.left,
+                    r.top,
+                    (r.right - r.left).max(1),
+                    (r.bottom - r.top).max(1),
+                    flags,
+                );
+            }
+            if batch.is_null() || EndDeferWindowPos(batch) == 0 {
+                for (child, r) in group {
+                    SetWindowPos(
+                        *child,
+                        null_mut(),
+                        r.left,
+                        r.top,
+                        (r.right - r.left).max(1),
+                        (r.bottom - r.top).max(1),
+                        flags,
+                    );
+                }
+            }
+        }
+        theme::sync_list_scroll(u.list);
+        SendMessageW(u.content, WM_SETREDRAW, 1, 0);
+        RedrawWindow(
+            u.window,
+            null(),
+            null_mut(),
+            RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME,
+        );
     }
 
     pub(super) unsafe fn status(&self, message: &str) {
@@ -1881,6 +1921,32 @@ mod capture_tests {
             assert!(IsWindowVisible(item(h, 204)) != 0);
             if std::env::var_os("DUNYU_UI_SCREENSHOTS").is_some() {
                 theme::capture(h, "target/ui-preview/advanced.bmp").unwrap();
+            }
+            // Opt in on an interactive Windows desktop: compare the actual displayed
+            // pixels after scrolling with a complete repaint at identical geometry.
+            if std::env::var_os("DUNYU_UI_SCROLL_CHECK").is_some() {
+                std::fs::create_dir_all("target/ui-preview").unwrap();
+                SetFocus(h);
+                for offset in [0, 120, 300, 120, 0, 400, 0] {
+                    app.ui.as_mut().unwrap().scroll = offset;
+                    app.layout_ui();
+                    RedrawWindow(h, null(), null_mut(), RDW_UPDATENOW | RDW_ALLCHILDREN);
+                    windows_sys::Win32::Graphics::Dwm::DwmFlush();
+                    theme::capture_screen(h, "target/ui-preview/scroll-actual.bmp").unwrap();
+                    RedrawWindow(
+                        h,
+                        null(),
+                        null_mut(),
+                        RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_ALLCHILDREN,
+                    );
+                    windows_sys::Win32::Graphics::Dwm::DwmFlush();
+                    theme::capture_screen(h, "target/ui-preview/scroll-redrawn.bmp").unwrap();
+                    assert_eq!(
+                        std::fs::read("target/ui-preview/scroll-actual.bmp").unwrap(),
+                        std::fs::read("target/ui-preview/scroll-redrawn.bmp").unwrap(),
+                        "scroll residue at {offset}"
+                    );
+                }
             }
             app.ui_action(116).unwrap();
             assert_eq!(IsWindowVisible(item(h, 204)), 0);
