@@ -1550,13 +1550,13 @@ impl App {
     }
 
     pub(super) unsafe fn status(&self, message: &str) {
-        self.status_color(message, 0xa1aab8);
+        self.status_color(message, theme::MUTED);
     }
     pub(super) unsafe fn status_error(&self, message: &str) {
-        self.status_color(message, 0xfb7185);
+        self.status_color(message, theme::DANGER);
     }
     unsafe fn status_success(&self, message: &str) {
-        self.status_color(message, 0x4ade80);
+        self.status_color(message, theme::SUCCESS);
     }
     unsafe fn status_color(&self, message: &str, value: u32) {
         if let Some(u) = &self.ui {

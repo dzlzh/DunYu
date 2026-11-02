@@ -5,15 +5,27 @@ use std::rc::Rc;
 use windows_sys::Win32::Graphics::GdiPlus::*;
 use windows_sys::Win32::UI::Controls::*;
 
-pub(super) const BACKGROUND: u32 = 0x0f1115;
-const SURFACE: u32 = 0x171b22;
-const WHITE: u32 = 0xffffff;
-const INK: u32 = 0xe5e7eb;
-const MUTED: u32 = 0xa1aab8;
-const BLUE: u32 = 0x2563eb;
-const ACCENT_TEXT: u32 = 0x73bda8;
-const LINE: u32 = 0x343d4b;
-const PALE: u32 = 0x203658;
+// 玄墨朱砂: Inkstone Xuanmo's ink surfaces and warm text, with vermilion actions.
+// Reference: https://github.com/Konata9/inkstone/blob/main/docs/palette.md
+// Neutral shades and mineral colors below come from Xuanmo; the accent state
+// and selection shades are DunYu adaptations rather than historical color names.
+pub(super) const BACKGROUND: u32 = 0x14131a;
+const SURFACE: u32 = 0x1a1922;
+const ON_ACCENT: u32 = 0x0f0e14;
+pub(super) const INK: u32 = 0xd4cec4;
+pub(super) const MUTED: u32 = 0xada599;
+pub(super) const ACCENT: u32 = 0xd8574a; // 鱼鳃红 · 降彩
+const ACCENT_HOVER: u32 = 0xe06b5f;
+const ACCENT_PRESSED: u32 = 0xcf5548;
+const ACCENT_TEXT: u32 = 0xe99587;
+const LINE: u32 = 0x343240;
+const SELECTION: u32 = 0x392728;
+const SURFACE_HOVER: u32 = 0x24222e;
+const SURFACE_PRESSED: u32 = 0x302e3c;
+pub(super) const SUCCESS: u32 = 0x2bae85; // 铜绿
+pub(super) const DANGER: u32 = 0xe25737; // 银朱 · 降彩
+pub(super) const POND_RIPPLE: u32 = LINE;
+pub(super) const POND_LEAF: u32 = 0x22212c;
 fn rgb(hex: u32) -> u32 {
     (hex & 255) << 16 | hex & 0xff00 | hex >> 16
 }
@@ -26,11 +38,10 @@ unsafe fn high_contrast() -> bool {
 unsafe fn color(value: u32) -> u32 {
     if high_contrast() {
         GetSysColor(match value {
-            INK | MUTED => COLOR_WINDOWTEXT,
-            BLUE => COLOR_HIGHLIGHT,
-            ACCENT_TEXT => COLOR_WINDOWTEXT,
-            SURFACE => COLOR_WINDOW,
-            WHITE => COLOR_HIGHLIGHTTEXT,
+            INK | MUTED | SUCCESS | DANGER | ACCENT_TEXT | LINE => COLOR_WINDOWTEXT,
+            ACCENT | ACCENT_HOVER | ACCENT_PRESSED | SELECTION => COLOR_HIGHLIGHT,
+            BACKGROUND | SURFACE | SURFACE_HOVER | SURFACE_PRESSED => COLOR_WINDOW,
+            ON_ACCENT => COLOR_HIGHLIGHTTEXT,
             _ => COLOR_BTNFACE,
         })
     } else {
@@ -78,6 +89,7 @@ struct PaintState {
     role: Role,
     hot: bool,
     tint: Option<u32>,
+    button_style: Option<(bool, u32)>,
     dpi: u32,
     cards: Vec<RECT>,
     fields: Vec<(HWND, RECT)>,
@@ -89,6 +101,7 @@ pub(super) unsafe fn attach(h: HWND, role: Role, theme: Rc<Theme>) {
         role,
         hot: false,
         tint: None,
+        button_style: None,
         dpi: 96,
         cards: vec![],
         fields: vec![],
@@ -105,6 +118,15 @@ pub(super) unsafe fn tint(h: HWND, value: u32) {
     }
     InvalidateRect(h, null(), 0);
 }
+// Rest controls live directly on the pond canvas rather than a settings card.
+pub(super) unsafe fn button_style(h: HWND, primary: bool, backdrop: u32) {
+    let mut ptr = 0;
+    if GetWindowSubclass(h, Some(procedure), SUBCLASS, &mut ptr) != 0 {
+        (*(ptr as *mut PaintState)).button_style = Some((primary, backdrop));
+    }
+    InvalidateRect(h, null(), 0);
+}
+
 pub(super) unsafe fn scene(h: HWND, dpi: u32, cards: Vec<RECT>, fields: Vec<(HWND, RECT)>) {
     let mut ptr = 0;
     if GetWindowSubclass(h, Some(procedure), SUBCLASS, &mut ptr) != 0 {
@@ -296,9 +318,9 @@ unsafe fn paint(h: HWND, dc: HDC, s: &PaintState) {
                 bottom: top + px(20),
             };
             let checked = SendMessageW(h, BM_GETCHECK, 0, 0) != 0;
-            rounded(dc, box_rect, px(4), if checked { BLUE } else { MUTED });
+            rounded(dc, box_rect, px(4), if checked { ACCENT } else { MUTED });
             if checked {
-                text(dc, h, "✓", box_rect, WHITE, DT_CENTER);
+                text(dc, h, "✓", box_rect, ON_ACCENT, DT_CENTER);
             } else {
                 rounded(dc, inset(box_rect, px(1).max(1)), px(3), SURFACE);
             }
@@ -362,7 +384,7 @@ unsafe fn paint(h: HWND, dc: HDC, s: &PaintState) {
             }
             for (field, rect) in &s.fields {
                 let focused = GetFocus() == *field;
-                rounded(dc, *rect, px(8), if focused { BLUE } else { LINE });
+                rounded(dc, *rect, px(8), if focused { ACCENT_TEXT } else { LINE });
                 rounded(
                     dc,
                     inset(*rect, px(if focused { 2 } else { 1 }).max(1)),
@@ -372,43 +394,41 @@ unsafe fn paint(h: HWND, dc: HDC, s: &PaintState) {
             }
         }
         Role::Button => {
-            fill(
-                dc,
-                r,
-                if matches!(GetDlgCtrlID(h), 113 | 330 | 506) {
-                    BACKGROUND
-                } else {
-                    SURFACE
-                },
-            );
-            let primary = matches!(GetDlgCtrlID(h), 113 | 330 | 506);
+            let default_primary = matches!(GetDlgCtrlID(h), 113 | 330 | 506);
+            let (primary, backdrop) = s.button_style.unwrap_or((
+                default_primary,
+                if default_primary { BACKGROUND } else { SURFACE },
+            ));
+            fill(dc, r, backdrop);
             let down = SendMessageW(h, BM_GETSTATE, 0, 0) as u32 & BST_PUSHED != 0;
             let enabled = IsWindowEnabled(h) != 0;
             let bg = if !enabled {
                 BACKGROUND
             } else if primary {
                 if down {
-                    0x1e40af
+                    ACCENT_PRESSED
                 } else if s.hot {
-                    0x1d4ed8
+                    ACCENT_HOVER
                 } else {
-                    BLUE
+                    ACCENT
                 }
             } else if down {
-                LINE
+                SURFACE_PRESSED
             } else if s.hot {
-                PALE
+                SURFACE_HOVER
             } else {
                 SURFACE
             };
-            let bg = s.tint.unwrap_or(bg);
+            // Highlight both sides of the text/background pair in system contrast mode.
+            let highlighted = high_contrast() && enabled && (primary || s.hot || down);
+            let bg = if highlighted { ACCENT } else { bg };
             let outer = inset(r, px(2));
             rounded(
                 dc,
                 outer,
                 px(8),
                 if GetFocus() == h {
-                    BLUE
+                    ACCENT_TEXT
                 } else if primary {
                     bg
                 } else {
@@ -423,10 +443,10 @@ unsafe fn paint(h: HWND, dc: HDC, s: &PaintState) {
                 button_text_rect(r, s.dpi),
                 if !enabled {
                     MUTED
-                } else if primary {
-                    WHITE
-                } else if GetDlgCtrlID(h) == 111 {
-                    0xfb7185
+                } else if primary || highlighted {
+                    ON_ACCENT
+                } else if GetDlgCtrlID(h) == 111 && !s.hot && !down {
+                    DANGER
                 } else {
                     INK
                 },
@@ -440,14 +460,18 @@ unsafe fn paint(h: HWND, dc: HDC, s: &PaintState) {
                 let mut item: RECT = std::mem::zeroed();
                 SendMessageW(h, TCM_GETITEMRECT, i, &mut item as *mut _ as isize);
                 if selected == i as isize {
-                    rounded(dc, inset(item, px(2)), px(8), PALE);
+                    rounded(dc, inset(item, px(2)), px(8), SELECTION);
                 }
                 if selected == i as isize && GetFocus() == h {
-                    rounded(dc, inset(item, px(2)), px(8), 0x73bda8);
-                    rounded(dc, inset(item, px(4)), px(6), PALE);
+                    rounded(dc, inset(item, px(2)), px(8), ACCENT_TEXT);
+                    rounded(dc, inset(item, px(4)), px(6), SELECTION);
                 }
                 let fg = if selected == i as isize {
-                    ACCENT_TEXT
+                    if high_contrast() {
+                        ON_ACCENT
+                    } else {
+                        ACCENT_TEXT
+                    }
                 } else {
                     MUTED
                 };
@@ -628,7 +652,7 @@ unsafe extern "system" fn procedure(
                 let px = |v: i32| v * (*ptr).dpi as i32 / 96;
                 fill(d.hDC, d.rcItem, SURFACE);
                 if selected {
-                    rounded(d.hDC, inset(d.rcItem, px(4)), px(8), PALE);
+                    rounded(d.hDC, inset(d.rcItem, px(4)), px(8), SELECTION);
                 }
                 let n = SendMessageW(d.hwndItem, LB_GETTEXTLEN, d.itemID as usize, 0);
                 if n >= 0 {
@@ -648,7 +672,15 @@ unsafe extern "system" fn procedure(
                         d.hwndItem,
                         lines.next().unwrap_or(""),
                         r,
-                        if selected { ACCENT_TEXT } else { INK },
+                        if selected {
+                            if high_contrast() {
+                                ON_ACCENT
+                            } else {
+                                ACCENT_TEXT
+                            }
+                        } else {
+                            INK
+                        },
                         DT_LEFT,
                     );
                     r.top += px(24);
@@ -658,7 +690,11 @@ unsafe extern "system" fn procedure(
                         d.hwndItem,
                         lines.next().unwrap_or(""),
                         r,
-                        MUTED,
+                        if selected && high_contrast() {
+                            ON_ACCENT
+                        } else {
+                            MUTED
+                        },
                         DT_LEFT,
                     );
                 }
@@ -686,7 +722,7 @@ unsafe extern "system" fn procedure(
                         let value = SendMessageW(hdr.hwndFrom, WM_USER, 0, 0).clamp(10, 100);
                         r.right = r.left + ((r.right - r.left) as isize * (value - 10) / 90) as i32;
                         if r.right > r.left {
-                            rounded(draw.hdc, r, px(3), BLUE);
+                            rounded(draw.hdc, r, px(3), ACCENT);
                         }
                         return CDRF_SKIPDEFAULT as isize;
                     }
@@ -696,12 +732,12 @@ unsafe extern "system" fn procedure(
                             draw.rc,
                             px(8),
                             if IsWindowEnabled(hdr.hwndFrom) != 0 {
-                                BLUE
+                                ACCENT
                             } else {
                                 MUTED
                             },
                         );
-                        rounded(draw.hdc, inset(draw.rc, px(3)), px(5), WHITE);
+                        rounded(draw.hdc, inset(draw.rc, px(3)), px(5), ON_ACCENT);
                         return CDRF_SKIPDEFAULT as isize;
                     }
                 }

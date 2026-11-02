@@ -67,15 +67,15 @@ unsafe extern "system" fn procedure(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LR
                 dc,
                 pond_color(
                     if GetDlgCtrlID(l as HWND) == 14 {
-                        0x9aada7
+                        theme::MUTED
                     } else {
-                        0xe7f1e8
+                        theme::INK
                     },
                     COLOR_WINDOWTEXT,
                 ),
             );
-            SetBkColor(dc, pond_color(0x0b1f22, COLOR_WINDOW));
-            SetDCBrushColor(dc, pond_color(0x0b1f22, COLOR_WINDOW));
+            SetBkColor(dc, pond_color(theme::BACKGROUND, COLOR_WINDOW));
+            SetDCBrushColor(dc, pond_color(theme::BACKGROUND, COLOR_WINDOW));
             GetStockObject(DC_BRUSH) as isize
         }
 
@@ -174,7 +174,7 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
         return;
     }
     let old = SelectObject(memory, bitmap);
-    let brush = CreateSolidBrush(pond_color(0x0b1f22, COLOR_WINDOW));
+    let brush = CreateSolidBrush(pond_color(theme::BACKGROUND, COLOR_WINDOW));
     let buffer = RECT {
         left: 0,
         top: 0,
@@ -200,7 +200,7 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
         };
         let mut pen = null_mut();
         GdipCreatePen1(
-            argb(0x204447, COLOR_WINDOWTEXT),
+            argb(theme::POND_RIPPLE, COLOR_WINDOWTEXT),
             2. * scale,
             UnitPixel,
             &mut pen,
@@ -215,7 +215,7 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
         }
         if full {
             let mut leaf = null_mut();
-            GdipCreateSolidFill(argb(0x173d38, COLOR_WINDOW), &mut leaf);
+            GdipCreateSolidFill(argb(theme::POND_LEAF, COLOR_WINDOW), &mut leaf);
             GdipFillPie(
                 g,
                 leaf as _,
@@ -255,7 +255,7 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
             let y = top + 66. * scale;
             GdipSetPenWidth(pen, 3. * scale);
             GdipDrawEllipse(g, pen, x, y, d, d);
-            GdipSetPenColor(pen, argb(0x73bda8, COLOR_HIGHLIGHT));
+            GdipSetPenColor(pen, argb(theme::ACCENT, COLOR_HIGHLIGHT));
             if percent > 0. {
                 GdipDrawArc(g, pen, x, y, d, d, -90., percent * 3.6);
             }
@@ -263,7 +263,7 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
             let x = 30. * scale;
             let y = top + 186. * scale;
             GdipDrawLine(g, pen, x, y, r.right as f32 - x, y);
-            GdipSetPenColor(pen, argb(0x73bda8, COLOR_HIGHLIGHT));
+            GdipSetPenColor(pen, argb(theme::ACCENT, COLOR_HIGHLIGHT));
             GdipDrawLine(
                 g,
                 pen,
@@ -775,7 +775,7 @@ impl Runtime {
         SendMessageW(close, WM_SETFONT, heading_font as usize, 0);
         theme::attach(close, theme::Role::Button, skin.clone());
         theme::scene(close, dpi, vec![], vec![]);
-        theme::tint(close, 0x163438);
+        theme::button_style(close, false, theme::BACKGROUND);
         let buttons: Vec<(usize, &str)> = if matches!(phase, Phase::Warning | Phase::Awaiting) {
             vec![
                 (1, "现在休息"),
@@ -815,7 +815,7 @@ impl Runtime {
             SendMessageW(b, WM_SETFONT, font as usize, 0);
             theme::attach(b, theme::Role::Button, skin.clone());
             theme::scene(b, dpi, vec![], vec![]);
-            theme::tint(b, if *id == 1 { 0x2d6e60 } else { 0x163438 });
+            theme::button_style(b, *id == 1, theme::BACKGROUND);
         }
 
         update_animation(h);
