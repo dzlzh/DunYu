@@ -364,7 +364,7 @@ impl App {
                 .ok()
                 .and_then(|b| serde_json::from_slice::<f64>(&b).ok())
                 .filter(|v| v.is_finite() && (0.1..=0.8).contains(v))
-                .unwrap_or(0.36),
+                .unwrap_or(super::design::SPLIT),
             dragging: false,
             baseline: vec![],
         };
@@ -877,8 +877,8 @@ impl App {
             &mut u,
             3,
             "STATIC",
-            "点击快捷键框后按组合键，Tab 离开。修改后需要保存。",
-            0,
+            "每次改变的不透明度百分点",
+            7051,
             244,
             440,
             610,
@@ -1029,12 +1029,12 @@ impl App {
         }
 
         let mut font: LOGFONTW = std::mem::zeroed();
-        font.lfHeight = -(14 * dpi as i32 / 96);
+        font.lfHeight = -(16 * dpi as i32 / 96);
         font.lfCharSet = DEFAULT_CHARSET;
         let face = wide("Source Han Serif SC");
         font.lfFaceName[..face.len()].copy_from_slice(&face);
         let new_font = CreateFontIndirectW(&font);
-        font.lfHeight = -(22 * dpi as i32 / 96);
+        font.lfHeight = -(27 * dpi as i32 / 96);
         font.lfWeight = 600;
         font.lfFaceName = [0; 32];
         let heading_face = wide("Source Han Serif SC");
@@ -1077,7 +1077,7 @@ impl App {
                 left: 0,
                 top: 0,
                 right: 1024 * dpi as i32 / 96,
-                bottom: 650 * dpi as i32 / 96,
+                bottom: 651 * dpi as i32 / 96,
             };
             AdjustWindowRectExForDpi(&mut size, WS_OVERLAPPEDWINDOW, 0, WS_EX_CONTROLPARENT, dpi);
             RECT {
@@ -1194,7 +1194,7 @@ impl App {
 
         let width = client.right * 96 / u.dpi as i32;
         let height = client.bottom * 96 / u.dpi as i32;
-        let viewport = (height - 140).max(1);
+        let viewport = (height - if u.page == 3 { 100 } else { 140 }).max(1);
         let columns = if width >= 960 { 2 } else { 1 };
         let action_width = [808, 809, 812, 813, 814]
             .into_iter()
@@ -1203,7 +1203,7 @@ impl App {
             .unwrap();
         let action_columns = ((width - 104 + 12) / (action_width + 12)).clamp(1, 5);
         let action_rows = (5 + action_columns - 1) / action_columns;
-        let extent = match u.page {
+        let mut extent = match u.page {
             0 => {
                 if u.advanced {
                     900
@@ -1229,17 +1229,25 @@ impl App {
                 }
             }
         };
+        let design = super::design::Canvas {
+            width,
+            height,
+            split: u.split_ratio,
+        };
+        let reference = super::design::reference_layout(columns, u.page, u.advanced);
+        if reference {
+            extent = if u.page == 0 && u.advanced {
+                900
+            } else if u.page == 3 {
+                514
+            } else {
+                480
+            };
+        }
         u.scroll = u.scroll.clamp(0, (extent - viewport).max(0));
         // Suppress intermediate paints; child geometry and paint snapshots form one frame.
         SendMessageW(u.content, WM_SETREDRAW, 0, 0);
-        MoveWindow(
-            u.content,
-            0,
-            scale(76),
-            client.right - scale(16),
-            scale(viewport),
-            0,
-        );
+        MoveWindow(u.content, 0, scale(76), client.right, scale(viewport), 0);
         let si = SCROLLINFO {
             cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
             fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
@@ -1315,7 +1323,35 @@ impl App {
                 }
             }
         }
-        let list_height = (viewport - 160).max(64);
+        if reference {
+            cards = design
+                .cards(u.page)
+                .into_iter()
+                .enumerate()
+                .map(|(index, (x, y, w, h))| {
+                    let h = if u.page == 0 && index == 1 && u.advanced {
+                        (extent - y - 16).max(h)
+                    } else {
+                        h
+                    };
+                    rect(
+                        x,
+                        if u.page == 0 && index == 0 {
+                            y
+                        } else {
+                            y - u.scroll
+                        },
+                        w,
+                        h,
+                    )
+                })
+                .collect();
+        }
+        let list_height = if reference {
+            design.control(119).unwrap().3
+        } else {
+            (viewport - 160).max(64)
+        };
         let count = SendMessageW(u.list, LB_GETCOUNT, 0, 0).max(0) as i32;
         u.list_scroll = u.list_scroll.clamp(0, (count * 64 - list_height).max(0));
         let list_info = SCROLLINFO {
@@ -1541,6 +1577,22 @@ impl App {
                 7051 => None,
                 _ => None,
             };
+            let area = if !u.advanced && matches!(id,202..=206|6202..=6206|209) {
+                None
+            } else if reference {
+                design
+                    .control(id)
+                    .map(|mut r| {
+                        if id == 100 {
+                            r.1 = -(u.list_scroll % 64);
+                            r.3 += u.list_scroll % 64;
+                        }
+                        r
+                    })
+                    .or(area)
+            } else {
+                area
+            };
             let visible = (*page == 99 || *page == u.page) && area.is_some();
             if !visible {
                 ShowWindow(*c, SW_HIDE);
@@ -1568,7 +1620,7 @@ impl App {
                     // Add padding around the font's full line height, including descenders.
                     let desired_height = (r.bottom - r.top)
                         .max(measured.cy + scale(12))
-                        .max(scale(40));
+                        .max(scale(28));
                     let extra = desired_height - (r.bottom - r.top);
                     r.top -= extra / 2;
                     r.bottom = r.top + desired_height;
@@ -1579,8 +1631,13 @@ impl App {
                     }
                     r.left += scale(4);
                     r.right -= scale(4);
-                    r.top += scale(8);
-                    r.bottom -= scale(6);
+                    let (top, bottom) = super::design::edit_inset(
+                        r.bottom - r.top,
+                        theme::font_line_height(*c),
+                        u.dpi,
+                    );
+                    r.top += top;
+                    r.bottom -= bottom;
                 }
                 if visible {
                     placements.push((*c, r));
@@ -1596,13 +1653,6 @@ impl App {
             } else {
                 "高级选项  +"
             },
-        );
-        SendMessageW(
-            item(u.window, 9),
-            TCM_SETITEMSIZE,
-            0,
-            ((scale(40) as isize) << 16)
-                | scale(((width - 230) / PAGES.len() as i32).min(128)) as isize,
         );
         SendMessageW(u.list, LB_SETITEMHEIGHT, 0, scale(64) as isize);
         theme::sync_list_scroll(u.list);
@@ -1645,6 +1695,19 @@ impl App {
                 }
             }
         }
+        // Size items after positioning the host: its width differs from the main window.
+        let tab = item(u.window, 9);
+        let mut tab_rect: RECT = std::mem::zeroed();
+        GetClientRect(tab, &mut tab_rect);
+        let item_width =
+            super::design::navigation_item_width(tab_rect.right, u.dpi, PAGES.len() as i32);
+        SendMessageW(tab, TCM_SETMINTABWIDTH, 0, 0);
+        SendMessageW(
+            tab,
+            TCM_SETITEMSIZE,
+            0,
+            ((scale(51) as isize) << 16) | item_width as isize,
+        );
         SendMessageW(u.list, LB_SETTOPINDEX, (u.list_scroll / 64) as usize, 0);
         theme::sync_list_scroll(u.list);
         SendMessageW(u.content, WM_SETREDRAW, 1, 0);
@@ -2368,7 +2431,68 @@ mod capture_tests {
             assert_eq!(text_at(h, 200), "未保存草稿");
             assert_eq!(app.config.rules[0].name, "测试程序");
             assert_ne!(app.rule_snapshot(), app.ui.as_ref().unwrap().baseline);
+            // Native regressions: overflow arrows, clipped edit lines, and layout
+            // movement when expanding/collapsing advanced summon fields.
+            for dpi in [96, 120, 144, 192] {
+                app.scale_ui(dpi, None);
+                app.page(0);
+                app.ui.as_mut().unwrap().advanced = false;
+                app.layout_ui();
+                let bounds = |id| {
+                    let mut r: RECT = std::mem::zeroed();
+                    GetWindowRect(item(h, id), &mut r);
+                    (r.left, r.top, r.right, r.bottom)
+                };
+                let ids = [9, 9002, 119, 120, 114, 112, 200, 201, 207, 208, 116];
+                let before: Vec<_> = ids.iter().map(|id| bounds(*id)).collect();
+                app.ui_action(116).unwrap();
+                assert_ne!(IsWindowVisible(item(h, 202)), 0);
+                for (id, expected) in ids.iter().zip(&before) {
+                    assert_eq!(
+                        bounds(*id),
+                        *expected,
+                        "advanced moved control {id} at DPI {dpi}"
+                    );
+                }
+                app.ui_action(116).unwrap();
+                assert_eq!(IsWindowVisible(item(h, 202)), 0);
+                for (id, expected) in ids.iter().zip(&before) {
+                    assert_eq!(bounds(*id), *expected);
+                }
+                let tab = item(h, 9);
+                UpdateWindow(tab);
+                let mut client: RECT = std::mem::zeroed();
+                GetClientRect(tab, &mut client);
+                for index in 0..PAGES.len() {
+                    let mut r: RECT = std::mem::zeroed();
+                    SendMessageW(tab, TCM_GETITEMRECT, index, &mut r as *mut _ as isize);
+                    assert!(
+                        r.left >= 0 && r.right <= client.right,
+                        "navigation overflow at DPI {dpi}"
+                    );
+                }
+                let arrows =
+                    FindWindowExW(tab, null_mut(), wide("msctls_updown32").as_ptr(), null());
+                assert!(
+                    arrows.is_null() || IsWindowVisible(arrows) == 0,
+                    "navigation scroll arrows at DPI {dpi}"
+                );
+                app.page(3);
+                for id in [801, 802, 803, 804] {
+                    let edit = item(h, id);
+                    let mut r: RECT = std::mem::zeroed();
+                    SendMessageW(edit, EM_GETRECT, 0, &mut r as *mut _ as isize);
+                    assert!(
+                        r.bottom - r.top >= theme::font_line_height(edit),
+                        "clipped numeric edit {id} at DPI {dpi}"
+                    );
+                }
+            }
+            app.scale_ui(96, None);
+            app.page(0);
             if std::env::var_os("DUNYU_UI_SCREENSHOTS").is_some() {
+                app.ui.as_mut().unwrap().split_ratio = super::super::design::SPLIT;
+                app.scale_ui(144, None);
                 std::fs::create_dir_all("target/ui-preview").unwrap();
                 for (page, name) in [
                     (0, "summon"),
@@ -2379,7 +2503,26 @@ mod capture_tests {
                     (5, "settings"),
                 ] {
                     app.page(page);
+                    let fixtures = [
+                        (810, "小憩 06:11 · 舒展 已关闭"),
+                        (400, "目标窗口不可用，请重新捕获"),
+                        (405, "不可用"),
+                        (801, "20"),
+                        (802, "20"),
+                        (804, "60"),
+                        (803, "5"),
+                    ];
+                    let original: Vec<_> = fixtures
+                        .iter()
+                        .map(|(id, _)| (*id, text_at(h, *id)))
+                        .collect();
+                    for (id, value) in fixtures {
+                        set_text(h, id, value);
+                    }
                     theme::capture(h, &format!("target/ui-preview/{name}.bmp")).unwrap();
+                    for (id, value) in original {
+                        set_text(h, id, &value);
+                    }
                 }
                 app.page(4);
                 assert_eq!(IsWindowVisible(item(h, 506)), 0);

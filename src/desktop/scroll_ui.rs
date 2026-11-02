@@ -24,7 +24,7 @@ pub(super) unsafe fn filter(msg: &MSG) -> bool {
             u.dragging = true;
             SetCapture(msg.hwnd);
             if msg.message == WM_LBUTTONDBLCLK {
-                u.split_ratio = 0.36;
+                u.split_ratio = super::design::SPLIT;
                 u.dragging = false;
                 ReleaseCapture();
                 if let Err(e) = atomic_json(&a.dir.join("ui-state.json"), &u.split_ratio) {
@@ -42,7 +42,7 @@ pub(super) unsafe fn filter(msg: &MSG) -> bool {
             GetClientRect(u.content, &mut r);
             let width = r.right * 96 / u.dpi as i32;
             u.split_ratio = ((point.x * 96 / u.dpi as i32 - 24) as f64
-                / (width - 64).max(1) as f64)
+                / (width - 68).max(1) as f64)
                 .clamp(0.1, 0.8);
             if msg.message == WM_LBUTTONUP {
                 u.dragging = false;

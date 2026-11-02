@@ -192,11 +192,6 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
     DeleteObject(brush);
     let full = !GetPropW(h, wide("DunYu.Full").as_ptr()).is_null();
     let scale = GetPropW(h, wide("DunYu.LayoutDpi").as_ptr()) as usize as f32 / 96.;
-    let top = if full {
-        ((r.bottom as f32 - 520. * scale) / 2.).max(16. * scale)
-    } else {
-        24. * scale
-    };
     let mut g = null_mut();
     if GdipCreateFromHDC(memory, &mut g) == 0 {
         GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
@@ -228,18 +223,19 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
             let [x, y, d, _] = layout.rect(661., 261., 350., 350.);
             GdipSetPenColor(pen, argb(theme::INK, COLOR_WINDOWTEXT));
             GdipSetPenWidth(pen, 2. * scale);
-            if moving {
-                super::assets::ring(g, [x, y, d, d]);
-            } else {
+            if theme::high_contrast() {
                 GdipDrawEllipse(g, pen, x, y, d, d);
+            } else {
+                super::assets::ring(g, [x, y, d, d]);
             }
             GdipSetPenColor(pen, argb(theme::ACCENT, COLOR_HIGHLIGHT));
+            GdipSetPenWidth(pen, 6. * layout.scale);
             if percent > 0. {
                 GdipDrawArc(g, pen, x, y, d, d, -90., percent * 3.6);
             }
         } else {
-            let x = 30. * scale;
-            let y = top + 186. * scale;
+            let x = r.right as f32 * 109. / 1561.;
+            let y = r.bottom as f32 * 640. / 1008.;
             GdipDrawLine(g, pen, x, y, r.right as f32 - x, y);
             GdipSetPenColor(pen, argb(theme::ACCENT, COLOR_HIGHLIGHT));
             GdipDrawLine(
@@ -264,22 +260,46 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
         GdipDeletePen(pen);
         GdipDeleteGraphics(g);
     }
+    if full && !theme::high_contrast() {
+        let l = super::swim::Layout::new(r.right as f32, r.bottom as f32);
+        let [x, y, w, h] = l.rect(699., 220., 140., 10.);
+        super::assets::stroke(
+            memory,
+            RECT {
+                left: x as i32 - dirty.left,
+                top: y as i32 - dirty.top,
+                right: (x + w) as i32 - dirty.left,
+                bottom: (y + h) as i32 - dirty.top,
+            },
+            false,
+        );
+    }
+    let logo_scale = if full {
+        layout_scale(r.right, r.bottom)
+    } else {
+        r.right as f32 / 1561.
+    };
+    let (logo_x, logo_y, logo_size) = if full {
+        (30., 27., 50.)
+    } else {
+        (80., 60., 100.)
+    };
     let logo = LoadImageW(
         GetModuleHandleW(null()),
         101usize as *const u16,
         IMAGE_ICON,
-        (32. * scale) as i32,
-        (32. * scale) as i32,
+        (logo_size * logo_scale) as i32,
+        (logo_size * logo_scale) as i32,
         LR_SHARED,
     ) as HICON;
     if !logo.is_null() {
         DrawIconEx(
             memory,
-            (20. * scale) as i32 - dirty.left,
-            (20. * scale) as i32 - dirty.top,
+            (logo_x * logo_scale) as i32 - dirty.left,
+            (logo_y * logo_scale) as i32 - dirty.top,
             logo,
-            (32. * scale) as i32,
-            (32. * scale) as i32,
+            (logo_size * logo_scale) as i32,
+            (logo_size * logo_scale) as i32,
             0,
             null_mut(),
             DI_NORMAL,
@@ -695,7 +715,7 @@ impl Runtime {
             lf.lfHeight = -px(size);
             let face = wide(if name == "DunYu.RestTitle" {
                 "Source Han Serif SC"
-            } else if name == "DunYu.RestTimer" {
+            } else if name == "DunYu.RestTimer" && full {
                 "Segoe UI Light"
             } else {
                 "Source Han Serif SC"
@@ -706,8 +726,8 @@ impl Runtime {
             font
         };
         let font = make_font(16, "DunYu.RestFont");
-        let heading_font = make_font(if full { 22 } else { 18 }, "DunYu.RestTitle");
-        let timer_font = make_font(if full { 72 } else { 40 }, "DunYu.RestTimer");
+        let heading_font = make_font(if full { 22 } else { 20 }, "DunYu.RestTitle");
+        let timer_font = make_font(if full { 72 } else { 56 }, "DunYu.RestTimer");
         let top = if full {
             ((height - px(520)) / 2).max(px(16))
         } else {
@@ -867,6 +887,28 @@ impl Runtime {
             }
             theme::outline(GetDlgItem(h, 3));
         }
+        if !full && buttons.len() == 1 {
+            let sx = width as f32 / 1561.;
+            let sy = height as f32 / 1008.;
+            for (id, x, y, w, tall) in [
+                (12, 390., 60., 780., 100.),
+                (10, 450., 235., 660., 190.),
+                (13, 180., 455., 1200., 110.),
+                (3, 80., 726., 1402., 144.),
+                (4, 1406., 53., 102., 102.),
+            ] {
+                MoveWindow(
+                    GetDlgItem(h, id),
+                    (x * sx).round() as i32,
+                    (y * sy).round() as i32,
+                    (w * sx).round() as i32,
+                    (tall * sy).round() as i32,
+                    0,
+                );
+            }
+            SendMessageW(GetDlgItem(h, 3), WM_SETFONT, heading_font as usize, 0);
+            theme::outline(GetDlgItem(h, 3));
+        }
         update_animation(h);
         ShowWindow(h, SW_SHOWNOACTIVATE);
         self.windows.push(h);
@@ -882,6 +924,10 @@ impl Runtime {
         }
         IsDialogMessageW(root, msg) != 0
     }
+}
+
+fn layout_scale(width: i32, height: i32) -> f32 {
+    (width as f32 / 1672.).min(height as f32 / 941.)
 }
 
 #[cfg(test)]
@@ -948,6 +994,15 @@ mod tests {
             for (h, expected) in runtime.windows.iter().zip(&expected) {
                 let mut actual: RECT = std::mem::zeroed();
                 GetWindowRect(*h, &mut actual);
+                if std::env::var_os("DUNYU_UI_SCREENSHOTS").is_some() && *h == runtime.windows[0] {
+                    KillTimer(*h, ANIMATION_TIMER);
+                    SetPropW(
+                        *h,
+                        wide("DunYu.Stamp").as_ptr(),
+                        (GetTickCount64() + 1000) as HANDLE,
+                    );
+                    theme::capture(*h, "target/ui-preview/rest-fullscreen.bmp").unwrap();
+                }
                 assert_eq!(
                     (actual.left, actual.top, actual.right, actual.bottom),
                     (expected.left, expected.top, expected.right, expected.bottom)

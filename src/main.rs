@@ -1,4 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
+#[cfg(all(test, not(windows)))]
+#[path = "desktop/design.rs"]
+mod design;
 #[cfg(windows)]
 mod desktop;
 #[cfg(all(test, not(windows)))]

@@ -25,7 +25,7 @@ pub(super) const POND_RIPPLE: u32 = 0x8a9078;
 fn rgb(hex: u32) -> u32 {
     (hex & 255) << 16 | hex & 0xff00 | hex >> 16
 }
-unsafe fn high_contrast() -> bool {
+pub(super) unsafe fn high_contrast() -> bool {
     let mut hc: HIGHCONTRASTW = std::mem::zeroed();
     hc.cbSize = std::mem::size_of_val(&hc) as u32;
     SystemParametersInfoW(SPI_GETHIGHCONTRAST, hc.cbSize, &mut hc as *mut _ as _, 0);
@@ -165,13 +165,21 @@ impl Drop for Paper {
     }
 }
 thread_local! {
-    static PAPER: RefCell<HashMap<(i32,i32), Paper>> = RefCell::new(HashMap::new());
-    static CANVAS: std::cell::Cell<(i32,i32)> = const { std::cell::Cell::new((1024,650)) };
+    static PAPER: RefCell<HashMap<(i32,i32,i32), Paper>> = RefCell::new(HashMap::new());
+    static CANVAS: std::cell::Cell<(i32,i32,i32)> = const { std::cell::Cell::new((1024,650,0)) };
 }
 pub(super) unsafe fn canvas(h: HWND) {
     let mut r: RECT = std::mem::zeroed();
     GetClientRect(GetAncestor(h, GA_ROOT), &mut r);
-    CANVAS.set((r.right.max(1), r.bottom.max(1)));
+    let root = GetAncestor(h, GA_ROOT);
+    let mode = if !GetPropW(root, wide("DunYu.Full").as_ptr()).is_null() {
+        1
+    } else if !GetPropW(root, wide("DunYu.RestHost").as_ptr()).is_null() {
+        2
+    } else {
+        0
+    };
+    CANVAS.set((r.right.max(1), r.bottom.max(1), mode));
 }
 unsafe fn paper_brush(dc: HDC) -> HBRUSH {
     let size = CANVAS.get();
@@ -184,7 +192,7 @@ unsafe fn paper_brush(dc: HDC) -> HBRUSH {
             let memory = CreateCompatibleDC(dc);
             let bitmap = CreateCompatibleBitmap(dc, size.0, size.1);
             let old = SelectObject(memory, bitmap);
-            super::assets::background(memory, size.0, size.1);
+            super::assets::background(memory, size.0, size.1, size.2);
             let brush = CreatePatternBrush(bitmap);
             SelectObject(memory, old);
             DeleteObject(bitmap);
@@ -211,6 +219,13 @@ pub(super) unsafe fn paper(dc: HDC, r: RECT) {
     }
 }
 unsafe fn fill(dc: HDC, r: RECT, value: u32) {
+    if value == SURFACE && !high_contrast() {
+        let saved = CANVAS.get();
+        CANVAS.set((saved.0, saved.1, 3));
+        paper(dc, r);
+        CANVAS.set(saved);
+        return;
+    }
     if value == BACKGROUND {
         paper(dc, r);
         return;
@@ -220,6 +235,22 @@ unsafe fn fill(dc: HDC, r: RECT, value: u32) {
     DeleteObject(b);
 }
 unsafe fn rounded(dc: HDC, r: RECT, radius: i32, value: u32) {
+    if matches!(value, SURFACE | BACKGROUND) && !high_contrast() {
+        let saved = SaveDC(dc);
+        let region = CreateRoundRectRgn(
+            r.left,
+            r.top,
+            r.right + 1,
+            r.bottom + 1,
+            radius * 2,
+            radius * 2,
+        );
+        ExtSelectClipRgn(dc, region, RGN_AND);
+        fill(dc, r, value);
+        RestoreDC(dc, saved);
+        DeleteObject(region);
+        return;
+    }
     let mut g = null_mut();
     let mut path = null_mut();
     let mut brush = null_mut();
@@ -267,6 +298,16 @@ pub(super) fn button_text_rect(mut r: RECT, dpi: u32) -> RECT {
     r
 }
 
+/// A complete line even when the edit is empty (text extent then reports zero).
+pub(super) unsafe fn font_line_height(h: HWND) -> i32 {
+    let dc = GetDC(h);
+    let old = SelectObject(dc, SendMessageW(h, WM_GETFONT, 0, 0) as _);
+    let mut metrics: TEXTMETRICW = std::mem::zeroed();
+    GetTextMetricsW(dc, &mut metrics);
+    SelectObject(dc, old);
+    ReleaseDC(h, dc);
+    metrics.tmHeight
+}
 pub(super) unsafe fn label_size(h: HWND) -> SIZE {
     let dc = GetDC(h);
     let old = SelectObject(dc, SendMessageW(h, WM_GETFONT, 0, 0) as _);
@@ -538,25 +579,16 @@ unsafe fn paint(h: HWND, dc: HDC, s: &PaintState) {
             let mut label = r;
             label.bottom -= px(4);
             text(dc, h, &title(h), label, INK, DT_LEFT);
-            let mut g = null_mut();
-            if GdipCreateFromHDC(dc, &mut g) == 0 {
-                let c = color(MUTED);
-                let argb = 0xff000000 | (c & 255) << 16 | c & 0xff00 | c >> 16;
-                let mut pen = null_mut();
-                GdipCreatePen1(argb, 1., UnitPixel, &mut pen);
-                ink_curve(
-                    g,
-                    pen,
-                    [
-                        (0., (r.bottom - px(1)) as f32),
-                        (px(24) as f32, (r.bottom - px(4)) as f32),
-                        (px(60) as f32, (r.bottom - px(2)) as f32),
-                        (px(94).min(r.right) as f32, (r.bottom - px(3)) as f32),
-                    ],
-                );
-                GdipDeletePen(pen);
-                GdipDeleteGraphics(g);
-            }
+            super::assets::stroke(
+                dc,
+                RECT {
+                    left: 0,
+                    top: r.bottom - px(8),
+                    right: px(102).min(r.right),
+                    bottom: r.bottom,
+                },
+                false,
+            );
         }
         Role::Brand => {
             fill(dc, r, BACKGROUND);
@@ -692,7 +724,15 @@ unsafe fn paint(h: HWND, dc: HDC, s: &PaintState) {
             );
         }
         Role::Surface => {
-            fill(dc, r, BACKGROUND);
+            fill(
+                dc,
+                r,
+                if GetDlgCtrlID(h) == 119 {
+                    SURFACE
+                } else {
+                    BACKGROUND
+                },
+            );
             if GetDlgCtrlID(h) == 119
                 && SendMessageW(GetDlgItem(h, 100), LB_GETCOUNT, 0, 0) == 0
                 && !high_contrast()
@@ -748,6 +788,8 @@ unsafe fn paint(h: HWND, dc: HDC, s: &PaintState) {
                 SURFACE_PRESSED
             } else if s.hot {
                 SURFACE_HOVER
+            } else if s.outline {
+                backdrop
             } else {
                 SURFACE
             };
@@ -803,7 +845,15 @@ unsafe fn paint(h: HWND, dc: HDC, s: &PaintState) {
                         top: item.bottom - px(6),
                         bottom: item.bottom - px(3),
                     };
-                    rounded(dc, mark, px(2), ACCENT);
+                    super::assets::stroke(
+                        dc,
+                        RECT {
+                            top: mark.top - px(2),
+                            bottom: mark.bottom + px(2),
+                            ..mark
+                        },
+                        true,
+                    );
                 }
                 if selected == i as isize && GetFocus() == h {
                     rounded(dc, inset(item, px(2)), px(8), ACCENT_TEXT);
@@ -868,7 +918,7 @@ unsafe extern "system" fn procedure(
     }
     let role = (*ptr).role;
     match m {
-        WM_SETFONT if role == Role::Edit && w != 0 => {
+        WM_SETFONT if matches!(role, Role::Edit | Role::Tab) && w != 0 => {
             let mut lf: LOGFONTW = std::mem::zeroed();
             GetObjectW(
                 w as _,
@@ -876,7 +926,15 @@ unsafe extern "system" fn procedure(
                 &mut lf as *mut _ as _,
             );
             lf.lfFaceName = [0; 32];
-            let face = wide("Microsoft YaHei UI");
+            let face = wide(if role == Role::Tab {
+                "Source Han Serif SC"
+            } else {
+                "Microsoft YaHei UI"
+            });
+            if role == Role::Tab {
+                lf.lfHeight = lf.lfHeight * 21 / 27;
+                lf.lfWeight = 400;
+            }
             lf.lfFaceName[..face.len()].copy_from_slice(&face);
             let font = CreateFontIndirectW(&lf);
             if !font.is_null() {
@@ -1027,11 +1085,17 @@ unsafe extern "system" fn procedure(
             };
             SetBkColor(dc, color(backdrop));
             SetDCBrushColor(dc, color(backdrop));
-            if backdrop == BACKGROUND && !high_contrast() {
+            if !high_contrast() {
                 let mut origin = POINT { x: 0, y: 0 };
                 MapWindowPoints(child, GetAncestor(child, GA_ROOT), &mut origin, 1);
                 SetBrushOrgEx(dc, -origin.x, -origin.y, null_mut());
-                return paper_brush(dc) as isize;
+                let saved = CANVAS.get();
+                if backdrop == SURFACE {
+                    CANVAS.set((saved.0, saved.1, 3));
+                }
+                let brush = paper_brush(dc);
+                CANVAS.set(saved);
+                return brush as isize;
             }
             return GetStockObject(DC_BRUSH) as isize;
         }
@@ -1159,21 +1223,25 @@ unsafe extern "system" fn procedure(
 /// any other application's desktop content. Used only by Windows UI tests.
 #[cfg(test)]
 pub(super) unsafe fn capture(h: HWND, path: &str) -> std::io::Result<()> {
-    capture_impl(h, path, false)
+    capture_impl(h, path, false, true)
 }
 
 #[cfg(test)]
 pub(super) unsafe fn capture_screen(h: HWND, path: &str) -> std::io::Result<()> {
-    capture_impl(h, path, true)
+    capture_impl(h, path, true, false)
 }
 
 #[cfg(test)]
-unsafe fn capture_impl(h: HWND, path: &str, actual: bool) -> std::io::Result<()> {
+unsafe fn capture_impl(h: HWND, path: &str, actual: bool, client: bool) -> std::io::Result<()> {
     use std::io::Write;
     let mut r: RECT = std::mem::zeroed();
-    GetWindowRect(h, &mut r);
+    if client {
+        GetClientRect(h, &mut r);
+    } else {
+        GetWindowRect(h, &mut r);
+    }
     let (width, height) = (r.right - r.left, r.bottom - r.top);
-    let screen = GetWindowDC(h);
+    let screen = if client { GetDC(h) } else { GetWindowDC(h) };
     let dc = CreateCompatibleDC(screen);
     let bitmap = CreateCompatibleBitmap(screen, width, height);
     let old = SelectObject(dc, bitmap);
@@ -1181,7 +1249,7 @@ unsafe fn capture_impl(h: HWND, path: &str, actual: bool) -> std::io::Result<()>
         let captured = if actual {
             BitBlt(dc, 0, 0, width, height, screen, 0, 0, SRCCOPY)
         } else {
-            windows_sys::Win32::Storage::Xps::PrintWindow(h, dc, 0)
+            windows_sys::Win32::Storage::Xps::PrintWindow(h, dc, u32::from(client))
         };
         if captured == 0 {
             return Err(std::io::Error::last_os_error());

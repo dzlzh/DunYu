@@ -25,10 +25,16 @@ jobs:
             finally { $bitmap.Dispose() }
           }
       - if: runner.os == 'Windows'
+        run: python -m pip install Pillow==11.3.0
+      - if: runner.os == 'Windows'
+        run: python scripts/compare-ui.py
+      - if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
           name: DunYu-ui-preview
-          path: target/ui-preview/*.png
+          path: |
+            target/ui-preview/*.png
+            target/ui-preview/comparison.json
           if-no-files-found: error
       - run: cargo clippy --all-targets
       - if: runner.os == 'Windows'
