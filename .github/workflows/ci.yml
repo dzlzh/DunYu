@@ -38,6 +38,9 @@ jobs:
         run: |
           New-Item dist/DunYu -ItemType Directory -Force
           Copy-Item target/release/dunyu.exe,README.md,docs/USAGE.md dist/DunYu
+          New-Item dist/DunYu/docs,dist/DunYu/resources -ItemType Directory -Force
+          Copy-Item docs/USAGE.md dist/DunYu/docs
+          Copy-Item resources/fish.png,resources/dunyu.ico,resources/icon-prompt.txt dist/DunYu/resources
           Compress-Archive dist/DunYu dist/DunYu-windows-x64.zip
           (Get-FileHash dist/DunYu-windows-x64.zip -Algorithm SHA256).Hash + '  DunYu-windows-x64.zip' | Set-Content dist/SHA256SUMS.txt
       - if: runner.os == 'Windows'

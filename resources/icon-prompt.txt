@@ -1,0 +1,5 @@
+Generator: built-in imagegen
+Reference: user-provided dunyu.jpg (orange koi and green lily pads on a teal pond)
+Output: fish.png; packaged as dunyu.ico at 16, 20, 24, 32, 40, 48, 64, 128, 256 pixels
+
+Use case: logo-brand. Reference image: the provided dunyu.jpg is the visual identity and composition reference for the DunYu Windows app icon. Generate a polished square app icon faithfully based on it: an orange koi fish viewed from above curving diagonally toward the upper right through deep teal pond water, bright green lily pads entering at the upper right and lower left. Preserve this arrangement, natural palette, gentle rounded-square silhouette and calm painterly flat illustration style. Simplify small details for a legible 16px taskbar/tray icon; strong orange fish silhouette, clean broad leaves, very few subtle light flecks, no tiny texture. The rounded-square tile should occupy about 94 percent of the square canvas, centered; ONLY outside its rounded corners is transparent, the pond inside remains solid dark teal. No white surround, no mockup, no text, no letters, no extra borders or cast shadow. Produce one finished icon, not an icon sheet.

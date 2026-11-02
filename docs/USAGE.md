@@ -90,6 +90,6 @@ BMP 截图写入 `target/ui-preview`，CI 另将其转换为 PNG。检查四页�
 
 验证滚动残影时，将窗口缩小到最小尺寸，打开高级选项，连续上下滚动及拖动滚动条，再调整窗口大小；四个页面及规则列表都应保持文字和边框完整。分别在 100%、125%、150%、200% 缩放重复。须观察实际滚动后的画面，不能仅用强制重绘截图代替。
 
-图标素材由内置 imagegen 生成，源图为 `resources/fish.png`，多尺寸资源为 `resources/dunyu.ico`。生成提示：简洁蓝青色小鱼 Windows 软件图标，朝右，圆润轮廓，单眼，适合 16 像素识别，透明底，无文字、无徽章、无阴影。
+图标素材由内置 imagegen 生成，源图为 `resources/fish.png`，多尺寸资源为 `resources/dunyu.ico`。本版参考提供的锦鲤荷塘图片，保留深青色水面、橙色锦鲤、绿色荷叶与圆角构图，简化小尺寸细节，圆角外透明。完整提示词见 [icon-prompt.txt](../resources/icon-prompt.txt)。
 
 交互式 Windows 桌面可设置 `DUNYU_UI_SCROLL_CHECK=1`，运行 `cargo test editor_drafts_selection_layout_and_target_state -- --test-threads=1`，比较实际滚动画面与完整重绘画面。测试期间保持窗口可见、不受遮挡。差异图片保存在 `target/ui-preview/scroll-*.bmp`。
