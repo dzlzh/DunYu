@@ -94,6 +94,9 @@ pub(super) unsafe fn filter(msg: &MSG) -> bool {
             motion.snap(actual);
         }
         motion.add(delta, max, GetTickCount64(), rest_ui::motion_enabled());
+        if motion.current == actual && motion.target == actual {
+            return true;
+        }
         SetTimer(a.host, TIMER, 16, None);
         a.scroll_frame();
         true
@@ -110,11 +113,17 @@ impl App {
         for motion in &mut u.motions {
             active |= motion.tick(now);
         }
-        u.scroll = u.motions[0].current.round() as i32;
-        u.list_scroll = u.motions[1].current.round() as i32;
+        let next = (
+            u.motions[0].current.round() as i32,
+            u.motions[1].current.round() as i32,
+        );
+        let changed = next != (u.scroll, u.list_scroll);
+        (u.scroll, u.list_scroll) = next;
         if !active {
             KillTimer(self.host, TIMER);
         }
-        self.layout_ui();
+        if changed {
+            self.layout_scrolled_ui();
+        }
     }
 }

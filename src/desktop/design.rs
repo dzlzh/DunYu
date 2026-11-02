@@ -62,7 +62,7 @@ impl Canvas {
         let r = match id {
             9 => (366, 69, 1136, 77),
             9002 => (44, 68, 285, 78),
-            9001 => (42, 925, 1100, 50),
+            9001 => (42, 940, 1100, 50),
             113 | 330 | 506 => (1236, 912, 265, 68),
             7000 => (70, 200, 400, 67),
             114 => (577, 200, 880, 67),
@@ -183,6 +183,12 @@ impl Canvas {
         Some(area)
     }
 }
+// The scrolling host and the fixed footer share the main window's coordinates.
+pub(super) fn content_height(height: i32, page: usize, footer_top: i32) -> i32 {
+    (height - if page == 3 { 100 } else { 140 })
+        .min(footer_top - 4 - 76)
+        .max(1)
+}
 // Native control layout metrics, in device pixels.
 pub(super) fn navigation_item_width(client_width: i32, dpi: u32, count: i32) -> i32 {
     // Leave space for the native tab border and selected-item overhang.
@@ -195,9 +201,39 @@ pub(super) fn edit_inset(height: i32, line_height: i32, dpi: u32) -> (i32, i32) 
 pub(super) fn reference_layout(columns: i32, _page: usize, _advanced: bool) -> bool {
     columns == 2
 }
+// Visibility is application state; a reference rectangle must not override it.
+pub(super) fn state_allows(id: i32, has_rules: bool, advanced: bool) -> bool {
+    if id == 118 {
+        return !has_rules;
+    }
+    advanced || !matches!(id,202..=206|6202..=6206|209)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn empty_hint_tracks_rule_lifecycle() {
+        for has_rules in [false, true, true, false] {
+            assert_eq!(state_allows(118, has_rules, false), !has_rules);
+        }
+        assert!(!state_allows(202, false, false));
+        assert!(state_allows(202, true, true));
+    }
+    #[test]
+    fn scrolling_host_stays_above_save_button() {
+        for height in [420, 651, 800] {
+            let c = Canvas {
+                width: 1024,
+                height,
+                split: SPLIT,
+            };
+            let footer = c.control(113).unwrap().1;
+            assert!(
+                76 + content_height(height, 0, footer) <= footer - 4,
+                "scrolling content overlaps save button at height {height}"
+            );
+        }
+    }
     #[test]
     fn measured_cards_match_reference() {
         let c = Canvas {

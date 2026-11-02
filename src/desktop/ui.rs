@@ -1159,10 +1159,18 @@ impl App {
     }
 
     pub(super) unsafe fn layout_ui(&mut self) {
+        self.layout(false);
+    }
+    pub(super) unsafe fn layout_scrolled_ui(&mut self) {
+        self.layout(true);
+    }
+    unsafe fn layout(&mut self, scrolling: bool) {
         let Some(u) = self.ui.as_mut() else { return };
-        for (toggle, ids) in [(800, [801, 802, 815]), (817, [804, 803, 816])] {
-            for id in ids {
-                EnableWindow(item(u.window, id), i32::from(checked(u.window, toggle)));
+        if !scrolling {
+            for (toggle, ids) in [(800, [801, 802, 815]), (817, [804, 803, 816])] {
+                for id in ids {
+                    EnableWindow(item(u.window, id), i32::from(checked(u.window, toggle)));
+                }
             }
         }
         let scale = |v: i32| v * u.dpi as i32 / 96;
@@ -1194,7 +1202,6 @@ impl App {
 
         let width = client.right * 96 / u.dpi as i32;
         let height = client.bottom * 96 / u.dpi as i32;
-        let viewport = (height - if u.page == 3 { 100 } else { 140 }).max(1);
         let columns = if width >= 960 { 2 } else { 1 };
         let action_width = [808, 809, 812, 813, 814]
             .into_iter()
@@ -1235,6 +1242,33 @@ impl App {
             split: u.split_ratio,
         };
         let reference = super::design::reference_layout(columns, u.page, u.advanced);
+        // The content host must stop above every fixed footer control. The save
+        // button can grow with font metrics, so reserve its painted bounds too.
+        let mut footer_top = if reference {
+            scale(design.control(9001).unwrap().1)
+        } else {
+            scale(height - 38)
+        };
+        let save = match u.page {
+            0 => Some(113),
+            1 => Some(330),
+            5 => Some(506),
+            _ => None,
+        };
+        if let Some(id) = save {
+            let (_, y, _, h) = if reference {
+                design.control(id).unwrap()
+            } else {
+                (0, height - 54, 0, 44)
+            };
+            let outer_height = scale(h);
+            let button_height = outer_height
+                .max(theme::label_size(item(u.window, id)).cy + scale(12))
+                .max(scale(28));
+            footer_top = footer_top.min(scale(y) - (button_height - outer_height) / 2);
+        }
+        let viewport =
+            super::design::content_height(height, u.page, footer_top * 96 / u.dpi as i32);
         if reference {
             extent = if u.page == 0 && u.advanced {
                 900
@@ -1247,7 +1281,9 @@ impl App {
         u.scroll = u.scroll.clamp(0, (extent - viewport).max(0));
         // Suppress intermediate paints; child geometry and paint snapshots form one frame.
         SendMessageW(u.content, WM_SETREDRAW, 0, 0);
-        MoveWindow(u.content, 0, scale(76), client.right, scale(viewport), 0);
+        if !scrolling {
+            MoveWindow(u.content, 0, scale(76), client.right, scale(viewport), 0);
+        }
         let si = SCROLLINFO {
             cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
             fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
@@ -1369,6 +1405,10 @@ impl App {
         let mut placements = vec![];
         for (page, c) in &u.controls {
             let id = GetDlgCtrlID(*c);
+            let root = *page == 99 || matches!(id, 113 | 330 | 506);
+            if scrolling && root {
+                continue;
+            }
             let area: Option<(i32, i32, i32, i32)> = match id {
                 9 => Some((206, 14, width - 230, 52)),
                 9002 => Some((24, 10, 174, 56)),
@@ -1380,7 +1420,7 @@ impl App {
                 9004 => None,
                 119 => Some((36, 76, left_width - 40, (viewport - 160).max(64))),
                 120 => Some((24 + left_width, 12, 16, (viewport - 24).max(180))),
-                9001 => Some((24, height - 48, width - save_width - 64, 40)),
+                9001 => Some((24, height - 38, width - save_width - 64, 30)),
                 113 | 330 | 506 => Some((width - save_width - 24, height - 54, save_width, 44)),
                 7000 => Some((44, 32, left_width - 40, 28)),
                 100 => Some((
@@ -1577,22 +1617,23 @@ impl App {
                 7051 => None,
                 _ => None,
             };
-            let area = if !u.advanced && matches!(id,202..=206|6202..=6206|209) {
-                None
-            } else if reference {
-                design
-                    .control(id)
-                    .map(|mut r| {
-                        if id == 100 {
-                            r.1 = -(u.list_scroll % 64);
-                            r.3 += u.list_scroll % 64;
-                        }
-                        r
-                    })
-                    .or(area)
-            } else {
-                area
-            };
+            let area =
+                if !super::design::state_allows(id, !self.config.rules.is_empty(), u.advanced) {
+                    None
+                } else if reference {
+                    design
+                        .control(id)
+                        .map(|mut r| {
+                            if id == 100 {
+                                r.1 = -(u.list_scroll % 64);
+                                r.3 += u.list_scroll % 64;
+                            }
+                            r
+                        })
+                        .or(area)
+                } else {
+                    area
+                };
             let visible = (*page == 99 || *page == u.page) && area.is_some();
             if !visible {
                 ShowWindow(*c, SW_HIDE);
@@ -1645,24 +1686,31 @@ impl App {
                 theme::scene(*c, u.dpi, vec![], vec![]);
             }
         }
-        set_text(
-            u.window,
-            116,
-            if u.advanced {
-                "高级选项  −"
-            } else {
-                "高级选项  +"
-            },
-        );
-        SendMessageW(u.list, LB_SETITEMHEIGHT, 0, scale(64) as isize);
+        if !scrolling {
+            set_text(
+                u.window,
+                116,
+                if u.advanced {
+                    "高级选项  −"
+                } else {
+                    "高级选项  +"
+                },
+            );
+            SendMessageW(u.list, LB_SETITEMHEIGHT, 0, scale(64) as isize);
+        }
         theme::sync_list_scroll(u.list);
         theme::scene(u.content, u.dpi, cards, fields);
-        theme::scene(u.window, u.dpi, vec![], vec![]);
+        if !scrolling {
+            theme::scene(u.window, u.dpi, vec![], vec![]);
+        }
         for parent in [u.window, u.content, item(u.window, 119)] {
             let group: Vec<_> = placements
                 .iter()
                 .filter(|(h, _)| GetParent(*h) == parent)
                 .collect();
+            if group.is_empty() {
+                continue;
+            }
             let flags =
                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOCOPYBITS | SWP_SHOWWINDOW;
             let mut batch = BeginDeferWindowPos(group.len() as i32);
@@ -1696,27 +1744,34 @@ impl App {
             }
         }
         // Size items after positioning the host: its width differs from the main window.
-        let tab = item(u.window, 9);
-        let mut tab_rect: RECT = std::mem::zeroed();
-        GetClientRect(tab, &mut tab_rect);
-        let item_width =
-            super::design::navigation_item_width(tab_rect.right, u.dpi, PAGES.len() as i32);
-        SendMessageW(tab, TCM_SETMINTABWIDTH, 0, 0);
-        SendMessageW(
-            tab,
-            TCM_SETITEMSIZE,
-            0,
-            ((scale(51) as isize) << 16) | item_width as isize,
-        );
+        if !scrolling {
+            let tab = item(u.window, 9);
+            let mut tab_rect: RECT = std::mem::zeroed();
+            GetClientRect(tab, &mut tab_rect);
+            let item_width =
+                super::design::navigation_item_width(tab_rect.right, u.dpi, PAGES.len() as i32);
+            SendMessageW(tab, TCM_SETMINTABWIDTH, 0, 0);
+            SendMessageW(
+                tab,
+                TCM_SETITEMSIZE,
+                0,
+                ((scale(51) as isize) << 16) | item_width as isize,
+            );
+        }
         SendMessageW(u.list, LB_SETTOPINDEX, (u.list_scroll / 64) as usize, 0);
         theme::sync_list_scroll(u.list);
         SendMessageW(u.content, WM_SETREDRAW, 1, 0);
         RedrawWindow(
-            u.window,
+            if scrolling { u.content } else { u.window },
             null(),
             null_mut(),
-            RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME,
+            RDW_INVALIDATE | RDW_ALLCHILDREN | if scrolling { 0 } else { RDW_ERASE | RDW_FRAME },
         );
+        if scrolling {
+            for id in [9003, 9004] {
+                InvalidateRect(item(u.window, id), null(), 0);
+            }
+        }
     }
 
     pub(super) unsafe fn status(&self, message: &str) {
@@ -2421,6 +2476,102 @@ mod capture_tests {
             );
             assert_eq!(text_at(h, 200), "测试程序");
             assert_eq!(app.rule_snapshot(), app.ui.as_ref().unwrap().baseline);
+            // Adding the first rule must suppress the empty caption in both layouts;
+            // clearing the list must restore it, and reloading must suppress it again.
+            let saved_rules = app.config.rules.clone();
+            app.scale_ui(96, None);
+            for width in [800, 1100] {
+                SetWindowPos(
+                    h,
+                    null_mut(),
+                    0,
+                    0,
+                    width,
+                    700,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                app.layout_ui();
+                assert!(SendMessageW(app.ui.as_ref().unwrap().list, LB_GETCOUNT, 0, 0) > 0);
+                assert_eq!(IsWindowVisible(item(h, 118)), 0);
+                app.config.rules.clear();
+                app.refresh_list();
+                app.layout_ui();
+                assert_ne!(IsWindowVisible(item(h, 118)), 0);
+                app.config.rules = saved_rules.clone();
+                app.refresh_list();
+                app.layout_ui();
+                assert_eq!(IsWindowVisible(item(h, 118)), 0);
+            }
+            app.scale_ui(96, None);
+            // Scrolling must not dirty the stationary save button or status line.
+            // Exercise both an idle frame and an actual change of scroll position.
+            for (page, dpi) in [0, 5]
+                .into_iter()
+                .flat_map(|page| [96, 120, 144, 192].map(|dpi| (page, dpi)))
+            {
+                app.scale_ui(dpi, None);
+                app.page(page);
+                if page == 0 {
+                    app.ui.as_mut().unwrap().advanced = true;
+                    app.layout_ui();
+                }
+                let save = if page == 0 { 113 } else { 506 };
+                for position in [0., 24., 24., 0.] {
+                    RedrawWindow(
+                        h,
+                        null(),
+                        null_mut(),
+                        RDW_VALIDATE | RDW_NOERASE | RDW_ALLCHILDREN | RDW_NOFRAME,
+                    );
+                    app.ui.as_mut().unwrap().motions[0].snap(position);
+                    app.scroll_frame();
+                    let mut content_bounds: RECT = std::mem::zeroed();
+                    let mut save_bounds: RECT = std::mem::zeroed();
+                    GetWindowRect(app.ui.as_ref().unwrap().content, &mut content_bounds);
+                    GetWindowRect(item(h, save), &mut save_bounds);
+                    assert!(
+                        content_bounds.bottom <= save_bounds.top,
+                        "editor overlaps save button on page {page}, DPI {dpi}, position {position}"
+                    );
+                    let mut status_bounds: RECT = std::mem::zeroed();
+                    GetWindowRect(item(h, 9001), &mut status_bounds);
+                    assert!(
+                        content_bounds.bottom <= status_bounds.top,
+                        "editor overlaps status on page {page}, DPI {dpi}"
+                    );
+                    for child in [item(h, save), item(h, 9001)] {
+                        assert_eq!(
+                            GetUpdateRect(child, null_mut(), 0),
+                            0,
+                            "scroll invalidated footer on page {page}"
+                        );
+                    }
+                    // Root redraws would paint over the footer before its child paint.
+                    let mut footer = RECT {
+                        left: 0,
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                    };
+                    GetClientRect(h, &mut footer);
+                    footer.top = footer.bottom - 60;
+                    let update = CreateRectRgn(0, 0, 0, 0);
+                    GetUpdateRgn(h, update, 0);
+                    let band = CreateRectRgn(footer.left, footer.top, footer.right, footer.bottom);
+                    CombineRgn(update, update, band, RGN_AND);
+                    let mut dirty: RECT = std::mem::zeroed();
+                    assert_eq!(
+                        GetRgnBox(update, &mut dirty),
+                        NULLREGION,
+                        "scroll dirtied root footer"
+                    );
+                    DeleteObject(update);
+                    DeleteObject(band);
+                }
+            }
+            app.page(0);
+            app.ui.as_mut().unwrap().advanced = false;
+            app.layout_ui();
             set_text(h, 200, "未保存草稿");
             app.pending.push(Pending {
                 rule: 0,

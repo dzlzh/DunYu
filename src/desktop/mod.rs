@@ -835,12 +835,16 @@ unsafe extern "system" fn procedure(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                             SB_THUMBTRACK | SB_THUMBPOSITION => si.nTrackPos,
                             _ => u.list_scroll,
                         };
+                        let next = next.clamp(0, (si.nMax - si.nPage as i32 + 1).max(0));
+                        if next == u.list_scroll {
+                            return Some(0);
+                        }
                         let _ = u;
                         if let Some(u) = a.ui.as_mut() {
                             u.list_scroll = next;
                             u.motions[1].snap(next as f64);
                         }
-                        a.layout_ui();
+                        a.layout_scrolled_ui();
                     }
                     Some(0)
                 }
@@ -864,10 +868,19 @@ unsafe extern "system" fn procedure(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                                 _ => 0,
                             }
                         };
-                        u.scroll += delta;
+                        let mut si: SCROLLINFO = std::mem::zeroed();
+                        si.cbSize = std::mem::size_of_val(&si) as u32;
+                        si.fMask = SIF_ALL;
+                        GetScrollInfo(GetDlgItem(u.window, 9003), SB_CTL, &mut si);
+                        let next =
+                            (u.scroll + delta).clamp(0, (si.nMax - si.nPage as i32 + 1).max(0));
+                        if next == u.scroll {
+                            return Some(0);
+                        }
+                        u.scroll = next;
                         u.motions[0].snap(u.scroll as f64);
                     }
-                    a.layout_ui();
+                    a.layout_scrolled_ui();
                     Some(0)
                 }
                 WM_DPICHANGED => {

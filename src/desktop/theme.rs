@@ -766,10 +766,17 @@ unsafe fn paint(h: HWND, dc: HDC, s: &PaintState) {
             }
         }
         Role::Button => {
-            let default_primary = matches!(GetDlgCtrlID(h), 113 | 330 | 506 | 808 | 401);
+            let id = GetDlgCtrlID(h);
+            let default_primary = matches!(id, 113 | 330 | 506 | 808 | 401);
+            // Only the fixed footer buttons sit on the window background.
+            // Card actions need the card texture around their rounded corners.
             let (primary, backdrop) = s.button_style.unwrap_or((
                 default_primary,
-                if default_primary { BACKGROUND } else { SURFACE },
+                if matches!(id, 113 | 330 | 506) {
+                    BACKGROUND
+                } else {
+                    SURFACE
+                },
             ));
             fill(dc, r, backdrop);
             let down = SendMessageW(h, BM_GETSTATE, 0, 0) as u32 & BST_PUSHED != 0;
