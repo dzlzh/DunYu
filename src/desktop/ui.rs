@@ -24,7 +24,7 @@ pub(super) unsafe extern "system" fn content_proc(
     }
 }
 
-fn is_hotkey_field(id: i32) -> bool {
+pub(super) fn is_hotkey_field(id: i32) -> bool {
     matches!(id, 207 | 300..=307 | 500..=503)
 }
 
@@ -1390,6 +1390,7 @@ impl App {
     }
 
     pub(super) unsafe fn page(&mut self, page: usize) {
+        super::recorder::stop();
         if let Some(u) = &mut self.ui {
             u.page = page;
             u.scroll = 0;

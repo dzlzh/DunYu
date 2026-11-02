@@ -470,12 +470,27 @@ unsafe extern "system" fn procedure(
 ) -> LRESULT {
     let ptr = data as *mut PaintState;
     if m == WM_NCDESTROY {
+        super::recorder::stop_for(h);
         RemoveWindowSubclass(h, Some(procedure), SUBCLASS);
         drop(Box::from_raw(ptr));
         return DefSubclassProc(h, m, w, l);
     }
     let role = (*ptr).role;
     match m {
+        WM_ACTIVATE if role == Role::Surface && GetAncestor(h, GA_ROOT) == h => {
+            if w & 0xffff == WA_INACTIVE as usize {
+                super::recorder::stop();
+            } else {
+                super::recorder::start(GetFocus());
+            }
+        }
+        WM_SHOWWINDOW if w == 0 && role == Role::Surface => {
+            super::recorder::stop();
+        }
+        super::recorder::RECORDED => {
+            super::recorder::deliver(h, w, l);
+            return 0;
+        }
         WM_SETTINGCHANGE | WM_THEMECHANGED => {
             InvalidateRect(h, null(), 1);
         }
@@ -497,6 +512,14 @@ unsafe extern "system" fn procedure(
             InvalidateRect(h, null(), 0);
         }
         WM_SETFOCUS | WM_KILLFOCUS | WM_ENABLE => {
+            if role == Role::Edit {
+                if m == WM_SETFOCUS {
+                    super::recorder::start(h);
+                }
+                if m == WM_KILLFOCUS {
+                    super::recorder::stop();
+                }
+            }
             InvalidateRect(h, null(), 0);
             if role == Role::Edit {
                 InvalidateRect(GetParent(h), null(), 0);

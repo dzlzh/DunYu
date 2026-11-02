@@ -1,4 +1,5 @@
 #![allow(unsafe_op_in_unsafe_fn)]
+mod recorder;
 mod theme;
 mod ui;
 use dunyu::*;
@@ -521,8 +522,8 @@ impl App {
                 let id = self.next_id;
                 if id > 0xbfff || RegisterHotKey(self.host, id, modifiers, key.key) == 0 {
                     return Err(format!(
-                        "快捷键注册失败：修饰键 {}，键码 {}",
-                        key.modifiers, key.key
+                        "快捷键 {} 注册失败：可能被系统或其他程序占用",
+                        ui::hotkey_text(key)
                     ));
                 }
                 self.keys.insert(id, (key.clone(), *cmd));
