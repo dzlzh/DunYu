@@ -428,28 +428,10 @@ impl App {
             0,
         );
         control(
-            &mut u,
-            0,
-            "BUTTON",
-            "新建规则",
-            110,
-            20,
-            378,
-            95,
-            32,
-            WS_TABSTOP,
+            &mut u, 0, "BUTTON", "新建", 110, 20, 378, 95, 32, WS_TABSTOP,
         );
         control(
-            &mut u,
-            0,
-            "BUTTON",
-            "删除规则",
-            111,
-            125,
-            378,
-            95,
-            32,
-            WS_TABSTOP,
+            &mut u, 0, "BUTTON", "删除", 111, 125, 378, 95, 32, WS_TABSTOP,
         );
         for (id, label, y) in [
             (200, "名称", 52),
@@ -515,7 +497,7 @@ impl App {
             &mut u,
             0,
             "BUTTON",
-            "捕获窗口信息（3秒）",
+            "捕获窗口（3秒）",
             112,
             440,
             228,
@@ -648,7 +630,7 @@ impl App {
             &mut u,
             1,
             "BUTTON",
-            "保存槽位快捷键",
+            "保存快捷键",
             330,
             700,
             560,
@@ -673,7 +655,7 @@ impl App {
             &mut u,
             2,
             "BUTTON",
-            "捕获窗口（3秒后）",
+            "捕获窗口（3秒）",
             401,
             20,
             108,
@@ -746,7 +728,7 @@ impl App {
             &mut u,
             2,
             "BUTTON",
-            "当前窗口恢复 100%",
+            "恢复 100%",
             403,
             20,
             340,
@@ -758,7 +740,7 @@ impl App {
             &mut u,
             2,
             "BUTTON",
-            "恢复全部窗口与透明度",
+            "恢复全部窗口",
             404,
             20,
             410,
@@ -1012,6 +994,24 @@ impl App {
         };
         let mut client: RECT = std::mem::zeroed();
         GetClientRect(u.window, &mut client);
+        let button_width = |id, minimum: i32| {
+            let measured = theme::label_size(item(u.window, id));
+            minimum.max((measured.cx * 96 + u.dpi as i32 - 1) / u.dpi as i32 + 24)
+        };
+        let save_width = [113, 330, 506]
+            .into_iter()
+            .map(|id| button_width(id, 156))
+            .max()
+            .unwrap();
+        let browse_width = button_width(115, 76);
+        let slot_extra = (320..=323)
+            .map(|id| {
+                let height = theme::label_size(item(u.window, id)).cy;
+                ((height * 96 + u.dpi as i32 - 1) / u.dpi as i32 + 12 - 40).max(0)
+            })
+            .max()
+            .unwrap_or(0);
+
         let width = client.right * 96 / u.dpi as i32;
         let height = client.bottom * 96 / u.dpi as i32;
         let viewport = (height - 140).max(1);
@@ -1024,7 +1024,7 @@ impl App {
                     440
                 }
             }
-            1 => 64 + (4 / columns) * 192,
+            1 => 64 + (4 / columns) * (192 + slot_extra),
             2 => 520,
             _ => 580,
         };
@@ -1059,7 +1059,7 @@ impl App {
         let slot = |i: i32| {
             (
                 24 + (i % columns) * (card_width + 16),
-                64 + (i / columns) * 192,
+                64 + (i / columns) * (192 + slot_extra),
             )
         };
         let mut cards = vec![];
@@ -1076,7 +1076,7 @@ impl App {
             1 => {
                 for i in 0..4 {
                     let (x, y) = slot(i);
-                    cards.push(rect(x, y - u.scroll, card_width, 176));
+                    cards.push(rect(x, y - u.scroll, card_width, 176 + slot_extra));
                 }
             }
             2 => {
@@ -1099,8 +1099,8 @@ impl App {
                 9002 => Some((24, 22, 112, 32)),
                 9003 => Some((width - 16, 76, 14, viewport)),
                 9004 => Some((220, 76, 12, 268)),
-                9001 => Some((24, height - 48, width - 220, 40)),
-                113 | 330 | 506 => Some((width - 180, height - 50, 156, 38)),
+                9001 => Some((24, height - 48, width - save_width - 64, 40)),
+                113 | 330 | 506 => Some((width - save_width - 24, height - 54, save_width, 44)),
                 7000 => Some((44, 32, 180, 28)),
                 100 => Some((36, 76, 180, 268)),
                 110 => Some((40, 360, 100, 36)),
@@ -1117,7 +1117,7 @@ impl App {
                     };
                     let y = 132 + row * 78;
                     let w = if field == 201 {
-                        fw - 84
+                        fw - browse_width - 8
                     } else if field == 207 {
                         fw - 130
                     } else {
@@ -1130,7 +1130,7 @@ impl App {
                         if id >= 6000 { 22 } else { 36 },
                     ))
                 }
-                115 => Some((right - 96, 236, 76, 36)),
+                115 => Some((right - 20 - browse_width, 236, browse_width, 40)),
                 208 => Some((right - 140, 314, 120, 30)),
                 116 => Some((form, 372, fw, 36)),
                 202..=206 | 6202..=6206 if u.advanced => {
@@ -1148,15 +1148,21 @@ impl App {
                 7001 => Some((24, 12, bw - 48, 32)),
                 350..=353 => {
                     let (x, y) = slot(id - 350);
-                    Some((x + 20, y + 16, card_width - 156, 28))
+                    Some((
+                        x + 20,
+                        y + 16,
+                        card_width - button_width(320 + id - 350, 112) - 44,
+                        28,
+                    ))
                 }
                 340..=343 => {
                     let (x, y) = slot(id - 340);
-                    Some((x + 20, y + 54, card_width - 40, 24))
+                    Some((x + 20, y + 54 + slot_extra, card_width - 40, 24))
                 }
                 320..=323 => {
                     let (x, y) = slot(id - 320);
-                    Some((x + card_width - 132, y + 14, 112, 36))
+                    let w = button_width(id, 112);
+                    Some((x + card_width - w - 20, y + 14, w, 40))
                 }
                 300..=307 | 360..=367 => {
                     let base = if id >= 360 { 360 } else { 300 };
@@ -1165,7 +1171,7 @@ impl App {
                     let field_width = (card_width - 56) / 2;
                     Some((
                         x + 20 + second * (field_width + 16),
-                        y + 92 + if base == 300 { 24 } else { 0 },
+                        y + 92 + slot_extra + if base == 300 { 24 } else { 0 },
                         field_width,
                         if base == 300 { 36 } else { 22 },
                     ))
@@ -1205,6 +1211,19 @@ impl App {
             if let Some((x, y, w, h)) = area {
                 let root = *page == 99 || matches!(id, 113 | 330 | 506);
                 let mut r = rect(x, if root { y } else { y - u.scroll }, w, h);
+                if class(*c).eq_ignore_ascii_case("button")
+                    && GetWindowLongPtrW(*c, GWL_STYLE) as u32 & 15 != BS_AUTOCHECKBOX as u32
+                {
+                    let measured = theme::label_size(*c);
+                    r.right = r.right.max(r.left + measured.cx + scale(24));
+                    // Add padding around the font's full line height, including descenders.
+                    let desired_height = (r.bottom - r.top)
+                        .max(measured.cy + scale(12))
+                        .max(scale(40));
+                    let extra = desired_height - (r.bottom - r.top);
+                    r.top -= extra / 2;
+                    r.bottom = r.top + desired_height;
+                }
                 if class(*c) == "Edit" || class(*c) == "EDIT" {
                     if visible {
                         fields.push((*c, r));
@@ -1962,6 +1981,65 @@ mod capture_tests {
                 app.scale_ui(dpi, None);
             }
             assert_eq!(rect(item(h, 201)), before);
+            // Exercise the actual GDI font metrics and paint rectangle at larger
+            // text sizes: the previous 12px top/bottom inset clipped even 14px text.
+            for dpi in [96, 120, 144, 192] {
+                for logical_height in [14, 20, 28] {
+                    app.scale_ui(dpi, None);
+                    let mut font: LOGFONTW = std::mem::zeroed();
+                    font.lfHeight = -(logical_height * dpi as i32 / 96);
+                    font.lfCharSet = DEFAULT_CHARSET;
+                    let face = wide("Microsoft YaHei UI");
+                    font.lfFaceName[..face.len()].copy_from_slice(&face);
+                    let large_font = CreateFontIndirectW(&font);
+                    assert!(!large_font.is_null());
+                    for (_, child) in &app.ui.as_ref().unwrap().controls {
+                        if class(*child).eq_ignore_ascii_case("button")
+                            && GetWindowLongPtrW(*child, GWL_STYLE) as u32 & 15
+                                != BS_AUTOCHECKBOX as u32
+                        {
+                            SendMessageW(*child, WM_SETFONT, large_font as usize, 0);
+                        }
+                    }
+                    for page in 0..4 {
+                        app.page(page);
+                        for (_, child) in &app.ui.as_ref().unwrap().controls {
+                            if IsWindowVisible(*child) == 0
+                                || !class(*child).eq_ignore_ascii_case("button")
+                                || GetWindowLongPtrW(*child, GWL_STYLE) as u32 & 15
+                                    == BS_AUTOCHECKBOX as u32
+                            {
+                                continue;
+                            }
+                            let mut bounds: RECT = std::mem::zeroed();
+                            GetClientRect(*child, &mut bounds);
+                            let label = theme::button_text_rect(bounds, dpi);
+                            let size = theme::label_size(*child);
+                            assert!(
+                                label.bottom - label.top >= size.cy,
+                                "clipped button {} at {dpi} DPI, font {logical_height}",
+                                title(*child)
+                            );
+                            assert!(
+                                label.right - label.left >= size.cx,
+                                "truncated button {} at {dpi} DPI, font {logical_height}",
+                                title(*child)
+                            );
+                        }
+                        if dpi == 144
+                            && logical_height == 28
+                            && std::env::var_os("DUNYU_UI_SCREENSHOTS").is_some()
+                        {
+                            theme::capture(h, &format!("target/ui-preview/large-text-{page}.bmp"))
+                                .unwrap();
+                        }
+                    }
+                    app.scale_ui(dpi, None);
+                    DeleteObject(large_font);
+                }
+            }
+            app.scale_ui(96, None);
+            app.page(2);
             let n = app.track(external).unwrap();
             app.ui.as_mut().unwrap().target = Some(app.records[n].token.clone());
             app.opacity(external, Some(128), 0).unwrap();

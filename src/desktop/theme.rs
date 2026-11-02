@@ -158,6 +158,29 @@ fn inset(mut r: RECT, n: i32) -> RECT {
     r.bottom -= n;
     r
 }
+// Horizontal breathing room must not consume the text's vertical line box.
+pub(super) fn button_text_rect(mut r: RECT, dpi: u32) -> RECT {
+    let px = |v: i32| v * dpi as i32 / 96;
+    r.left += px(12);
+    r.right -= px(12);
+    r.top += px(4);
+    r.bottom -= px(4);
+    r
+}
+
+pub(super) unsafe fn label_size(h: HWND) -> SIZE {
+    let dc = GetDC(h);
+    let old = SelectObject(dc, SendMessageW(h, WM_GETFONT, 0, 0) as _);
+    let label = wide(&title(h));
+    let mut size: SIZE = std::mem::zeroed();
+    GetTextExtentPoint32W(dc, label.as_ptr(), (label.len() - 1) as i32, &mut size);
+    if !old.is_null() {
+        SelectObject(dc, old);
+    }
+    ReleaseDC(h, dc);
+    size
+}
+
 unsafe fn text(dc: HDC, h: HWND, s: &str, mut r: RECT, value: u32, flags: u32) {
     let old = SelectObject(dc, SendMessageW(h, WM_GETFONT, 0, 0) as _);
     SetBkMode(dc, TRANSPARENT as i32);
@@ -168,7 +191,7 @@ unsafe fn text(dc: HDC, h: HWND, s: &str, mut r: RECT, value: u32, flags: u32) {
         text.as_ptr(),
         -1,
         &mut r,
-        flags | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+        flags | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
     );
     if !old.is_null() {
         SelectObject(dc, old);
@@ -402,7 +425,7 @@ unsafe fn paint(h: HWND, dc: HDC, s: &PaintState) {
                 dc,
                 h,
                 &title(h),
-                inset(r, px(12)),
+                button_text_rect(r, s.dpi),
                 if !enabled {
                     MUTED
                 } else if primary {
