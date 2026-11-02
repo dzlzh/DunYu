@@ -909,6 +909,9 @@ impl Runtime {
             SendMessageW(GetDlgItem(h, 3), WM_SETFONT, heading_font as usize, 0);
             theme::outline(GetDlgItem(h, 3));
         }
+        if !full {
+            fit_card_counter(h, phase);
+        }
         update_animation(h);
         ShowWindow(h, SW_SHOWNOACTIVATE);
         self.windows.push(h);
@@ -924,6 +927,85 @@ impl Runtime {
         }
         IsDialogMessageW(root, msg) != 0
     }
+}
+
+// Fit the complete GDI font line, including the CJK font's leading and descent.
+// The timer lane is bounded by the title and body so a larger line cannot overlap them.
+unsafe fn fit_card_counter(h: HWND, phase: Phase) {
+    let label = GetDlgItem(h, 10);
+    let dpi = GetPropW(h, wide("DunYu.LayoutDpi").as_ptr()) as usize as i32;
+    let gap = (6 * dpi / 96).max(2);
+    let bounds = |id| {
+        let mut r: RECT = std::mem::zeroed();
+        GetWindowRect(GetDlgItem(h, id), &mut r);
+        MapWindowPoints(null_mut(), h, &mut r as *mut _ as *mut POINT, 2);
+        r
+    };
+    let title = bounds(12);
+    let body = bounds(13);
+    let timer = bounds(10);
+    let top = title.bottom + gap;
+    let bottom = (body.top - gap).max(top + 1);
+    let available_height = (bottom - top - 2).max(1);
+    let available_width = (timer.right - timer.left - gap * 2).max(1);
+    let sample = wide(match phase {
+        Phase::Awaiting => "歇一会儿",
+        Phase::Warning => "30 秒",
+        _ => "000:00",
+    });
+    let key = wide("DunYu.RestTimer");
+    let original = GetPropW(h, key.as_ptr()) as HFONT;
+    let mut font = original;
+    let mut lf: LOGFONTW = std::mem::zeroed();
+    GetObjectW(
+        font,
+        std::mem::size_of_val(&lf) as i32,
+        &mut lf as *mut _ as _,
+    );
+    let dc = GetDC(label);
+    let line = loop {
+        let old = SelectObject(dc, font);
+        let mut metrics: TEXTMETRICW = std::mem::zeroed();
+        GetTextMetricsW(dc, &mut metrics);
+        let mut text: SIZE = std::mem::zeroed();
+        GetTextExtentPoint32W(dc, sample.as_ptr(), (sample.len() - 1) as i32, &mut text);
+        SelectObject(dc, old);
+        if (metrics.tmHeight <= available_height && text.cx <= available_width)
+            || lf.lfHeight.abs() <= 1
+        {
+            break metrics.tmHeight;
+        }
+        lf.lfHeight = -(lf.lfHeight.abs() - 1);
+        let next = CreateFontIndirectW(&lf);
+        if next.is_null() {
+            break metrics.tmHeight;
+        }
+        if font != original {
+            DeleteObject(font);
+        }
+        font = next;
+    };
+    ReleaseDC(label, dc);
+    if font != original {
+        SendMessageW(label, WM_SETFONT, font as usize, 0);
+        SetPropW(h, key.as_ptr(), font);
+        DeleteObject(original);
+    }
+    let tall = (line + 2).min(bottom - top);
+    SetWindowLongPtrW(
+        label,
+        GWL_STYLE,
+        GetWindowLongPtrW(label, GWL_STYLE)
+            | windows_sys::Win32::System::SystemServices::SS_CENTERIMAGE as isize,
+    );
+    MoveWindow(
+        label,
+        timer.left,
+        top + (bottom - top - tall) / 2,
+        timer.right - timer.left,
+        tall,
+        0,
+    );
 }
 
 fn layout_scale(width: i32, height: i32) -> f32 {
@@ -966,10 +1048,56 @@ mod tests {
             ClientToScreen(card, &mut origin);
             assert!(title.left >= origin.x + 64 * dpi / 96);
             assert!(title.right <= close.left);
+            let counter = GetDlgItem(card, 10);
+            let mut counter_bounds: RECT = std::mem::zeroed();
+            GetClientRect(counter, &mut counter_bounds);
+            assert!(
+                counter_bounds.bottom >= theme::font_line_height(counter),
+                "card countdown line clipped"
+            );
+            assert!(
+                counter_bounds.right >= theme::label_size(counter).cx,
+                "card countdown width clipped"
+            );
+            let mut counter_screen: RECT = std::mem::zeroed();
+            let mut body_screen: RECT = std::mem::zeroed();
+            GetWindowRect(counter, &mut counter_screen);
+            GetWindowRect(GetDlgItem(card, 13), &mut body_screen);
+            assert!(counter_screen.top >= title.bottom && counter_screen.bottom <= body_screen.top);
 
             if std::env::var_os("DUNYU_UI_SCREENSHOTS").is_some() {
                 std::fs::create_dir_all("target/ui-preview").unwrap();
                 theme::capture(runtime.windows[0], "target/ui-preview/rest-preview.bmp").unwrap();
+            }
+            for phase in [Phase::Warning, Phase::Awaiting] {
+                let mut sample = Runtime::default();
+                sample.create(
+                    RECT {
+                        left: 0,
+                        top: 0,
+                        right: 1920,
+                        bottom: 1080,
+                    },
+                    false,
+                    phase,
+                    host,
+                );
+                let popup = sample.windows[0];
+                let label = GetDlgItem(popup, 10);
+                SetWindowTextW(
+                    label,
+                    wide(if phase == Phase::Warning {
+                        "30 秒"
+                    } else {
+                        "歇一会儿"
+                    })
+                    .as_ptr(),
+                );
+                let mut bounds: RECT = std::mem::zeroed();
+                GetClientRect(label, &mut bounds);
+                assert!(bounds.bottom >= theme::font_line_height(label));
+                assert!(bounds.right >= theme::label_size(label).cx);
+                sample.close();
             }
             let old = runtime.generation;
             runtime.close();

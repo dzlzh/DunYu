@@ -5,8 +5,8 @@ use windows_sys::Win32::UI::Controls::Dialogs::*;
 use windows_sys::Win32::UI::Controls::*;
 
 pub(super) unsafe fn item(window: HWND, id: i32) -> HWND {
-    if id == 100 {
-        return GetDlgItem(GetDlgItem(GetDlgItem(window, 9000), 119), 100);
+    if matches!(id, 100 | 118) {
+        return GetDlgItem(GetDlgItem(GetDlgItem(window, 9000), 119), id);
     }
     let direct = GetDlgItem(window, id);
     if !direct.is_null() {
@@ -475,7 +475,20 @@ impl App {
             100,
             SBS_VERT as u32,
         );
-        control(&mut u, 0, "STATIC", "还没有规则", 118, 0, 0, 180, 28, 0);
+        let empty = control(
+            &mut u,
+            0,
+            "STATIC",
+            "还没有规则",
+            118,
+            0,
+            0,
+            180,
+            28,
+            windows_sys::Win32::System::SystemServices::SS_CENTER
+                | windows_sys::Win32::System::SystemServices::SS_CENTERIMAGE,
+        );
+        SetParent(empty, clip);
         control(&mut u, 0, "STATIC", "程序召唤", 0, 20, 12, 200, 28, 0);
         control(
             &mut u,
@@ -1383,11 +1396,12 @@ impl App {
                 })
                 .collect();
         }
-        let list_height = if reference {
-            design.control(119).unwrap().3
+        let list_area = if reference {
+            design.control(119).unwrap()
         } else {
-            (viewport - 160).max(64)
+            (36, 76, left_width - 40, (viewport - 160).max(64))
         };
+        let list_height = list_area.3;
         let count = SendMessageW(u.list, LB_GETCOUNT, 0, 0).max(0) as i32;
         u.list_scroll = u.list_scroll.clamp(0, (count * 64 - list_height).max(0));
         let list_info = SCROLLINFO {
@@ -1653,6 +1667,20 @@ impl App {
                     w,
                     h,
                 );
+                if id == 118 {
+                    let (_, (x, y, w, h)) = super::design::empty_state(
+                        scale(list_area.2),
+                        scale(list_area.3),
+                        theme::font_line_height(*c),
+                        u.dpi,
+                    );
+                    r = RECT {
+                        left: x,
+                        top: y,
+                        right: x + w,
+                        bottom: y + h,
+                    };
+                }
                 if class(*c).eq_ignore_ascii_case("button")
                     && GetWindowLongPtrW(*c, GWL_STYLE) as u32 & 15 != BS_AUTOCHECKBOX as u32
                 {
@@ -2496,7 +2524,36 @@ mod capture_tests {
                 app.config.rules.clear();
                 app.refresh_list();
                 app.layout_ui();
-                assert_ne!(IsWindowVisible(item(h, 118)), 0);
+                let caption = item(h, 118);
+                let clip = item(h, 119);
+                assert_ne!(IsWindowVisible(caption), 0);
+                assert_eq!(IsWindowVisible(app.ui.as_ref().unwrap().list), 0);
+                assert_eq!(GetParent(caption), clip);
+                assert_ne!(
+                    GetWindowLongPtrW(caption, GWL_STYLE) as u32
+                        & windows_sys::Win32::System::SystemServices::SS_CENTER,
+                    0
+                );
+                let mut bounds: RECT = std::mem::zeroed();
+                GetClientRect(clip, &mut bounds);
+                let mut actual: RECT = std::mem::zeroed();
+                GetWindowRect(caption, &mut actual);
+                MapWindowPoints(null_mut(), clip, &mut actual as *mut _ as *mut POINT, 2);
+                let (_, expected) = super::super::design::empty_state(
+                    bounds.right,
+                    bounds.bottom,
+                    theme::font_line_height(caption),
+                    96,
+                );
+                assert_eq!(
+                    (
+                        actual.left,
+                        actual.top,
+                        actual.right - actual.left,
+                        actual.bottom - actual.top
+                    ),
+                    expected
+                );
                 app.config.rules = saved_rules.clone();
                 app.refresh_list();
                 app.layout_ui();

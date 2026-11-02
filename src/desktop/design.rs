@@ -183,6 +183,19 @@ impl Canvas {
         Some(area)
     }
 }
+/// Pixel rectangles for the empty-list illustration and its centered caption.
+pub(super) fn empty_state(width: i32, height: i32, line: i32, dpi: u32) -> (Area, Area) {
+    let px = |v: i32| v * dpi as i32 / 96;
+    let text_height = line.min(height).max(1);
+    let gap = px(12).min((height - text_height).max(0));
+    let icon_height = px(68).min((height - text_height - gap).max(0));
+    let icon_width = (icon_height * 84 / 68).min(width);
+    let top = (height - icon_height - gap - text_height) / 2;
+    (
+        ((width - icon_width) / 2, top, icon_width, icon_height),
+        (0, top + icon_height + gap, width, text_height),
+    )
+}
 // The scrolling host and the fixed footer share the main window's coordinates.
 pub(super) fn content_height(height: i32, page: usize, footer_top: i32) -> i32 {
     (height - if page == 3 { 100 } else { 140 })
@@ -205,6 +218,9 @@ pub(super) fn reference_layout(columns: i32, _page: usize, _advanced: bool) -> b
 pub(super) fn state_allows(id: i32, has_rules: bool, advanced: bool) -> bool {
     if id == 118 {
         return !has_rules;
+    }
+    if id == 100 {
+        return has_rules;
     }
     advanced || !matches!(id,202..=206|6202..=6206|209)
 }
@@ -232,6 +248,19 @@ mod tests {
                 76 + content_height(height, 0, footer) <= footer - 4,
                 "scrolling content overlaps save button at height {height}"
             );
+        }
+    }
+    #[test]
+    fn empty_group_is_centered_and_inside_the_list() {
+        for dpi in [96, 120, 144, 192] {
+            for (w, h) in [(270, 307), (400, 500), (200, 64)] {
+                let (w, h, line) = (w * dpi / 96, h * dpi / 96, 24 * dpi / 96);
+                let (icon, text) = empty_state(w, h, line, dpi as u32);
+                assert!((icon.0 * 2 + icon.2 - w).abs() <= 1);
+                assert_eq!(text.0 * 2 + text.2, w);
+                assert!((icon.1 + text.1 + text.3 - h).abs() <= 1);
+                assert!(icon.1 >= 0 && text.1 + text.3 <= h);
+            }
         }
     }
     #[test]

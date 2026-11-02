@@ -737,15 +737,16 @@ unsafe fn paint(h: HWND, dc: HDC, s: &PaintState) {
                 && SendMessageW(GetDlgItem(h, 100), LB_GETCOUNT, 0, 0) == 0
                 && !high_contrast()
             {
-                let cx = r.right / 2;
-                let cy = r.bottom / 2;
+                let caption = GetDlgItem(h, 118);
+                let ((x, y, w, h), _) =
+                    super::design::empty_state(r.right, r.bottom, font_line_height(caption), s.dpi);
                 super::assets::navigation(
                     dc,
                     RECT {
-                        left: cx - px(42),
-                        top: cy - px(50),
-                        right: cx + px(42),
-                        bottom: cy + px(18),
+                        left: x,
+                        top: y,
+                        right: x + w,
+                        bottom: y + h,
                     },
                     0,
                 );
