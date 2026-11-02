@@ -1,4 +1,5 @@
 #![allow(unsafe_op_in_unsafe_fn)]
+mod theme;
 mod ui;
 use dunyu::*;
 use serde::{Deserialize, Serialize};
@@ -136,11 +137,10 @@ struct Pending {
 }
 struct Ui {
     window: HWND,
+    theme: std::rc::Rc<theme::Theme>,
     page: usize,
     controls: Vec<(usize, HWND)>,
     content: HWND,
-    // Original 96-DPI rectangles, in the same order as controls.
-    rects: Vec<(i32, i32, i32, i32)>,
     advanced: bool,
     scroll: i32,
     baseline: Vec<String>,
@@ -151,6 +151,7 @@ struct Ui {
     dpi: u32,
     font: HFONT,
     heading_font: HFONT,
+    value_font: HFONT,
     pending_opacity: Option<(Token, u8)>,
 }
 struct App {
@@ -591,7 +592,7 @@ impl App {
         n.uID = 1;
         n.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         n.uCallbackMessage = TRAY;
-        n.hIcon = LoadIconW(null_mut(), IDI_APPLICATION);
+        n.hIcon = LoadIconW(GetModuleHandleW(null()), 101usize as _);
         let tip = wide("遁鱼 DunYu · 摸鱼有道");
         n.szTip[..tip.len()].copy_from_slice(&tip);
         Shell_NotifyIconW(NIM_ADD, &n);
@@ -689,10 +690,10 @@ unsafe extern "system" fn procedure(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                                     Some(((next as u32 * 255 + 50) / 100) as u8),
                                     0,
                                 ) {
-                                    a.status(&e);
+                                    a.status_error(&e);
                                 }
                             } else {
-                                a.status("目标窗口已失效，请重新捕获");
+                                a.status_error("目标窗口已失效，请重新捕获");
                             }
                         }
                         a.refresh_state();
@@ -753,6 +754,26 @@ unsafe extern "system" fn procedure(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                     }
                     Some(0)
                 }
+                WM_VSCROLL if l != 0 && GetDlgCtrlID(l as HWND) == 9004 => {
+                    if let Some(u) = &a.ui {
+                        let top = SendMessageW(u.list, LB_GETTOPINDEX, 0, 0) as i32;
+                        let mut si: SCROLLINFO = std::mem::zeroed();
+                        si.cbSize = std::mem::size_of_val(&si) as u32;
+                        si.fMask = SIF_ALL;
+                        GetScrollInfo(l as HWND, SB_CTL, &mut si);
+                        let next = match w as i32 & 0xffff {
+                            SB_LINEUP => top - 1,
+                            SB_LINEDOWN => top + 1,
+                            SB_PAGEUP => top - si.nPage as i32,
+                            SB_PAGEDOWN => top + si.nPage as i32,
+                            SB_THUMBTRACK | SB_THUMBPOSITION => si.nTrackPos,
+                            _ => top,
+                        };
+                        SendMessageW(u.list, LB_SETTOPINDEX, next.max(0) as usize, 0);
+                        theme::sync_list_scroll(u.list);
+                    }
+                    Some(0)
+                }
                 WM_VSCROLL | WM_MOUSEWHEEL => {
                     if let Some(u) = a.ui.as_mut() {
                         let delta = if msg == WM_MOUSEWHEEL {
@@ -767,7 +788,7 @@ unsafe extern "system" fn procedure(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                                     let mut si: SCROLLINFO = std::mem::zeroed();
                                     si.cbSize = std::mem::size_of_val(&si) as u32;
                                     si.fMask = SIF_TRACKPOS;
-                                    GetScrollInfo(u.content, SB_VERT, &mut si);
+                                    GetScrollInfo(GetDlgItem(u.window, 9003), SB_CTL, &mut si);
                                     si.nTrackPos - u.scroll
                                 }
                                 _ => 0,
@@ -789,7 +810,7 @@ unsafe extern "system" fn procedure(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                         && l == u.opacity as isize
                     {
                         let value = SendMessageW(u.opacity, WM_USER, 0, 0);
-                        ui::set_text(u.window, 405, &format!("不透明度：{value}%"));
+                        ui::set_text(u.window, 405, &format!("{value}%"));
                         if let Some(token) = u.target.as_ref().filter(|t| t.valid()) {
                             u.pending_opacity = Some((token.clone(), value.clamp(10, 100) as u8));
                             SetTimer(a.host, 900, 60, None);
@@ -859,7 +880,7 @@ unsafe extern "system" fn procedure(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                         }
                     } else if (w >> 16) == BN_CLICKED as usize {
                         if let Err(e) = a.ui_action(id) {
-                            a.status(&e);
+                            a.status_error(&e);
                         }
                     }
                     Some(0)
@@ -906,7 +927,7 @@ pub fn run() {
             let n = wide(name);
             wc.lpszClassName = n.as_ptr();
             wc.hCursor = LoadCursorW(null_mut(), IDC_ARROW);
-            wc.hIcon = LoadIconW(null_mut(), IDI_APPLICATION);
+            wc.hIcon = LoadIconW(GetModuleHandleW(null()), 101usize as _);
             wc.hbrBackground = (COLOR_BTNFACE + 1) as HBRUSH;
             if RegisterClassW(&wc) == 0 {
                 error("创建窗口类失败");
@@ -1034,6 +1055,9 @@ pub fn run() {
                 DestroyWindow(u.window);
                 if !u.font.is_null() {
                     DeleteObject(u.font);
+                }
+                if !u.value_font.is_null() {
+                    DeleteObject(u.value_font);
                 }
                 if !u.heading_font.is_null() {
                     DeleteObject(u.heading_font);

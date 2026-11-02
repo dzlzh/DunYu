@@ -178,6 +178,22 @@ pub(super) unsafe fn control(
     h: i32,
     style: u32,
 ) -> HWND {
+    let id = if id == 0 {
+        match label {
+            "程序召唤" => 7000,
+            "窗口绑定 · 仅在当前会话有效" => 7001,
+            "窗口不透明度" => 7002,
+            "全局快捷键" => 7003,
+            "调整步长 · 每次改变的不透明度百分点" => 7040,
+            "启动与后台运行" => 7050,
+            "点击后切换到需要调整的窗口" => 7010,
+            "增减快捷键支持长按连续调整；步长可在设置页修改。" => 7011,
+            "点击快捷键框后按组合键，Tab 离开。修改后需要保存。" => 7051,
+            _ => id,
+        }
+    } else {
+        id
+    };
     let x = if page == 3 {
         match x {
             244 | 245 => 20,
@@ -193,7 +209,7 @@ pub(super) unsafe fn control(
         style
     };
     let c = CreateWindowExW(
-        if kind == "EDIT" { WS_EX_CLIENTEDGE } else { 0 },
+        0,
         wide(kind).as_ptr(),
         wide(label).as_ptr(),
         WS_CHILD | WS_VISIBLE | style,
@@ -211,12 +227,29 @@ pub(super) unsafe fn control(
         null(),
     );
     SendMessageW(c, WM_SETFONT, GetStockObject(DEFAULT_GUI_FONT) as usize, 1);
+    let role = match kind {
+        "STATIC" if id == 9002 => theme::Role::Brand,
+        "SCROLLBAR" => theme::Role::Scrollbar,
+        "BUTTON" if style & 15 == BS_AUTOCHECKBOX as u32 => theme::Role::Checkbox,
+        "EDIT" => theme::Role::Edit,
+        "SysTabControl32" => theme::Role::Tab,
+        "BUTTON" if style & 15 != BS_AUTOCHECKBOX as u32 => theme::Role::Button,
+        _ => theme::Role::Native,
+    };
+    theme::attach(c, role, u.theme.clone());
+    if kind == "EDIT" {
+        SendMessageW(
+            c,
+            EM_SETMARGINS,
+            (EC_LEFTMARGIN | EC_RIGHTMARGIN) as usize,
+            (8 << 16) | 8,
+        );
+    }
     u.controls.push((page, c));
-    u.rects.push((x, y, w, h));
     c
 }
 pub(super) unsafe fn field(u: &mut Ui, page: usize, label: &str, id: i32, y: i32, value: &str) {
-    control(u, page, "STATIC", label, 0, 245, y + 4, 130, 24, 0);
+    control(u, page, "STATIC", label, 6000 + id, 245, y + 4, 130, 24, 0);
     control(
         u,
         page,
@@ -257,11 +290,13 @@ impl App {
             error("无法创建设置窗口");
             return;
         }
+        let dark: i32 = 1;
+        windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute(h, 20, &dark as *const _ as _, 4);
         let content = CreateWindowExW(
             WS_EX_CONTROLPARENT,
             wide("DunYu.Content.1").as_ptr(),
             wide("").as_ptr(),
-            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_CLIPCHILDREN,
+            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
             0,
             50,
             900,
@@ -276,12 +311,15 @@ impl App {
             error("无法创建设置内容区域");
             return;
         }
+        let skin = theme::Theme::new();
+        theme::attach(h, theme::Role::Surface, skin.clone());
+        theme::attach(content, theme::Role::Surface, skin.clone());
         let mut u = Ui {
             window: h,
+            theme: skin,
             content,
             page: 0,
             controls: vec![],
-            rects: vec![],
             list: null_mut(),
             selected: None,
             target: self
@@ -292,6 +330,7 @@ impl App {
             dpi: 96,
             font: null_mut(),
             heading_font: null_mut(),
+            value_font: null_mut(),
             pending_opacity: None,
             advanced: false,
             scroll: 0,
@@ -307,8 +346,9 @@ impl App {
             12,
             860,
             32,
-            WS_TABSTOP,
+            WS_TABSTOP | TCS_FIXEDWIDTH,
         );
+        control(&mut u, 99, "STATIC", "遁鱼", 9002, 24, 22, 100, 32, 0);
         SetWindowPos(
             tab,
             HWND_TOP,
@@ -347,8 +387,33 @@ impl App {
             52,
             200,
             310,
-            WS_BORDER | WS_VSCROLL | LBS_NOTIFY as u32 | WS_TABSTOP,
+            LBS_NOTIFY as u32 | LBS_OWNERDRAWFIXED as u32 | LBS_HASSTRINGS as u32 | WS_TABSTOP,
         );
+        control(
+            &mut u,
+            99,
+            "SCROLLBAR",
+            "",
+            9003,
+            0,
+            0,
+            14,
+            100,
+            SBS_VERT as u32,
+        );
+        control(
+            &mut u,
+            0,
+            "SCROLLBAR",
+            "",
+            9004,
+            0,
+            0,
+            14,
+            100,
+            SBS_VERT as u32,
+        );
+        control(&mut u, 0, "STATIC", "还没有规则", 118, 0, 0, 180, 28, 0);
         control(&mut u, 0, "STATIC", "程序召唤", 0, 20, 12, 200, 28, 0);
         control(
             &mut u,
@@ -505,11 +570,35 @@ impl App {
                 1,
                 "STATIC",
                 &format!("槽位 {}", i + 1),
-                0,
+                350 + i,
                 20,
                 y,
                 100,
                 28,
+                0,
+            );
+            control(
+                &mut u,
+                1,
+                "STATIC",
+                "绑定快捷键",
+                360 + i * 2,
+                0,
+                0,
+                200,
+                24,
+                0,
+            );
+            control(
+                &mut u,
+                1,
+                "STATIC",
+                "显示／隐藏快捷键",
+                361 + i * 2,
+                0,
+                0,
+                200,
+                24,
                 0,
             );
             let slot = &self.config.slots[i as usize];
@@ -791,13 +880,26 @@ impl App {
     pub(super) unsafe fn scale_ui(&mut self, dpi: u32, suggested: Option<RECT>) {
         let Some(u) = self.ui.as_mut() else { return };
         u.dpi = dpi;
+        for (kind, logical) in [(ICON_SMALL, 16), (ICON_BIG, 32)] {
+            let size = logical * dpi as i32 / 96;
+            let icon = LoadImageW(
+                GetModuleHandleW(null()),
+                101usize as _,
+                IMAGE_ICON,
+                size,
+                size,
+                LR_SHARED,
+            );
+            SendMessageW(u.window, WM_SETICON, kind as usize, icon as isize);
+        }
+
         let mut font: LOGFONTW = std::mem::zeroed();
-        font.lfHeight = -(16 * dpi as i32 / 96);
+        font.lfHeight = -(14 * dpi as i32 / 96);
         font.lfCharSet = DEFAULT_CHARSET;
         let face = wide("Microsoft YaHei UI");
         font.lfFaceName[..face.len()].copy_from_slice(&face);
         let new_font = CreateFontIndirectW(&font);
-        font.lfHeight = -(20 * dpi as i32 / 96);
+        font.lfHeight = -(22 * dpi as i32 / 96);
         font.lfWeight = 600;
         let heading = CreateFontIndirectW(&font);
         if !new_font.is_null() {
@@ -810,8 +912,8 @@ impl App {
             u.font = new_font;
         }
         if !heading.is_null() {
-            for ((page, c), (_, y, _, _)) in u.controls.iter().zip(&u.rects) {
-                if (*page != 99 && *y == 12) || GetDlgCtrlID(*c) == 405 {
+            for (_, c) in &u.controls {
+                if matches!(GetDlgCtrlID(*c), 7000..=7003 | 7040 | 7050 | 350..=353 | 114 | 9002) {
                     SendMessageW(*c, WM_SETFONT, heading as usize, 1);
                 }
             }
@@ -819,6 +921,15 @@ impl App {
                 DeleteObject(u.heading_font);
             }
             u.heading_font = heading;
+        }
+        font.lfHeight = -(40 * dpi as i32 / 96);
+        let value_font = CreateFontIndirectW(&font);
+        if !value_font.is_null() {
+            SendMessageW(item(u.window, 405), WM_SETFONT, value_font as usize, 1);
+            if !u.value_font.is_null() {
+                DeleteObject(u.value_font);
+            }
+            u.value_font = value_font;
         }
         let bounds = suggested.unwrap_or_else(|| {
             let mut r: RECT = std::mem::zeroed();
@@ -893,20 +1004,39 @@ impl App {
     pub(super) unsafe fn layout_ui(&mut self) {
         let Some(u) = self.ui.as_mut() else { return };
         let scale = |v: i32| v * u.dpi as i32 / 96;
+        let rect = |x, y, w, h| RECT {
+            left: scale(x),
+            top: scale(y),
+            right: scale(x + w),
+            bottom: scale(y + h),
+        };
         let mut client: RECT = std::mem::zeroed();
         GetClientRect(u.window, &mut client);
         let width = client.right * 96 / u.dpi as i32;
         let height = client.bottom * 96 / u.dpi as i32;
-        let viewport = (height - 110).max(1);
+        let viewport = (height - 140).max(1);
+        let columns = if width >= 840 { 2 } else { 1 };
         let extent = match u.page {
-            0 if u.advanced => 590,
-            0 => 430,
-            1 => 470,
-            2 => 510,
-            _ => 500,
+            0 => {
+                if u.advanced {
+                    900
+                } else {
+                    440
+                }
+            }
+            1 => 64 + (4 / columns) * 192,
+            2 => 520,
+            _ => 580,
         };
         u.scroll = u.scroll.clamp(0, (extent - viewport).max(0));
-        MoveWindow(u.content, 0, scale(54), client.right, scale(viewport), 1);
+        MoveWindow(
+            u.content,
+            0,
+            scale(76),
+            client.right - scale(16),
+            scale(viewport),
+            1,
+        );
         let si = SCROLLINFO {
             cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
             fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
@@ -916,74 +1046,216 @@ impl App {
             nPos: u.scroll,
             nTrackPos: 0,
         };
-        SetScrollInfo(u.content, SB_VERT, &si, 1);
-        let mut content_rect: RECT = std::mem::zeroed();
-        GetClientRect(u.content, &mut content_rect);
-        let body_width = content_rect.right * 96 / u.dpi as i32;
+        SetScrollInfo(item(u.window, 9003), SB_CTL, &si, 1);
+        let mut content: RECT = std::mem::zeroed();
+        GetClientRect(u.content, &mut content);
+        let bw = content.right * 96 / u.dpi as i32;
+        let right = bw - 24;
+        let form = 284;
+        let fw = (right - form - 20).max(160);
+        let card_width = (bw - 48 - 16 * (columns - 1)) / columns;
+        let slot = |i: i32| {
+            (
+                24 + (i % columns) * (card_width + 16),
+                64 + (i / columns) * 192,
+            )
+        };
+        let mut cards = vec![];
+        match u.page {
+            0 => {
+                cards.push(rect(24, 12 - u.scroll, 220, 400));
+                cards.push(rect(
+                    264,
+                    12 - u.scroll,
+                    bw - 288,
+                    if u.advanced { 864 } else { 404 },
+                ));
+            }
+            1 => {
+                for i in 0..4 {
+                    let (x, y) = slot(i);
+                    cards.push(rect(x, y - u.scroll, card_width, 176));
+                }
+            }
+            2 => {
+                cards.push(rect(24, 64 - u.scroll, bw - 48, 124));
+                cards.push(rect(24, 204 - u.scroll, bw - 48, 204));
+                cards.push(rect(24, 424 - u.scroll, bw - 48, 72));
+            }
+            _ => {
+                cards.push(rect(24, 12 - u.scroll, bw - 48, 296));
+                cards.push(rect(24, 324 - u.scroll, bw - 48, 100));
+                cards.push(rect(24, 440 - u.scroll, bw - 48, 116));
+            }
+        }
+        let mut fields = vec![];
+        for (page, c) in &u.controls {
+            let id = GetDlgCtrlID(*c);
+            let area: Option<(i32, i32, i32, i32)> = match id {
+                9 => Some((148, 18, 500, 40)),
+                9002 => Some((24, 22, 112, 32)),
+                9003 => Some((width - 16, 76, 14, viewport)),
+                9004 => Some((220, 76, 12, 268)),
+                9001 => Some((24, height - 48, width - 220, 40)),
+                113 | 330 | 506 => Some((width - 180, height - 50, 156, 38)),
+                7000 => Some((44, 32, 180, 28)),
+                100 => Some((36, 76, 180, 268)),
+                110 => Some((40, 360, 100, 36)),
+                111 => Some((144, 360, 84, 36)),
+                118 if self.config.rules.is_empty() => Some((56, 148, 156, 28)),
+                114 => Some((form, 32, fw, 28)),
+                112 => Some((form, 76, 220, 36)),
+                200 | 201 | 207 | 6200 | 6201 | 6207 => {
+                    let field = if id >= 6000 { id - 6000 } else { id };
+                    let row = match field {
+                        200 => 0,
+                        201 => 1,
+                        _ => 2,
+                    };
+                    let y = 132 + row * 78;
+                    let w = if field == 201 {
+                        fw - 84
+                    } else if field == 207 {
+                        fw - 130
+                    } else {
+                        fw
+                    };
+                    Some((
+                        form,
+                        if id >= 6000 { y } else { y + 26 },
+                        w,
+                        if id >= 6000 { 22 } else { 36 },
+                    ))
+                }
+                115 => Some((right - 96, 236, 76, 36)),
+                208 => Some((right - 140, 314, 120, 30)),
+                116 => Some((form, 372, fw, 36)),
+                202..=206 | 6202..=6206 if u.advanced => {
+                    let field = if id >= 6000 { id - 6000 } else { id };
+                    let y = 432 + (field - 202) * 76;
+                    Some((
+                        form,
+                        if id >= 6000 { y } else { y + 26 },
+                        fw,
+                        if id >= 6000 { 22 } else { 36 },
+                    ))
+                }
+                209 if u.advanced => Some((form, 820, fw, 30)),
+                117 => None,
+                7001 => Some((24, 12, bw - 48, 32)),
+                350..=353 => {
+                    let (x, y) = slot(id - 350);
+                    Some((x + 20, y + 16, card_width - 156, 28))
+                }
+                340..=343 => {
+                    let (x, y) = slot(id - 340);
+                    Some((x + 20, y + 54, card_width - 40, 24))
+                }
+                320..=323 => {
+                    let (x, y) = slot(id - 320);
+                    Some((x + card_width - 132, y + 14, 112, 36))
+                }
+                300..=307 | 360..=367 => {
+                    let base = if id >= 360 { 360 } else { 300 };
+                    let (x, y) = slot((id - base) / 2);
+                    let second = (id - base) % 2;
+                    let field_width = (card_width - 56) / 2;
+                    Some((
+                        x + 20 + second * (field_width + 16),
+                        y + 92 + if base == 300 { 24 } else { 0 },
+                        field_width,
+                        if base == 300 { 36 } else { 22 },
+                    ))
+                }
+                7002 => Some((24, 12, bw - 48, 32)),
+                400 => Some((44, 84, bw - 88, 28)),
+                401 => Some((44, 132, 220, 36)),
+                7010 => Some((280, 136, bw - 324, 24)),
+                405 => Some((44, 228, bw - 88, 48)),
+                402 => Some((44, 284, bw - 88, 40)),
+                406 => Some((44, 328, 180, 24)),
+                407 => Some((bw - 224, 328, 180, 24)),
+                403 => Some((44, 360, 220, 36)),
+                404 => Some((44, 442, 240, 36)),
+                7011 => None,
+                7003 => Some((44, 32, bw - 88, 28)),
+                500..=503 | 6500..=6503 => {
+                    let field = if id >= 6000 { id - 6000 } else { id };
+                    let y = 84 + (field - 500) * 50;
+                    Some((
+                        if id >= 6000 { 44 } else { 244 },
+                        y,
+                        if id >= 6000 { 180 } else { bw - 288 },
+                        36,
+                    ))
+                }
+                7040 => Some((44, 340, bw - 88, 24)),
+                6504 => Some((44, 378, 180, 24)),
+                504 => Some((244, 374, 160, 36)),
+                7050 => Some((44, 456, bw - 88, 28)),
+                505 => Some((44, 502, bw - 88, 30)),
+                7051 => None,
+                _ => None,
+            };
+            let visible = (*page == 99 || *page == u.page) && area.is_some();
+            ShowWindow(*c, if visible { SW_SHOW } else { SW_HIDE });
+            if let Some((x, y, w, h)) = area {
+                let root = *page == 99 || matches!(id, 113 | 330 | 506);
+                let mut r = rect(x, if root { y } else { y - u.scroll }, w, h);
+                if class(*c) == "Edit" || class(*c) == "EDIT" {
+                    if visible {
+                        fields.push((*c, r));
+                    }
+                    r.left += scale(4);
+                    r.right -= scale(4);
+                    r.top += scale(8);
+                    r.bottom -= scale(6);
+                }
+                MoveWindow(
+                    *c,
+                    r.left,
+                    r.top,
+                    (r.right - r.left).max(1),
+                    (r.bottom - r.top).max(1),
+                    1,
+                );
+                theme::scene(*c, u.dpi, vec![], vec![]);
+            }
+        }
         set_text(
             u.window,
             116,
             if u.advanced {
-                "高级选项 ▾"
+                "高级选项  −"
             } else {
-                "高级选项 ▸"
+                "高级选项  +"
             },
         );
-        for ((page, c), (x, y, w, h)) in u.controls.iter().zip(&u.rects) {
-            let id = GetDlgCtrlID(*c);
-            let advanced =
-                *page == 0 && (matches!(id, 202..=206 | 209) || (*x == 245 && *y >= 284));
-            let visible = (*page == 99 || *page == u.page) && (!advanced || u.advanced);
-            ShowWindow(*c, if visible { SW_SHOW } else { SW_HIDE });
-            let footer = matches!(id, 113 | 330 | 506 | 9001);
-            let cy = if footer {
-                height - 42
-            } else if *page == 99 {
-                *y
-            } else if id == 117 && !u.advanced {
-                280 - u.scroll
-            } else {
-                *y - u.scroll
-            };
-            let width = if *page == 99 || footer {
-                width
-            } else {
-                body_width
-            };
-            let cx = if id == 407 {
-                width - 240
-            } else if id == 115 {
-                width - 134
-            } else if *page == 1 && *x >= 370 {
-                *x + (width - 900) * if *x >= 620 { 2 } else { 1 } / 3
-            } else if matches!(id, 113 | 330 | 506) {
-                width - 200
-            } else {
-                *x
-            };
-            let cw = if id == 406 {
-                220
-            } else if id == 112 {
-                (width - 460).clamp(120, 260)
-            } else if *page == 1 && *w == 220 {
-                *w + (width - 900) / 3
-            } else if id == 9 {
-                width - 40
-            } else if id == 9001 {
-                width - 240
-            } else if *w >= 370 {
-                (*w + width - 900).max(150)
-            } else {
-                *w
-            };
-            MoveWindow(*c, scale(cx), scale(cy), scale(cw), scale(*h), 1);
-        }
-        InvalidateRect(u.content, null(), 1);
+        SendMessageW(
+            item(u.window, 9),
+            TCM_SETITEMSIZE,
+            0,
+            ((scale(40) as isize) << 16) | scale(112) as isize,
+        );
+        SendMessageW(u.list, LB_SETITEMHEIGHT, 0, scale(64) as isize);
+        theme::sync_list_scroll(u.list);
+        theme::scene(u.content, u.dpi, cards, fields);
+        theme::scene(u.window, u.dpi, vec![], vec![]);
     }
 
     pub(super) unsafe fn status(&self, message: &str) {
+        self.status_color(message, 0xa1aab8);
+    }
+    pub(super) unsafe fn status_error(&self, message: &str) {
+        self.status_color(message, 0xfb7185);
+    }
+    unsafe fn status_success(&self, message: &str) {
+        self.status_color(message, 0x4ade80);
+    }
+    unsafe fn status_color(&self, message: &str, value: u32) {
         if let Some(u) = &self.ui {
             set_text(u.window, 9001, message);
+            theme::tint(item(u.window, 9001), value);
         }
     }
 
@@ -1009,7 +1281,7 @@ impl App {
             IDYES => match self.ui_action(113) {
                 Ok(()) => true,
                 Err(e) => {
-                    self.status(&e);
+                    self.status_error(&e);
                     false
                 }
             },
@@ -1069,10 +1341,10 @@ impl App {
             return;
         }
         if let Some(percent) = value {
-            set_text(u.window, 405, &format!("当前不透明度：{percent}%"));
+            set_text(u.window, 405, &format!("{percent}%"));
             SendMessageW(u.opacity, TBM_SETPOS, 1, percent.clamp(10, 100) as isize);
         } else {
-            set_text(u.window, 405, "当前不透明度：不可用");
+            set_text(u.window, 405, "不可用");
             self.cancel_opacity();
         }
     }
@@ -1115,9 +1387,10 @@ impl App {
                     LB_ADDSTRING,
                     0,
                     wide(&format!(
-                        "{}{}",
+                        "{}{}\n{}",
                         if r.enabled { "" } else { "[停用] " },
-                        r.name
+                        r.name,
+                        hotkey_text(&r.hotkey)
                     ))
                     .as_ptr() as isize,
                 );
@@ -1170,7 +1443,7 @@ impl App {
             if index.is_some() {
                 "编辑召唤规则"
             } else {
-                "新建规则 · 选择程序并录入快捷键"
+                "新建召唤规则"
             },
         );
         let snapshot = self.rule_snapshot();
@@ -1293,7 +1566,7 @@ impl App {
                     .unwrap_or(c.rules.len() - 1);
                 self.apply_config(c)?;
                 self.fill_rule(Some(selected));
-                self.status("规则已保存");
+                self.status_success("规则已保存");
             }
             330 => {
                 let mut c = self.config.clone();
@@ -1343,7 +1616,7 @@ impl App {
             _ => {}
         }
         if matches!(id, 330 | 506) {
-            self.status("修改已保存");
+            self.status_success("修改已保存");
         }
         if matches!(id, 403 | 404) {
             self.refresh_state();
@@ -1359,10 +1632,10 @@ impl App {
         };
         let h = u.window;
         if !eligible(target) {
-            self.status("未选中可操作的窗口，请重新捕获");
+            self.status_error("未选中可操作的窗口，请重新捕获");
         } else if id == 112 {
             if let Some((_, _, p)) = process(target) {
-                self.status("窗口信息已捕获，请核对后保存");
+                self.status_success("窗口信息已捕获，请核对后保存");
                 set_text(h, 204, &p);
                 if text_at(h, 201).is_empty() {
                     set_text(h, 201, &p);
@@ -1373,13 +1646,13 @@ impl App {
                     set_text(h, 200, &title(target));
                 }
             } else {
-                self.status("无法读取目标进程，请检查权限并重新捕获");
+                self.status_error("无法读取目标进程，请检查权限并重新捕获");
             }
         } else if id == 401 {
             match self.track(target) {
                 Ok(n) => {
                     self.ui.as_mut().unwrap().target = Some(self.records[n].token.clone());
-                    self.status("目标窗口已捕获");
+                    self.status_success("目标窗口已捕获");
                 }
                 Err(e) => {
                     error(&e);
@@ -1401,7 +1674,7 @@ impl App {
             match self.track(target) {
                 Ok(n) => {
                     self.slots[i] = Some(self.records[n].token.clone());
-                    self.status("窗口已绑定到槽位");
+                    self.status_success("窗口已绑定到槽位");
                     if let Err(e) = self.journal() {
                         error(&e);
                     }
@@ -1514,6 +1787,7 @@ mod capture_tests {
                             DestroyWindow(u.window);
                             DeleteObject(u.font);
                             DeleteObject(u.heading_font);
+                            DeleteObject(u.value_font);
                         }
                         DestroyWindow(self.app.host);
                         if IsWindow(self.external) != 0 {
@@ -1550,6 +1824,8 @@ mod capture_tests {
             }
             app.open_ui();
             let h = app.ui.as_ref().unwrap().window;
+            app.ui.as_mut().unwrap().target = None;
+            app.refresh_state();
             assert!(!item(h, 201).is_null());
             assert_eq!(GetAncestor(item(h, 201), GA_ROOT), h);
             assert_eq!(app.rule_snapshot(), app.ui.as_ref().unwrap().baseline);
@@ -1578,8 +1854,34 @@ mod capture_tests {
             assert_eq!(text_at(h, 200), "未保存草稿");
             assert_eq!(app.config.rules[0].name, "测试程序");
             assert_ne!(app.rule_snapshot(), app.ui.as_ref().unwrap().baseline);
+            if std::env::var_os("DUNYU_UI_SCREENSHOTS").is_some() {
+                std::fs::create_dir_all("target/ui-preview").unwrap();
+                for (page, name) in [(0, "summon"), (1, "bind"), (2, "opacity"), (3, "settings")] {
+                    app.page(page);
+                    theme::capture(h, &format!("target/ui-preview/{name}.bmp")).unwrap();
+                }
+                app.page(0);
+                let saved = app.config.rules.clone();
+                app.config.rules.clear();
+                app.refresh_list();
+                app.layout_ui();
+                theme::capture(h, "target/ui-preview/empty.bmp").unwrap();
+                app.config.rules = saved;
+                app.refresh_list();
+                app.layout_ui();
+                EnableWindow(item(h, 113), 0);
+                theme::capture(h, "target/ui-preview/disabled.bmp").unwrap();
+                EnableWindow(item(h, 113), 1);
+                SetFocus(item(h, 201));
+                SendMessageW(item(h, 113), WM_MOUSEMOVE, 0, 0);
+                theme::capture(h, "target/ui-preview/focus-hover.bmp").unwrap();
+                SendMessageW(item(h, 113), WM_MOUSELEAVE, 0, 0);
+            }
             app.ui_action(116).unwrap();
             assert!(IsWindowVisible(item(h, 204)) != 0);
+            if std::env::var_os("DUNYU_UI_SCREENSHOTS").is_some() {
+                theme::capture(h, "target/ui-preview/advanced.bmp").unwrap();
+            }
             app.ui_action(116).unwrap();
             assert_eq!(IsWindowVisible(item(h, 204)), 0);
             let rect = |h: HWND| {
@@ -1597,7 +1899,7 @@ mod capture_tests {
             app.ui.as_mut().unwrap().target = Some(app.records[n].token.clone());
             app.opacity(external, Some(128), 0).unwrap();
             app.refresh_state();
-            assert_eq!(text_at(h, 405), "当前不透明度：50%");
+            assert_eq!(text_at(h, 405), "50%");
             assert_eq!(
                 SendMessageW(app.ui.as_ref().unwrap().opacity, WM_USER, 0, 0),
                 50
@@ -1605,7 +1907,7 @@ mod capture_tests {
             app.ui.as_mut().unwrap().pending_opacity = Some((app.records[n].token.clone(), 30));
             app.ui_action(403).unwrap();
             assert!(app.ui.as_ref().unwrap().pending_opacity.is_none());
-            assert_eq!(text_at(h, 405), "当前不透明度：100%");
+            assert_eq!(text_at(h, 405), "100%");
             DestroyWindow(external);
             app.refresh_state();
             assert_eq!(IsWindowEnabled(item(h, 402)), 0);
