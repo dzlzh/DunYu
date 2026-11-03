@@ -1044,13 +1044,13 @@ impl App {
         let mut font: LOGFONTW = std::mem::zeroed();
         font.lfHeight = -(16 * dpi as i32 / 96);
         font.lfCharSet = DEFAULT_CHARSET;
-        let face = wide("Source Han Serif SC");
+        let face = wide(super::fonts::FACE);
         font.lfFaceName[..face.len()].copy_from_slice(&face);
         let new_font = CreateFontIndirectW(&font);
         font.lfHeight = -(27 * dpi as i32 / 96);
         font.lfWeight = 600;
         font.lfFaceName = [0; 32];
-        let heading_face = wide("Source Han Serif SC");
+        let heading_face = wide(super::fonts::FACE);
         font.lfFaceName[..heading_face.len()].copy_from_slice(&heading_face);
         let heading = CreateFontIndirectW(&font);
         if !new_font.is_null() {

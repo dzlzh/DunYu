@@ -1,5 +1,8 @@
 //! Embedded design artwork; decoded once and shared across desktop windows.
 use super::*;
+mod packed {
+    include!("../../resources/optimized/regions.rs");
+}
 use windows_sys::Win32::Graphics::GdiPlus::*;
 struct Image {
     image: *mut GpImage,
@@ -81,12 +84,12 @@ thread_local! {
 }
 pub(super) unsafe fn navigation(dc: HDC, r: RECT, index: usize) {
     let sources = [
-        [230., 150., 250., 200.],
-        [630., 180., 290., 170.],
-        [1040., 180., 310., 170.],
-        [230., 470., 250., 230.],
-        [630., 510., 290., 190.],
-        [1060., 480., 280., 230.],
+        packed::NAV_0,
+        packed::NAV_1,
+        packed::NAV_2,
+        packed::NAV_3,
+        packed::NAV_4,
+        packed::NAV_5,
     ];
     let Some(source) = sources.get(index) else {
         return;
@@ -94,7 +97,7 @@ pub(super) unsafe fn navigation(dc: HDC, r: RECT, index: usize) {
     NAV.with(|cache| {
         let mut cache = cache.borrow_mut();
         let image = cache.get_or_insert_with(|| {
-            Image::load(include_bytes!("../../resources/nav-icons-ink.png"))
+            Image::load(include_bytes!("../../resources/optimized/nav.png"))
         });
         let mut g = null_mut();
         if GdipCreateFromHDC(dc, &mut g) == 0 {
@@ -138,23 +141,23 @@ pub(super) unsafe fn background(dc: HDC, width: i32, height: i32, scene: i32) {
     let (cache, bytes, source): (_, &[u8], _) = match scene {
         1 => (
             &FULL,
-            include_bytes!("../../docs/design/rest-preview-fullscreen-static.png"),
-            [20., 240., 400., 400.],
+            include_bytes!("../../resources/optimized/full.png"),
+            packed::FULL_PAPER,
         ),
         2 => (
             &CARD,
-            include_bytes!("../../docs/design/rest-preview-card.png"),
-            [80., 190., 300., 250.],
+            include_bytes!("../../resources/optimized/card.png"),
+            packed::CARD_PAPER,
         ),
         3 => (
             &MAIN,
-            include_bytes!("../../docs/design/ui-settings.png"),
-            [400., 285., 500., 90.],
+            include_bytes!("../../resources/optimized/main.png"),
+            packed::MAIN_SURFACE,
         ),
         _ => (
             &MAIN,
-            include_bytes!("../../docs/design/ui-settings.png"),
-            [40., 720., 400., 180.],
+            include_bytes!("../../resources/optimized/main.png"),
+            packed::MAIN_PAPER,
         ),
     };
     cache.with(|cache| {
@@ -176,7 +179,7 @@ pub(super) unsafe fn background(dc: HDC, width: i32, height: i32, scene: i32) {
                 image.draw(
                     g,
                     [width as f32 - 340. * scale, 0., 250. * scale, 220. * scale],
-                    [1332., 0., 250., 220.],
+                    packed::FULL_TOP,
                     false,
                 );
                 image.draw(
@@ -187,13 +190,13 @@ pub(super) unsafe fn background(dc: HDC, width: i32, height: i32, scene: i32) {
                         90. * scale,
                         130. * scale,
                     ],
-                    [1582., 90., 90., 130.],
+                    packed::FULL_RIGHT,
                     false,
                 );
                 image.draw(
                     g,
                     [0., height as f32 - 200. * scale, 340. * scale, 200. * scale],
-                    [0., 741., 340., 200.],
+                    packed::FULL_BOTTOM,
                     false,
                 );
             }
@@ -205,9 +208,7 @@ pub(super) unsafe fn ring(g: *mut GpGraphics, dest: [f32; 4]) {
     FULL.with(|cache| {
         let mut cache = cache.borrow_mut();
         let image = cache.get_or_insert_with(|| {
-            Image::load(include_bytes!(
-                "../../docs/design/rest-preview-fullscreen-static.png"
-            ))
+            Image::load(include_bytes!("../../resources/optimized/full.png"))
         });
         let mut state = 0;
         GdipSaveGraphics(g, &mut state);
@@ -223,7 +224,7 @@ pub(super) unsafe fn ring(g: *mut GpGraphics, dest: [f32; 4]) {
             dest[3] - 2. * inset,
         );
         GdipSetClipPath(g, path, CombineModeIntersect);
-        image.draw(g, dest, [661., 261., 350., 350.], false);
+        image.draw(g, dest, packed::RING, false);
         GdipDeletePath(path);
         GdipRestoreGraphics(g, state);
     });
@@ -233,14 +234,14 @@ pub(super) unsafe fn stroke(dc: HDC, r: RECT, red: bool) {
     MAIN.with(|cache| {
         let mut cache = cache.borrow_mut();
         let image = cache.get_or_insert_with(|| {
-            Image::load(include_bytes!("../../docs/design/ui-settings.png"))
+            Image::load(include_bytes!("../../resources/optimized/main.png"))
         });
         let mut g = null_mut();
         if GdipCreateFromHDC(dc, &mut g) == 0 {
             let source = if red {
-                [1345., 131., 151., 13.]
+                packed::STROKE_RED
             } else {
-                [42., 232., 153., 14.]
+                packed::STROKE_INK
             };
             image.draw(
                 g,

@@ -301,22 +301,20 @@ pub(super) fn button_text_rect(mut r: RECT, dpi: u32) -> RECT {
 /// A complete line even when the edit is empty (text extent then reports zero).
 pub(super) unsafe fn font_line_height(h: HWND) -> i32 {
     let dc = GetDC(h);
-    let old = SelectObject(dc, SendMessageW(h, WM_GETFONT, 0, 0) as _);
+    let selected = super::fonts::select(dc, h, &title(h));
     let mut metrics: TEXTMETRICW = std::mem::zeroed();
     GetTextMetricsW(dc, &mut metrics);
-    SelectObject(dc, old);
+    drop(selected);
     ReleaseDC(h, dc);
     metrics.tmHeight
 }
 pub(super) unsafe fn label_size(h: HWND) -> SIZE {
     let dc = GetDC(h);
-    let old = SelectObject(dc, SendMessageW(h, WM_GETFONT, 0, 0) as _);
+    let selected = super::fonts::select(dc, h, &title(h));
     let label = wide(&title(h));
     let mut size: SIZE = std::mem::zeroed();
     GetTextExtentPoint32W(dc, label.as_ptr(), (label.len() - 1) as i32, &mut size);
-    if !old.is_null() {
-        SelectObject(dc, old);
-    }
+    drop(selected);
     ReleaseDC(h, dc);
     size
 }
@@ -348,7 +346,7 @@ unsafe fn text(dc: HDC, h: HWND, s: &str, mut r: RECT, value: u32, flags: u32) {
         );
         return;
     }
-    let old = SelectObject(dc, SendMessageW(h, WM_GETFONT, 0, 0) as _);
+    let selected = super::fonts::select(dc, h, s);
     SetBkMode(dc, TRANSPARENT as i32);
     SetTextColor(dc, color(value));
     let text = wide(s);
@@ -359,9 +357,7 @@ unsafe fn text(dc: HDC, h: HWND, s: &str, mut r: RECT, value: u32, flags: u32) {
         &mut r,
         flags | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
     );
-    if !old.is_null() {
-        SelectObject(dc, old);
-    }
+    drop(selected);
 }
 // Hand-drawn animation contour: bold silhouette with restrained pressure changes.
 unsafe fn ink_curve(g: *mut GpGraphics, pen: *mut GpPen, p: [(f32, f32); 4]) {
@@ -619,7 +615,7 @@ unsafe fn paint(h: HWND, dc: HDC, s: &PaintState) {
             label.bottom = r.bottom;
             let mut lf: LOGFONTW = std::mem::zeroed();
             lf.lfHeight = -px(11);
-            let face = wide("Source Han Serif SC");
+            let face = wide(super::fonts::FACE);
             lf.lfFaceName[..face.len()].copy_from_slice(&face);
             let small = CreateFontIndirectW(&lf);
             let old = SelectObject(dc, small);
@@ -935,7 +931,7 @@ unsafe extern "system" fn procedure(
             );
             lf.lfFaceName = [0; 32];
             let face = wide(if role == Role::Tab {
-                "Source Han Serif SC"
+                super::fonts::FACE
             } else {
                 "Microsoft YaHei UI"
             });

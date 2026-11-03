@@ -714,11 +714,11 @@ impl Runtime {
             let mut lf: LOGFONTW = std::mem::zeroed();
             lf.lfHeight = -px(size);
             let face = wide(if name == "DunYu.RestTitle" {
-                "Source Han Serif SC"
+                super::fonts::FACE
             } else if name == "DunYu.RestTimer" && full {
                 "Segoe UI Light"
             } else {
-                "Source Han Serif SC"
+                super::fonts::FACE
             });
             lf.lfFaceName[..face.len()].copy_from_slice(&face);
             let font = CreateFontIndirectW(&lf);
@@ -870,7 +870,7 @@ impl Runtime {
                 let face = wide(if id == 10 {
                     "Segoe UI Light"
                 } else {
-                    "Source Han Serif SC"
+                    super::fonts::FACE
                 });
                 lf.lfFaceName[..face.len()].copy_from_slice(&face);
                 let font = CreateFontIndirectW(&lf);

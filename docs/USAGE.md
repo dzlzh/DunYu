@@ -135,3 +135,17 @@ Windows交互验收可设置 `DUNYU_UI_TRANSITION_CHECK=1` 后运行 `cargo test
 核对高级选项中的进程路径、类名和标题条件。标题可能包含会变化的文件名；只按程序匹配时可清空标题。使用快捷方式启动时，应填写目标进程的实际 EXE 路径。
 
 滑块残影回归：在可见的 Windows 桌面设置 `DUNYU_UI_OPACITY_CHECK=1`，运行界面集成测试；比较实际拖动与完整重绘的滑块截图，产物为 `opacity-actual.bmp` 和 `opacity-redrawn.bmp`。
+
+## 发布资源体积
+
+运行时使用 `resources/optimized` 中已提交的字体子集和无损图集，普通 Cargo 构建无需 Python。完整字体和设计稿保留为生成输入，不直接内嵌。子集字体名为 DunYu Serif SC，保留 Regular / SemiBold 两种字重、GB2312 字符及源码用字，继续遵循原 OFL 许可；超出字库的动态标签使用系统 UI 字体。
+
+修改界面文案或原始素材后，用 Python 3.11 重新生成并提交资源：
+
+```sh
+python -m pip install -r scripts/asset-requirements.txt
+python scripts/prepare-assets.py
+python scripts/prepare-assets.py --check
+```
+
+检查模式不写入资源，并验证字形覆盖、字符宽度、行高和图集像素。CI 检查生成结果是否过期，并在 Windows 构建摘要中记录 EXE / ZIP 字节数。Windows 验收需在未安装原字体的系统上检查两种字重、生僻字规则名，以及 100%、125%、150%、200% 缩放下的字体和图集边缘。
