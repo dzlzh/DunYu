@@ -104,6 +104,11 @@ unsafe extern "system" fn procedure(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LR
             0
         }
         WM_NCDESTROY => {
+            let buffer = RemovePropW(h, wide("DunYu.BackBuffer").as_ptr())
+                as *mut Option<super::buffering::BackBuffer>;
+            if !buffer.is_null() {
+                drop(Box::from_raw(buffer));
+            }
             KillTimer(h, ANIMATION_TIMER);
             let fonts: Vec<_> = ["DunYu.RestFont", "DunYu.RestTitle", "DunYu.RestTimer"]
                 .iter()
@@ -150,6 +155,8 @@ unsafe fn pond_color(value: u32, system: i32) -> u32 {
     }
 }
 unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
+    #[cfg(test)]
+    let _measurement = super::ui::diagnostics::measure("paint");
     use windows_sys::Win32::Graphics::GdiPlus::*;
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
     let dc = if message == WM_PAINT {
@@ -159,26 +166,22 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
     };
     let mut r: RECT = std::mem::zeroed();
     GetClientRect(h, &mut r);
-    let dirty = if message == WM_PAINT { ps.rcPaint } else { r };
-    let memory = CreateCompatibleDC(dc);
-    let bitmap = CreateCompatibleBitmap(
-        dc,
-        (dirty.right - dirty.left).max(1),
-        (dirty.bottom - dirty.top).max(1),
-    );
-    if memory.is_null() || bitmap.is_null() {
-        if !bitmap.is_null() {
-            DeleteObject(bitmap);
-        }
-        if !memory.is_null() {
-            DeleteDC(memory);
-        }
-        if message == WM_PAINT {
-            EndPaint(h, &ps);
-        }
-        return;
-    }
-    let old = SelectObject(memory, bitmap);
+    #[cfg(test)]
+    let _role = super::ui::diagnostics::measure("paint.rest");
+    let mut dirty = if message == WM_PAINT { ps.rcPaint } else { r };
+    let cache =
+        GetPropW(h, wide("DunYu.BackBuffer").as_ptr()) as *mut Option<super::buffering::BackBuffer>;
+    let memory = if cache.is_null() {
+        None
+    } else {
+        super::buffering::BackBuffer::prepare(&mut *cache, dc, r.right, r.bottom)
+    };
+    let buffered = memory.is_some();
+    let memory = memory.unwrap_or_else(|| {
+        dirty = r;
+        dc
+    });
+    let saved = SaveDC(memory);
     let brush = CreateSolidBrush(pond_color(theme::BACKGROUND, COLOR_WINDOW));
     let buffer = RECT {
         left: 0,
@@ -305,20 +308,20 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
             DI_NORMAL,
         );
     }
-    BitBlt(
-        dc,
-        dirty.left,
-        dirty.top,
-        buffer.right,
-        buffer.bottom,
-        memory,
-        0,
-        0,
-        SRCCOPY,
-    );
-    SelectObject(memory, old);
-    DeleteObject(bitmap);
-    DeleteDC(memory);
+    if buffered {
+        BitBlt(
+            dc,
+            dirty.left,
+            dirty.top,
+            buffer.right,
+            buffer.bottom,
+            memory,
+            0,
+            0,
+            SRCCOPY,
+        );
+    }
+    RestoreDC(memory, saved);
     if message == WM_PAINT {
         EndPaint(h, &ps);
     }
@@ -562,22 +565,6 @@ impl Runtime {
             self.shown = None;
             return;
         }
-        if !preview {
-            self.scheduler.warning_presented(now);
-        }
-        if fullscreen && previous == Phase::Warning && self.scheduler.phase == Phase::Resting {
-            let mut point: POINT = std::mem::zeroed();
-            GetCursorPos(&mut point);
-            let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
-            if let Some(h) = self
-                .windows
-                .iter()
-                .find(|h| MonitorFromWindow(**h, MONITOR_DEFAULTTONEAREST) == monitor)
-            {
-                SetForegroundWindow(*h);
-                SetFocus(GetDlgItem(*h, 3));
-            }
-        }
         let seconds = if preview {
             (self.preview_until - now).div_ceil(1000)
         } else {
@@ -624,9 +611,13 @@ impl Runtime {
         };
         let stamp = GetTickCount64();
         for h in &self.windows {
-            SetWindowTextW(GetDlgItem(*h, 10), wide(&counter).as_ptr());
-            SetWindowTextW(GetDlgItem(*h, 12), wide(&heading).as_ptr());
-            SetWindowTextW(GetDlgItem(*h, 13), wide(body).as_ptr());
+            let _redraw = super::buffering::RedrawBatch::new(*h, *h);
+            for (id, text) in [(10, counter.as_str()), (12, heading.as_str()), (13, body)] {
+                let child = GetDlgItem(*h, id);
+                if title(child) != text {
+                    SetWindowTextW(child, wide(text).as_ptr());
+                }
+            }
             let duration = if preview {
                 5000
             } else if phase == Phase::Warning {
@@ -644,10 +635,39 @@ impl Runtime {
             SetPropW(*h, wide("DunYu.Stamp").as_ptr(), stamp as HANDLE);
             InvalidateRect(*h, null(), 0);
         }
+        // Every monitor's initial state is ready before any new window is shown.
+        for h in &self.windows {
+            if IsWindowVisible(*h) == 0 {
+                ShowWindow(*h, SW_SHOWNOACTIVATE);
+                RedrawWindow(
+                    *h,
+                    null(),
+                    null_mut(),
+                    RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+                );
+                update_animation(*h);
+            }
+        }
+        if !preview {
+            self.scheduler.warning_presented(now);
+        }
+        if fullscreen && previous == Phase::Warning && self.scheduler.phase == Phase::Resting {
+            let mut point: POINT = std::mem::zeroed();
+            GetCursorPos(&mut point);
+            let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+            if let Some(h) = self
+                .windows
+                .iter()
+                .find(|h| MonitorFromWindow(**h, MONITOR_DEFAULTTONEAREST) == monitor)
+            {
+                SetForegroundWindow(*h);
+                SetFocus(GetDlgItem(*h, 3));
+            }
+        }
     }
     unsafe fn create(&mut self, r: RECT, full: bool, phase: Phase, host: HWND) {
         let h = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_COMPOSITED,
             wide(REST_CLASS).as_ptr(),
             wide("遁鱼 · 休憩").as_ptr(),
             WS_POPUP | WS_CLIPCHILDREN,
@@ -662,6 +682,10 @@ impl Runtime {
         );
         if h.is_null() {
             return;
+        }
+        let buffer = Box::into_raw(Box::new(None::<super::buffering::BackBuffer>));
+        if SetPropW(h, wide("DunYu.BackBuffer").as_ptr(), buffer as HANDLE) == 0 {
+            drop(Box::from_raw(buffer));
         }
         SetWindowLongPtrW(h, GWLP_USERDATA, self.generation as isize);
         SetPropW(
@@ -912,8 +936,6 @@ impl Runtime {
         if !full {
             fit_card_counter(h, phase);
         }
-        update_animation(h);
-        ShowWindow(h, SW_SHOWNOACTIVATE);
         self.windows.push(h);
     }
     pub unsafe fn filter(msg: &MSG) -> bool {
@@ -1017,7 +1039,20 @@ mod tests {
     use super::*;
     #[test]
     fn preview_is_isolated_and_fullscreen_uses_each_monitor() {
+        struct Cleanup {
+            runtime: Runtime,
+            host: theme::TestWindow,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                unsafe {
+                    self.runtime.close();
+                    KillTimer(self.host.0, TIMER_ID);
+                }
+            }
+        }
         unsafe {
+            let _graphics = theme::TestGraphicsScope::new();
             windows_sys::Win32::UI::Controls::InitCommonControls();
             let host = CreateWindowExW(
                 0,
@@ -1034,7 +1069,11 @@ mod tests {
                 null(),
             );
             assert!(!host.is_null());
-            let mut runtime = Runtime::default();
+            let mut cleanup = Cleanup {
+                runtime: Runtime::default(),
+                host: theme::TestWindow(host),
+            };
+            let runtime = &mut cleanup.runtime;
             runtime.action(23, None, host);
             assert_eq!(runtime.windows.len(), 1);
             assert_eq!(runtime.scheduler.phase, Phase::Disabled);

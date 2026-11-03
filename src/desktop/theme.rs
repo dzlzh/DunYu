@@ -65,7 +65,47 @@ impl Drop for Theme {
     fn drop(&mut self) {
         unsafe {
             if self.token != 0 {
+                #[cfg(test)]
+                eprintln!("[graphics-cleanup] GdiplusShutdown({}) begin", self.token);
                 GdiplusShutdown(self.token);
+                #[cfg(test)]
+                eprintln!("[graphics-cleanup] GdiplusShutdown({}) end", self.token);
+            }
+        }
+    }
+}
+// Declare before test windows/fixtures so they are destroyed before this scope.
+// In particular, never leave GdiplusShutdown to Windows TLS detach callbacks.
+#[cfg(test)]
+pub(super) struct TestGraphicsScope(Option<Rc<Theme>>);
+#[cfg(test)]
+impl TestGraphicsScope {
+    pub(super) unsafe fn new() -> Self {
+        Self(Some(Theme::new()))
+    }
+}
+#[cfg(test)]
+impl Drop for TestGraphicsScope {
+    fn drop(&mut self) {
+        eprintln!("[graphics-cleanup] begin");
+        let paper = PAPER.with(|cache| std::mem::take(&mut *cache.borrow_mut()));
+        drop(paper);
+        super::assets::clear_test_cache();
+        eprintln!("[graphics-cleanup] GDI+ shutdown begin");
+        drop(self.0.take());
+        eprintln!("[graphics-cleanup] GDI+ shutdown end; fonts begin");
+        super::fonts::clear_test_cache();
+        eprintln!("[graphics-cleanup] end");
+    }
+}
+#[cfg(test)]
+pub(super) struct TestWindow(pub(super) HWND);
+#[cfg(test)]
+impl Drop for TestWindow {
+    fn drop(&mut self) {
+        unsafe {
+            if IsWindow(self.0) != 0 {
+                DestroyWindow(self.0);
             }
         }
     }
@@ -84,7 +124,23 @@ pub(super) enum Role {
     Slider,
     Gutter,
 }
+#[derive(PartialEq)]
+struct TabItemKey {
+    rect: [i32; 4],
+    visible: [i32; 4],
+    bounds: (i32, i32),
+    origin: (i32, i32),
+    canvas: (i32, i32, i32),
+    dpi: u32,
+    font: usize,
+}
+struct TabItemCache {
+    key: TabItemKey,
+    buffer: Option<super::buffering::BackBuffer>,
+}
 struct PaintState {
+    tabs: RefCell<[Option<TabItemCache>; super::ui::PAGES.len()]>,
+    buffer: Option<super::buffering::BackBuffer>,
     _theme: Rc<Theme>,
     role: Role,
     hot: bool,
@@ -108,6 +164,8 @@ impl Drop for PaintState {
 const SUBCLASS: usize = 0x44554e59;
 pub(super) unsafe fn attach(h: HWND, role: Role, theme: Rc<Theme>) {
     let state = Box::new(PaintState {
+        tabs: RefCell::new(std::array::from_fn(|_| None)),
+        buffer: None,
         _theme: theme,
         role,
         hot: false,
@@ -521,7 +579,185 @@ unsafe fn icon(dc: HDC, r: RECT, index: usize, value: u32) {
     GdipDeletePen(pen);
     GdipDeleteGraphics(graphics);
 }
-unsafe fn paint(h: HWND, dc: HDC, s: &PaintState) {
+unsafe fn tab_item(h: HWND, dc: HDC, dpi: u32, i: usize, mut item: RECT, selected: bool) {
+    let px = |v: i32| v * dpi as i32 / 96;
+    if selected {
+        if high_contrast() {
+            rounded(dc, inset(item, px(2)), px(8), SELECTION);
+        }
+        let mark = RECT {
+            left: item.left + px(12),
+            right: item.right - px(12),
+            top: item.bottom - px(6),
+            bottom: item.bottom - px(3),
+        };
+        super::assets::stroke(
+            dc,
+            RECT {
+                top: mark.top - px(2),
+                bottom: mark.bottom + px(2),
+                ..mark
+            },
+            true,
+        );
+    }
+    if selected && GetFocus() == h {
+        rounded(dc, inset(item, px(2)), px(8), ACCENT_TEXT);
+        rounded(dc, inset(item, px(4)), px(6), SELECTION);
+    }
+    let fg = if selected {
+        if high_contrast() { ON_ACCENT } else { INK }
+    } else {
+        INK
+    };
+    let label = super::ui::PAGES[i];
+    let font = SelectObject(dc, SendMessageW(h, WM_GETFONT, 0, 0) as _);
+    let mut size: SIZE = std::mem::zeroed();
+    GetTextExtentPoint32W(dc, wide(label).as_ptr(), 2, &mut size);
+    SelectObject(dc, font);
+    let left = (item.left + item.right - px(44) - size.cx) / 2;
+    let top = (item.top + item.bottom - px(20)) / 2;
+    let icon_rect = RECT {
+        left,
+        top: top - px(4),
+        right: left + px(36),
+        bottom: top + px(22),
+    };
+    {
+        #[cfg(test)]
+        let _icon = super::ui::diagnostics::measure("paint.tab.icon");
+        if high_contrast() {
+            icon(
+                dc,
+                icon_rect,
+                if i == 5 {
+                    4
+                } else if i == 4 {
+                    0
+                } else {
+                    i
+                },
+                fg,
+            );
+        } else {
+            super::assets::navigation(dc, icon_rect, i);
+        }
+    }
+    #[cfg(test)]
+    let _text = super::ui::diagnostics::measure("paint.tab.text");
+    item.left = left + px(44);
+    item.right = item.left + size.cx;
+    text(dc, h, label, item, fg, DT_LEFT);
+}
+
+unsafe fn paint_tabs(h: HWND, dc: HDC, s: &PaintState, cache_enabled: bool) {
+    let mut bounds: RECT = std::mem::zeroed();
+    GetClientRect(h, &mut bounds);
+    fill(dc, bounds, BACKGROUND);
+    let selected = SendMessageW(h, TCM_GETCURSEL, 0, 0);
+    let mut origin = POINT { x: 0, y: 0 };
+    MapWindowPoints(h, GetAncestor(h, GA_ROOT), &mut origin, 1);
+    let font = SendMessageW(h, WM_GETFONT, 0, 0) as usize;
+    let contrast = high_contrast();
+    let cache_enabled = cache_enabled && !contrast;
+    for i in 0..super::ui::PAGES.len() {
+        let mut item: RECT = std::mem::zeroed();
+        SendMessageW(h, TCM_GETITEMRECT, i, &mut item as *mut _ as isize);
+        if selected == i as isize {
+            #[cfg(test)]
+            let _active = super::ui::diagnostics::measure("paint.tab.active");
+            tab_item(h, dc, s.dpi, i, item, true);
+            continue;
+        }
+        // Keep the original coordinates for rasterization, but store only pixels
+        // that exist in the host buffer. Native tabs can exceed its height.
+        let visible = RECT {
+            top: item.top.max(bounds.top),
+            bottom: item.bottom.min(bounds.bottom),
+            ..item
+        };
+        let width = visible.right - visible.left;
+        let height = visible.bottom - visible.top;
+        let fallback = if contrast {
+            Some("paint.tab.fallback.high_contrast")
+        } else if !cache_enabled {
+            Some("paint.tab.fallback.no_buffer")
+        } else if width <= 0 || height <= 0 {
+            Some("paint.tab.fallback.empty")
+        } else if item.left < bounds.left || item.right > bounds.right {
+            Some("paint.tab.fallback.horizontal_clip")
+        } else {
+            None
+        };
+        if let Some(_reason) = fallback {
+            #[cfg(test)]
+            let _fallback = super::ui::diagnostics::measure(_reason);
+            tab_item(h, dc, s.dpi, i, item, false);
+            continue;
+        }
+        let key = TabItemKey {
+            rect: [item.left, item.top, item.right, item.bottom],
+            visible: [visible.left, visible.top, visible.right, visible.bottom],
+            bounds: (bounds.right, bounds.bottom),
+            origin: (origin.x, origin.y),
+            canvas: CANVAS.get(),
+            dpi: s.dpi,
+            font,
+        };
+        let mut tabs = s.tabs.borrow_mut();
+        if let Some(entry) = tabs[i].as_mut().filter(|entry| entry.key == key)
+            && let Some(memory) =
+                super::buffering::BackBuffer::prepare(&mut entry.buffer, dc, width, height)
+        {
+            #[cfg(test)]
+            let _copy = super::ui::diagnostics::measure("paint.tab.cache_copy");
+            if BitBlt(
+                dc,
+                visible.left,
+                visible.top,
+                width,
+                height,
+                memory,
+                0,
+                0,
+                SRCCOPY,
+            ) != 0
+            {
+                continue;
+            }
+            #[cfg(test)]
+            let _failure = super::ui::diagnostics::measure("paint.tab.fallback.copy_failed");
+        }
+        #[cfg(test)]
+        let _build = super::ui::diagnostics::measure("paint.tab.cache_build");
+        tab_item(h, dc, s.dpi, i, item, false);
+        // Copy from the completed frame to preserve exact text rasterization and
+        // paper alignment; no coordinate transforms or transparent text layers.
+        let mut buffer = None;
+        let memory = super::buffering::BackBuffer::prepare(&mut buffer, dc, width, height);
+        tabs[i] = memory
+            .filter(|&memory| {
+                BitBlt(
+                    memory,
+                    0,
+                    0,
+                    width,
+                    height,
+                    dc,
+                    visible.left,
+                    visible.top,
+                    SRCCOPY,
+                ) != 0
+            })
+            .map(|_| TabItemCache { key, buffer });
+        #[cfg(test)]
+        if tabs[i].is_none() {
+            let _failure = super::ui::diagnostics::measure("paint.tab.fallback.store_failed");
+        }
+    }
+}
+
+unsafe fn paint(h: HWND, dc: HDC, s: &PaintState, cache_enabled: bool) {
     canvas(h);
     let mut r: RECT = std::mem::zeroed();
     GetClientRect(h, &mut r);
@@ -833,75 +1069,7 @@ unsafe fn paint(h: HWND, dc: HDC, s: &PaintState) {
                 DT_CENTER,
             );
         }
-        Role::Tab => {
-            fill(dc, r, BACKGROUND);
-            let selected = SendMessageW(h, TCM_GETCURSEL, 0, 0);
-            for i in 0..super::ui::PAGES.len() {
-                let mut item: RECT = std::mem::zeroed();
-                SendMessageW(h, TCM_GETITEMRECT, i, &mut item as *mut _ as isize);
-                if selected == i as isize {
-                    if high_contrast() {
-                        rounded(dc, inset(item, px(2)), px(8), SELECTION);
-                    }
-                    let mark = RECT {
-                        left: item.left + px(12),
-                        right: item.right - px(12),
-                        top: item.bottom - px(6),
-                        bottom: item.bottom - px(3),
-                    };
-                    super::assets::stroke(
-                        dc,
-                        RECT {
-                            top: mark.top - px(2),
-                            bottom: mark.bottom + px(2),
-                            ..mark
-                        },
-                        true,
-                    );
-                }
-                if selected == i as isize && GetFocus() == h {
-                    rounded(dc, inset(item, px(2)), px(8), ACCENT_TEXT);
-                    rounded(dc, inset(item, px(4)), px(6), SELECTION);
-                }
-                let fg = if selected == i as isize {
-                    if high_contrast() { ON_ACCENT } else { INK }
-                } else {
-                    INK
-                };
-                let label = super::ui::PAGES[i];
-                let font = SelectObject(dc, SendMessageW(h, WM_GETFONT, 0, 0) as _);
-                let mut size: SIZE = std::mem::zeroed();
-                GetTextExtentPoint32W(dc, wide(label).as_ptr(), 2, &mut size);
-                SelectObject(dc, font);
-                let left = (item.left + item.right - px(44) - size.cx) / 2;
-                let top = (item.top + item.bottom - px(20)) / 2;
-                let icon_rect = RECT {
-                    left,
-                    top: top - px(4),
-                    right: left + px(36),
-                    bottom: top + px(22),
-                };
-                if high_contrast() {
-                    icon(
-                        dc,
-                        icon_rect,
-                        if i == 5 {
-                            4
-                        } else if i == 4 {
-                            0
-                        } else {
-                            i
-                        },
-                        fg,
-                    );
-                } else {
-                    super::assets::navigation(dc, icon_rect, i);
-                }
-                item.left = left + px(44);
-                item.right = item.left + size.cx;
-                text(dc, h, label, item, fg, DT_LEFT);
-            }
-        }
+        Role::Tab => paint_tabs(h, dc, s, cache_enabled),
         _ => {}
     }
 }
@@ -921,6 +1089,14 @@ unsafe extern "system" fn procedure(
         return DefSubclassProc(h, m, w, l);
     }
     let role = (*ptr).role;
+    if role == Role::Tab
+        && matches!(
+            m,
+            WM_SETFONT | WM_SETTINGCHANGE | WM_THEMECHANGED | WM_SYSCOLORCHANGE
+        )
+    {
+        *(*ptr).tabs.borrow_mut() = std::array::from_fn(|_| None);
+    }
     match m {
         WM_SETFONT if matches!(role, Role::Edit | Role::Tab) && w != 0 => {
             let mut lf: LOGFONTW = std::mem::zeroed();
@@ -1030,6 +1206,8 @@ unsafe extern "system" fn procedure(
             ) =>
         {
             let mut ps: PAINTSTRUCT = std::mem::zeroed();
+            #[cfg(test)]
+            let _measurement = super::ui::diagnostics::measure("paint");
             let dc = if m == WM_PAINT {
                 BeginPaint(h, &mut ps)
             } else {
@@ -1038,21 +1216,35 @@ unsafe extern "system" fn procedure(
             let saved = SaveDC(dc);
             let mut bounds: RECT = std::mem::zeroed();
             GetClientRect(h, &mut bounds);
-            let memory = CreateCompatibleDC(dc);
-            let bitmap = CreateCompatibleBitmap(dc, bounds.right.max(1), bounds.bottom.max(1));
-            if !memory.is_null() && !bitmap.is_null() {
-                let original = SelectObject(memory, bitmap);
-                paint(h, memory, &*ptr);
-                BitBlt(dc, 0, 0, bounds.right, bounds.bottom, memory, 0, 0, SRCCOPY);
-                SelectObject(memory, original);
+            #[cfg(test)]
+            let _role = super::ui::diagnostics::measure(match role {
+                Role::Surface => "paint.surface",
+                Role::Tab => "paint.tab",
+                Role::Brand => "paint.brand",
+                Role::Heading => "paint.heading",
+                _ => "paint.control",
+            });
+            let memory = super::buffering::BackBuffer::prepare(
+                &mut (*ptr).buffer,
+                dc,
+                bounds.right,
+                bounds.bottom,
+            );
+            if let Some(memory) = memory {
+                let state = SaveDC(memory);
+                {
+                    #[cfg(test)]
+                    let _draw = super::ui::diagnostics::measure("paint.draw");
+                    paint(h, memory, &*ptr, true);
+                }
+                {
+                    #[cfg(test)]
+                    let _copy = super::ui::diagnostics::measure("paint.copy");
+                    BitBlt(dc, 0, 0, bounds.right, bounds.bottom, memory, 0, 0, SRCCOPY);
+                }
+                RestoreDC(memory, state);
             } else {
-                paint(h, dc, &*ptr);
-            }
-            if !bitmap.is_null() {
-                DeleteObject(bitmap);
-            }
-            if !memory.is_null() {
-                DeleteDC(memory);
+                paint(h, dc, &*ptr, false);
             }
             RestoreDC(dc, saved);
             if m == WM_PAINT {
@@ -1320,4 +1512,352 @@ pub(super) unsafe fn sync_list_scroll(list: HWND) {
         nTrackPos: 0,
     };
     SetScrollInfo(bar, SB_CTL, &si, 1);
+}
+
+#[cfg(test)]
+pub(super) unsafe fn verify_navigation_for_test(h: HWND) {
+    unsafe { navigation_tests::verify_real_control(h) }
+}
+
+#[cfg(test)]
+pub(super) unsafe fn navigation_geometry(h: HWND) -> serde_json::Value {
+    let mut bounds: RECT = std::mem::zeroed();
+    GetClientRect(h, &mut bounds);
+    let items: Vec<_> = (0..super::ui::PAGES.len()).map(|i| {
+        let mut r: RECT = std::mem::zeroed();
+        SendMessageW(h, TCM_GETITEMRECT, i, &mut r as *mut _ as isize);
+        serde_json::json!({"index":i,"rect":[r.left,r.top,r.right,r.bottom],
+            "visible":[r.left.max(bounds.left),r.top.max(bounds.top),r.right.min(bounds.right),r.bottom.min(bounds.bottom)]})
+    }).collect();
+    serde_json::json!({"client":[bounds.left,bounds.top,bounds.right,bounds.bottom],
+        "high_contrast":high_contrast(),"items":items})
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::*;
+    struct Pixels {
+        dc: HDC,
+        bitmap: HBITMAP,
+        old: HGDIOBJ,
+        data: *const u8,
+        len: usize,
+    }
+    impl Pixels {
+        unsafe fn new(width: i32, height: i32) -> Self {
+            unsafe {
+                let dc = CreateCompatibleDC(null_mut());
+                let mut info: BITMAPINFO = std::mem::zeroed();
+                info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+                info.bmiHeader.biWidth = width;
+                info.bmiHeader.biHeight = -height;
+                info.bmiHeader.biPlanes = 1;
+                info.bmiHeader.biBitCount = 32;
+                let mut data = null_mut();
+                let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut data, null_mut(), 0);
+                assert!(!dc.is_null() && !bitmap.is_null());
+                let old = SelectObject(dc, bitmap);
+                Self {
+                    dc,
+                    bitmap,
+                    old,
+                    data: data as _,
+                    len: width as usize * height as usize * 4,
+                }
+            }
+        }
+        unsafe fn rgb(&self) -> Vec<u8> {
+            unsafe {
+                GdiFlush();
+                std::slice::from_raw_parts(self.data, self.len)
+                    .chunks_exact(4)
+                    .flat_map(|p| p[..3].iter().copied())
+                    .collect()
+            }
+        }
+    }
+    impl Drop for Pixels {
+        fn drop(&mut self) {
+            unsafe {
+                SelectObject(self.dc, self.old);
+                DeleteObject(self.bitmap);
+                DeleteDC(self.dc);
+            }
+        }
+    }
+    pub(super) unsafe fn verify_real_control(h: HWND) {
+        unsafe {
+            let mut ptr = 0;
+            assert_ne!(GetWindowSubclass(h, Some(procedure), SUBCLASS, &mut ptr), 0);
+            let mut bounds: RECT = std::mem::zeroed();
+            GetClientRect(h, &mut bounds);
+            let actual = Pixels::new(bounds.right, bounds.bottom);
+            let expected = Pixels::new(bounds.right, bounds.bottom);
+            let state = &*(ptr as *const PaintState);
+            paint(h, actual.dc, state, true);
+            let counters = super::super::ui::diagnostics::capture_counters(|| {
+                paint(h, actual.dc, state, true);
+            });
+            paint(h, expected.dc, state, false);
+            assert!(
+                actual.rgb() == expected.rgb(),
+                "real navigation pixels differ"
+            );
+            if !high_contrast() {
+                assert_eq!(
+                    counters.get("paint.tab.cache_copy").map(|v| v.0),
+                    Some(5),
+                    "real navigation cache unused: {}; {counters:?}",
+                    navigation_geometry(h)
+                );
+                assert!(
+                    !counters.contains_key("buffer.allocate"),
+                    "warm navigation allocated"
+                );
+            }
+        }
+    }
+    #[test]
+    #[ignore = "requires an interactive Windows desktop"]
+    fn cached_navigation_matches_original() {
+        unsafe {
+            let graphics = TestGraphicsScope::new();
+            InitCommonControls();
+            let root = CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                wide("Navigation cache verification").as_ptr(),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                0,
+                0,
+                1100,
+                250,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            let _root_owner = TestWindow(root);
+            let tab = CreateWindowExW(
+                0,
+                wide("SysTabControl32").as_ptr(),
+                wide("").as_ptr(),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | TCS_FIXEDWIDTH,
+                20,
+                20,
+                900,
+                70,
+                root,
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            assert!(!root.is_null() && !tab.is_null());
+            attach(tab, Role::Tab, Theme::new());
+            for (i, label) in super::super::ui::PAGES.iter().enumerate() {
+                let mut label = wide(label);
+                let entry = TCITEMW {
+                    mask: TCIF_TEXT,
+                    pszText: label.as_mut_ptr(),
+                    ..std::mem::zeroed()
+                };
+                SendMessageW(tab, TCM_INSERTITEMW, i, &entry as *const _ as isize);
+            }
+            let mut ptr = 0;
+            assert_ne!(
+                GetWindowSubclass(tab, Some(procedure), SUBCLASS, &mut ptr),
+                0
+            );
+            for dpi in [96, 120, 144, 192] {
+                for (base_width, base_height) in [
+                    (900, 51),
+                    (900, 52),
+                    (900, 70),
+                    (960, 51),
+                    (960, 52),
+                    (960, 70),
+                ] {
+                    let width = base_width * dpi / 96;
+                    let height = base_height * dpi / 96;
+                    SetWindowPos(
+                        root,
+                        null_mut(),
+                        0,
+                        0,
+                        width + 80,
+                        height + 120,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                    SetWindowPos(
+                        tab,
+                        null_mut(),
+                        20,
+                        20,
+                        width,
+                        height,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                    let mut lf: LOGFONTW = std::mem::zeroed();
+                    lf.lfHeight = -27 * dpi / 96;
+                    let font = CreateFontIndirectW(&lf);
+                    SendMessageW(tab, WM_SETFONT, font as usize, 0);
+                    DeleteObject(font);
+                    assert!(
+                        (*(ptr as *const PaintState))
+                            .tabs
+                            .borrow()
+                            .iter()
+                            .all(Option::is_none)
+                    );
+                    scene(tab, dpi as u32, vec![], vec![]);
+                    let item_width =
+                        super::super::design::navigation_item_width(width, dpi as u32, 6);
+                    SendMessageW(
+                        tab,
+                        TCM_SETITEMSIZE,
+                        0,
+                        ((51 * dpi / 96) << 16 | item_width) as isize,
+                    );
+                    let actual = Pixels::new(width, height);
+                    let expected = Pixels::new(width, height);
+                    for _ in 0..2 {
+                        for page in 0..6 {
+                            SendMessageW(tab, TCM_SETCURSEL, page, 0);
+                            for focused in [false, true] {
+                                SetFocus(if focused { tab } else { root });
+                                assert_eq!(GetFocus() == tab, focused);
+                                let state = &*(ptr as *const PaintState);
+                                paint(tab, actual.dc, state, true);
+                                canvas(tab);
+                                SetBrushOrgEx(expected.dc, -20, -20, null_mut());
+                                paint_tabs(tab, expected.dc, state, false);
+                                let a = actual.rgb();
+                                let b = expected.rgb();
+                                assert!(
+                                    a == b,
+                                    "navigation mismatch at DPI {dpi}, width {width}, page {page}, focus {focused}; first byte {:?}",
+                                    a.iter().zip(&b).position(|(a, b)| a != b)
+                                );
+                                let handles: Vec<_> = state
+                                    .tabs
+                                    .borrow()
+                                    .iter()
+                                    .map(|e| {
+                                        e.as_ref()
+                                            .and_then(|e| e.buffer.as_ref())
+                                            .map(|b| b.dc_for_test())
+                                    })
+                                    .collect();
+                                let counters =
+                                    super::super::ui::diagnostics::capture_counters(|| {
+                                        paint(tab, actual.dc, state, true);
+                                    });
+                                if !high_contrast() {
+                                    assert_eq!(
+                                        counters.get("paint.tab.cache_copy").map(|v| v.0),
+                                        Some(5),
+                                        "cache not used at DPI {dpi}, height {height}, page {page}: {counters:?}"
+                                    );
+                                }
+                                assert!(actual.rgb() == b, "cached repaint differs");
+                                assert_eq!(
+                                    handles,
+                                    state
+                                        .tabs
+                                        .borrow()
+                                        .iter()
+                                        .map(|e| e
+                                            .as_ref()
+                                            .and_then(|e| e.buffer.as_ref())
+                                            .map(|b| b.dc_for_test()))
+                                        .collect::<Vec<_>>()
+                                );
+                            }
+                        }
+                    }
+                    // Change background geometry and position without a font/theme
+                    // message: key comparison alone must reject the old pixels.
+                    SetWindowPos(
+                        root,
+                        null_mut(),
+                        0,
+                        0,
+                        width + 100,
+                        height + 160,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                    SetWindowPos(
+                        tab,
+                        null_mut(),
+                        30,
+                        25,
+                        width - 12,
+                        height,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                    let resized_actual = Pixels::new(width - 12, height);
+                    let resized_expected = Pixels::new(width - 12, height);
+                    let state = &*(ptr as *const PaintState);
+                    paint(tab, resized_actual.dc, state, true);
+                    canvas(tab);
+                    SetBrushOrgEx(resized_expected.dc, -30, -25, null_mut());
+                    paint_tabs(tab, resized_expected.dc, state, false);
+                    assert!(
+                        resized_actual.rgb() == resized_expected.rgb(),
+                        "stale cache after move/resize"
+                    );
+                    SendMessageW(tab, WM_THEMECHANGED, 0, 0);
+                    assert!(
+                        (*(ptr as *const PaintState))
+                            .tabs
+                            .borrow()
+                            .iter()
+                            .all(Option::is_none)
+                    );
+                }
+            }
+            paint(
+                tab,
+                Pixels::new(1920, 140).dc,
+                &*(ptr as *const PaintState),
+                true,
+            );
+            let state = &mut *(ptr as *mut PaintState);
+            let mut releases: Vec<_> = state
+                .tabs
+                .borrow_mut()
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(index, entry)| {
+                    entry.as_mut()?.buffer.as_mut().map(|buffer| {
+                        (format!("navigation item {index}"), buffer.observe_release())
+                    })
+                })
+                .collect();
+            if !high_contrast() {
+                assert!(!releases.is_empty(), "no navigation caches to verify");
+            }
+            if let Some(buffer) = state.buffer.as_mut() {
+                releases.push(("navigation paint buffer".into(), buffer.observe_release()));
+            }
+            assert_ne!(
+                DestroyWindow(root),
+                0,
+                "DestroyWindow failed: {}",
+                std::io::Error::last_os_error()
+            );
+            assert_eq!(IsWindow(root), 0, "root window remains after destruction");
+            assert_eq!(IsWindow(tab), 0, "tab window remains after destruction");
+            for (context, probe) in &releases {
+                probe.assert_released(context);
+            }
+            println!(
+                "Navigation checks completed; {} observed buffers released successfully. Cleanup follows.",
+                releases.len()
+            );
+            drop(_root_owner);
+            drop(graphics);
+            println!("Navigation cleanup completed; awaiting test runner result.");
+        }
+    }
 }

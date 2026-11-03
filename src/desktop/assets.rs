@@ -67,13 +67,21 @@ impl Drop for Image {
     fn drop(&mut self) {
         unsafe {
             if !self.image.is_null() {
+                #[cfg(test)]
+                eprintln!("[graphics-cleanup] GdipDisposeImage begin");
                 GdipDisposeImage(self.image);
+                #[cfg(test)]
+                eprintln!("[graphics-cleanup] GdipDisposeImage end");
             }
             if !self.stream.is_null() {
+                #[cfg(test)]
+                eprintln!("[graphics-cleanup] image stream Release begin");
                 let table = *(self.stream as *mut *mut usize);
                 let release: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32 =
                     std::mem::transmute(*table.add(2));
                 release(self.stream);
+                #[cfg(test)]
+                eprintln!("[graphics-cleanup] image stream Release end");
             }
         }
     }
@@ -257,4 +265,21 @@ pub(super) unsafe fn stroke(dc: HDC, r: RECT, red: bool) {
             GdipDeleteGraphics(g);
         }
     });
+}
+
+// Drop cached images/streams while ordinary thread execution is still active.
+#[cfg(test)]
+pub(super) fn clear_test_cache() {
+    for (name, cache) in [
+        ("NAV", &NAV),
+        ("KOI", &KOI),
+        ("MAIN", &MAIN),
+        ("FULL", &FULL),
+        ("CARD", &CARD),
+    ] {
+        eprintln!("[graphics-cleanup] image {name} begin");
+        let image = cache.with(|cache| cache.borrow_mut().take());
+        drop(image);
+        eprintln!("[graphics-cleanup] image {name} end");
+    }
 }

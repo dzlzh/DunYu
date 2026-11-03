@@ -162,7 +162,10 @@ pub(super) unsafe fn text_at(h: HWND, id: i32) -> String {
     String::from_utf16_lossy(&b[..n as usize])
 }
 pub(super) unsafe fn set_text(h: HWND, id: i32, s: &str) {
-    SetWindowTextW(item(h, id), wide(s).as_ptr());
+    let child = item(h, id);
+    if title(child) != s {
+        SetWindowTextW(child, wide(s).as_ptr());
+    }
 }
 pub(super) unsafe fn checked(h: HWND, id: i32) -> bool {
     SendMessageW(item(h, id), BM_GETCHECK, 0, 0) == 1
@@ -276,15 +279,24 @@ pub(super) unsafe fn field(u: &mut Ui, page: usize, label: &str, id: i32, y: i32
 }
 impl App {
     pub(super) unsafe fn open_ui(&mut self) {
-        if let Some(u) = &self.ui {
-            ShowWindow(u.window, SW_SHOW);
-            SetForegroundWindow(u.window);
-            self.refresh_state();
+        if let Some(window) = self.ui.as_ref().map(|u| u.window) {
+            {
+                let _redraw = super::buffering::RedrawBatch::new(window, window);
+                self.refresh_state();
+            }
+            ShowWindow(window, SW_SHOW);
+            RedrawWindow(
+                window,
+                null(),
+                null_mut(),
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+            );
+            SetForegroundWindow(window);
             return;
         }
         let target = GetForegroundWindow();
         let h = CreateWindowExW(
-            WS_EX_CONTROLPARENT,
+            WS_EX_CONTROLPARENT | WS_EX_COMPOSITED,
             wide("DunYu.Settings.1").as_ptr(),
             wide("遁鱼 DunYu").as_ptr(),
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
@@ -1178,11 +1190,21 @@ impl App {
         self.layout(true);
     }
     unsafe fn layout(&mut self, scrolling: bool) {
+        #[cfg(test)]
+        let _measurement = diagnostics::measure("layout");
         let Some(u) = self.ui.as_mut() else { return };
+        let _redraw = super::buffering::RedrawBatch::new(
+            u.window,
+            if scrolling { u.content } else { u.window },
+        );
         if !scrolling {
             for (toggle, ids) in [(800, [801, 802, 815]), (817, [804, 803, 816])] {
                 for id in ids {
-                    EnableWindow(item(u.window, id), i32::from(checked(u.window, toggle)));
+                    let child = item(u.window, id);
+                    let enabled = checked(u.window, toggle);
+                    if (IsWindowEnabled(child) != 0) != enabled {
+                        EnableWindow(child, i32::from(enabled));
+                    }
                 }
             }
         }
@@ -1293,7 +1315,7 @@ impl App {
         }
         u.scroll = u.scroll.clamp(0, (extent - viewport).max(0));
         // Suppress intermediate paints; child geometry and paint snapshots form one frame.
-        SendMessageW(u.content, WM_SETREDRAW, 0, 0);
+
         if !scrolling {
             MoveWindow(u.content, 0, scale(76), client.right, scale(viewport), 0);
         }
@@ -1649,8 +1671,16 @@ impl App {
                     area
                 };
             let visible = (*page == 99 || *page == u.page) && area.is_some();
-            if !visible {
-                ShowWindow(*c, SW_HIDE);
+            if !visible && GetWindowLongPtrW(*c, GWL_STYLE) as u32 & WS_VISIBLE != 0 {
+                placements.push((
+                    *c,
+                    RECT {
+                        left: 0,
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                    },
+                ));
             }
             if let Some((x, y, w, h)) = area {
                 let root = *page == 99 || matches!(id, 113 | 330 | 506);
@@ -1709,7 +1739,20 @@ impl App {
                     r.bottom -= bottom;
                 }
                 if visible {
-                    placements.push((*c, r));
+                    let mut current: RECT = std::mem::zeroed();
+                    GetWindowRect(*c, &mut current);
+                    MapWindowPoints(
+                        null_mut(),
+                        GetParent(*c),
+                        &mut current as *mut _ as *mut POINT,
+                        2,
+                    );
+                    if GetWindowLongPtrW(*c, GWL_STYLE) as u32 & WS_VISIBLE == 0
+                        || (current.left, current.top, current.right, current.bottom)
+                            != (r.left, r.top, r.right, r.bottom)
+                    {
+                        placements.push((*c, r));
+                    }
                 }
                 theme::scene(*c, u.dpi, vec![], vec![]);
             }
@@ -1754,7 +1797,11 @@ impl App {
                     r.top,
                     (r.right - r.left).max(1),
                     (r.bottom - r.top).max(1),
-                    flags,
+                    if r.right == 0 && r.bottom == 0 {
+                        (flags & !SWP_SHOWWINDOW) | SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE
+                    } else {
+                        flags
+                    },
                 );
             }
             if batch.is_null() || EndDeferWindowPos(batch) == 0 {
@@ -1766,7 +1813,11 @@ impl App {
                         r.top,
                         (r.right - r.left).max(1),
                         (r.bottom - r.top).max(1),
-                        flags,
+                        if r.right == 0 && r.bottom == 0 {
+                            (flags & !SWP_SHOWWINDOW) | SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE
+                        } else {
+                            flags
+                        },
                     );
                 }
             }
@@ -1788,13 +1839,7 @@ impl App {
         }
         SendMessageW(u.list, LB_SETTOPINDEX, (u.list_scroll / 64) as usize, 0);
         theme::sync_list_scroll(u.list);
-        SendMessageW(u.content, WM_SETREDRAW, 1, 0);
-        RedrawWindow(
-            if scrolling { u.content } else { u.window },
-            null(),
-            null_mut(),
-            RDW_INVALIDATE | RDW_ALLCHILDREN | if scrolling { 0 } else { RDW_ERASE | RDW_FRAME },
-        );
+
         if scrolling {
             for id in [9003, 9004] {
                 InvalidateRect(item(u.window, id), null(), 0);
@@ -1894,7 +1939,10 @@ impl App {
                 .unwrap_or("目标窗口不可用，请重新捕获".into()),
         );
         for id in [402, 403] {
-            EnableWindow(item(u.window, id), i32::from(value.is_some()));
+            let child = item(u.window, id);
+            if (IsWindowEnabled(child) != 0) != value.is_some() {
+                EnableWindow(child, i32::from(value.is_some()));
+            }
         }
         if value.is_some() && u.pending_opacity.is_some() {
             return;
@@ -1909,6 +1957,10 @@ impl App {
     }
 
     pub(super) unsafe fn page(&mut self, page: usize) {
+        let Some(window) = self.ui.as_ref().map(|u| u.window) else {
+            return;
+        };
+        let _redraw = super::buffering::RedrawBatch::new(window, window);
         super::recorder::stop();
         if let Some(u) = &mut self.ui {
             u.page = page;
@@ -1916,22 +1968,12 @@ impl App {
             u.motions[0].snap(0.);
             u.motions[1].snap(u.list_scroll as f64);
             SendMessageW(item(u.window, 9), TCM_SETCURSEL, page, 0);
-            for i in 0..4 {
-                let label = self
-                    .slots
-                    .get(i)
-                    .and_then(|t| t.as_ref())
-                    .filter(|t| t.valid())
-                    .map(|t| title(handle(t.hwnd)))
-                    .unwrap_or("尚未绑定".into());
-                set_text(u.window, 340 + i as i32, &label);
-            }
         }
         if let Some(u) = &self.ui {
             set_text(u.window, 810, &self.rest.status());
         }
-        self.layout_ui();
         self.refresh_state();
+        self.layout_ui();
     }
     pub(super) unsafe fn refresh_list(&mut self) {
         if let Some(u) = &self.ui {
@@ -1954,6 +1996,8 @@ impl App {
         }
     }
     pub(super) unsafe fn fill_rule(&mut self, index: Option<usize>) {
+        let window = self.ui.as_ref().unwrap().window;
+        let _redraw = super::buffering::RedrawBatch::new(window, window);
         let u = self.ui.as_mut().unwrap();
         u.selected = index;
         let default = SummonRule {
@@ -2336,99 +2380,148 @@ pub(super) unsafe fn autostart(enabled: bool) -> Result<(), String> {
 mod capture_tests {
     use super::*;
 
+    pub(super) struct Fixture {
+        pub(super) app: App,
+        external: HWND,
+        _graphics: theme::TestGraphicsScope,
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            unsafe {
+                self.app.rest.close();
+                self.app.restore_all();
+                for record in &self.app.records {
+                    if record.token.valid() {
+                        RemovePropW(handle(record.token.hwnd), wide(PROP).as_ptr());
+                    }
+                }
+                if let Some(u) = &self.app.ui {
+                    DestroyWindow(u.window);
+                    DeleteObject(u.font);
+                    DeleteObject(u.heading_font);
+                    DeleteObject(u.value_font);
+                }
+                DestroyWindow(self.app.host);
+                if IsWindow(self.external) != 0 {
+                    DestroyWindow(self.external);
+                }
+                let _ = std::fs::remove_dir_all(&self.app.dir);
+            }
+        }
+    }
+    pub(super) unsafe fn fixture() -> Fixture {
+        let graphics = theme::TestGraphicsScope::new();
+        let classes: [(&str, WNDPROC); 2] = [
+            ("DunYu.Settings.1", Some(procedure)),
+            ("DunYu.Content.1", Some(content_proc)),
+        ];
+        for (name, proc) in classes {
+            let mut wc: WNDCLASSW = std::mem::zeroed();
+            let name = wide(name);
+            wc.lpszClassName = name.as_ptr();
+            wc.lpfnWndProc = proc;
+            wc.hInstance = GetModuleHandleW(null());
+            wc.hbrBackground = (COLOR_BTNFACE + 1) as HBRUSH;
+            assert_ne!(RegisterClassW(&wc), 0);
+        }
+        InitCommonControls();
+        let create = |label: &str| {
+            CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                wide(label).as_ptr(),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                200,
+                200,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            )
+        };
+        let host = create("UI test host");
+        let external = create("UI test target");
+        let dir = std::env::temp_dir().join(format!("dunyu-ui-test-{}", std::process::id()));
+        let mut f = Fixture {
+            app: App {
+                host,
+                config: AppConfig::default(),
+                dir,
+                records: vec![],
+                slots: vec![None; 4],
+                targets: HashMap::new(),
+                keys: HashMap::new(),
+                next_id: 0,
+                pending: vec![],
+                ui: None,
+                hook: null_mut(),
+                taskbar: 0,
+                can_write: true,
+                launch_results: Default::default(),
+                rest: Default::default(),
+            },
+            external,
+            _graphics: graphics,
+        };
+        let app = &mut f.app;
+        // Pretend unchanged default keys are already registered: this test covers
+        // editor persistence, not registration, and must not reserve global keys.
+        for (i, (key, cmd)) in app.config.bindings().into_iter().enumerate() {
+            app.keys.insert(i as i32 + 1, (key, cmd));
+        }
+        app.open_ui();
+
+        app.ui.as_mut().unwrap().target = None;
+        app.refresh_state();
+        f
+    }
+
     #[test]
-    fn editor_drafts_selection_layout_and_target_state() {
+    #[ignore = "requires an interactive Windows desktop"]
+    fn real_navigation_uses_cache() {
         unsafe {
-            let classes: [(&str, WNDPROC); 2] = [
-                ("DunYu.Settings.1", Some(procedure)),
-                ("DunYu.Content.1", Some(content_proc)),
-            ];
-            for (name, proc) in classes {
-                let mut wc: WNDCLASSW = std::mem::zeroed();
-                let name = wide(name);
-                wc.lpszClassName = name.as_ptr();
-                wc.lpfnWndProc = proc;
-                wc.hInstance = GetModuleHandleW(null());
-                wc.hbrBackground = (COLOR_BTNFACE + 1) as HBRUSH;
-                assert_ne!(RegisterClassW(&wc), 0);
-            }
-            InitCommonControls();
-            let create = |label: &str| {
-                CreateWindowExW(
-                    0,
-                    wide("STATIC").as_ptr(),
-                    wide(label).as_ptr(),
-                    WS_OVERLAPPEDWINDOW,
-                    0,
-                    0,
-                    200,
-                    200,
+            let mut f = fixture();
+            let h = f.app.ui.as_ref().unwrap().window;
+            let dpi = f.app.ui.as_ref().unwrap().dpi as i32;
+            for width in [900, 1024] {
+                let mut outer: RECT = std::mem::zeroed();
+                let mut client: RECT = std::mem::zeroed();
+                GetWindowRect(h, &mut outer);
+                GetClientRect(h, &mut client);
+                SetWindowPos(
+                    h,
                     null_mut(),
-                    null_mut(),
-                    GetModuleHandleW(null()),
-                    null(),
-                )
-            };
-            let host = create("UI test host");
-            let external = create("UI test target");
-            let dir = std::env::temp_dir().join(format!("dunyu-ui-test-{}", std::process::id()));
-            struct Fixture {
-                app: App,
-                external: HWND,
-            }
-            impl Drop for Fixture {
-                fn drop(&mut self) {
-                    unsafe {
-                        self.app.restore_all();
-                        for record in &self.app.records {
-                            if record.token.valid() {
-                                RemovePropW(handle(record.token.hwnd), wide(PROP).as_ptr());
-                            }
+                    0,
+                    0,
+                    width * dpi / 96 + outer.right - outer.left - client.right,
+                    651 * dpi / 96 + outer.bottom - outer.top - client.bottom,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                f.app.layout_ui();
+                for _ in 0..2 {
+                    for page in 0..PAGES.len() {
+                        f.app.page(page);
+                        let tab = item(h, 9);
+                        for focus in [h, tab] {
+                            SetFocus(focus);
+                            assert_eq!(GetFocus(), focus);
+                            theme::verify_navigation_for_test(tab);
                         }
-                        if let Some(u) = &self.app.ui {
-                            DestroyWindow(u.window);
-                            DeleteObject(u.font);
-                            DeleteObject(u.heading_font);
-                            DeleteObject(u.value_font);
-                        }
-                        DestroyWindow(self.app.host);
-                        if IsWindow(self.external) != 0 {
-                            DestroyWindow(self.external);
-                        }
-                        let _ = std::fs::remove_dir_all(&self.app.dir);
                     }
                 }
             }
-            let mut f = Fixture {
-                app: App {
-                    host,
-                    config: AppConfig::default(),
-                    dir,
-                    records: vec![],
-                    slots: vec![None; 4],
-                    targets: HashMap::new(),
-                    keys: HashMap::new(),
-                    next_id: 0,
-                    pending: vec![],
-                    ui: None,
-                    hook: null_mut(),
-                    taskbar: 0,
-                    can_write: true,
-                    launch_results: Default::default(),
-                    rest: Default::default(),
-                },
-                external,
-            };
+        }
+    }
+
+    #[test]
+    fn editor_drafts_selection_layout_and_target_state() {
+        unsafe {
+            let mut f = fixture();
+            let external = f.external;
             let app = &mut f.app;
-            // Pretend unchanged default keys are already registered: this test covers
-            // editor persistence, not registration, and must not reserve global keys.
-            for (i, (key, cmd)) in app.config.bindings().into_iter().enumerate() {
-                app.keys.insert(i as i32 + 1, (key, cmd));
-            }
-            app.open_ui();
             let h = app.ui.as_ref().unwrap().window;
-            app.ui.as_mut().unwrap().target = None;
-            app.refresh_state();
             assert!(!item(h, 201).is_null());
             assert_eq!(
                 IsWindowVisible(item(h, 9004)),
@@ -3057,3 +3150,7 @@ mod capture_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "diagnostics.rs"]
+pub(crate) mod diagnostics;

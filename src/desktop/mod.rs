@@ -1,5 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 mod assets;
+mod buffering;
 mod design;
 mod fonts;
 mod recorder;

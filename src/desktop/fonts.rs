@@ -108,6 +108,12 @@ pub(super) unsafe fn select(dc: HDC, h: HWND, text: &str) -> Selection {
 }
 
 #[cfg(test)]
+pub(super) fn clear_test_cache() {
+    let fonts = FONTS.with(|cache| cache.borrow_mut().take());
+    drop(fonts);
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
@@ -116,6 +122,7 @@ mod tests {
         let rare = char::from_u32(0x9f98).unwrap().to_string();
         assert!(!covered(&rare));
         unsafe {
+            let _graphics = theme::TestGraphicsScope::new();
             ensure();
             let h = CreateWindowExW(
                 0,
@@ -132,6 +139,7 @@ mod tests {
                 null(),
             );
             assert!(!h.is_null());
+            let _window = theme::TestWindow(h);
             let dc = GetDC(h);
             for weight in [400, 600] {
                 let mut lf: LOGFONTW = std::mem::zeroed();
