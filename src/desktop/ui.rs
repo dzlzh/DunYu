@@ -1086,7 +1086,7 @@ impl App {
             ),
             (
                 913,
-                "转发延迟（秒）",
+                "合并等待（秒）",
                 self.config.message.delay_seconds.to_string(),
             ),
             (914, "企业 ID", String::new()),
@@ -2334,7 +2334,7 @@ impl App {
                 c.enabled = checked(h, 910);
                 c.keywords = dunyu::message::keywords(&text_at(h, 911));
                 c.poll_seconds = text_at(h, 912).parse().map_err(|_| "检查间隔须为整数")?;
-                c.delay_seconds = text_at(h, 913).parse().map_err(|_| "转发延迟须为整数")?;
+                c.delay_seconds = text_at(h, 913).parse().map_err(|_| "合并等待须为整数")?;
                 for (id, value) in [
                     (914, &mut c.corp_id),
                     (915, &mut c.agent_id),

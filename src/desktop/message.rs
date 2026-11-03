@@ -1,5 +1,7 @@
 use super::*;
-use dunyu::message::{MessageConfig, ProtectedValue, Store};
+use dunyu::message::{
+    MessageConfig, PendingNotification, ProtectedValue, Store, batch_content, collect_batch,
+};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -270,6 +272,7 @@ impl Sender {
 pub struct Status {
     pending: usize,
     sent: usize,
+    sent_batches: usize,
     skipped: usize,
     failed: usize,
     detail: String,
@@ -286,8 +289,8 @@ impl Runtime {
     pub fn text(&self) -> String {
         let s = self.status.lock().unwrap();
         format!(
-            "待发 {} · 成功 {} · 跳过 {} · 失败 {}\n{}",
-            s.pending, s.sent, s.skipped, s.failed, s.detail
+            "待发 {} · 成功 {} · 跳过 {} · 失败 {}\n已发汇总 {} 次 · {}",
+            s.pending, s.sent, s.skipped, s.failed, s.sent_batches, s.detail
         )
     }
     pub fn stop(&mut self) {
@@ -430,40 +433,54 @@ fn monitor(
         }
     };
     let store = Arc::new(Mutex::new(store));
-    let (tx, rx) = mpsc::sync_channel::<(i64, String, Instant)>(100);
+    let (tx, rx) = mpsc::sync_channel::<PendingNotification>(100);
     let worker_store = store.clone();
     let worker_cancel = cancel.clone();
     let worker_status = status.clone();
     let sender_config = c.clone();
     let worker = std::thread::spawn(move || {
-        while !worker_cancel.load(Ordering::SeqCst) {
-            let (id, text, due) = match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(v) => v,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(_) => break,
-            };
-            if wait(
-                &worker_cancel,
-                due.saturating_duration_since(Instant::now()),
-            ) {
-                break;
+        let mut next = None;
+        while let Some(batch) = collect_batch(
+            &rx,
+            &mut next,
+            Duration::from_secs(sender_config.delay_seconds.into()),
+            &worker_cancel,
+        ) {
+            let count = batch.len();
+            let mut texts = Vec::new();
+            let mut recheck_failed = false;
+            for item in batch {
+                if worker_cancel.load(Ordering::SeqCst) {
+                    return;
+                }
+                match worker_store.lock().unwrap().exists(item.id) {
+                    Ok(true) => texts.push(item.text),
+                    Ok(false) => {}
+                    Err(_) => recheck_failed = true,
+                }
             }
-            let exists = worker_store.lock().unwrap().exists(id);
             if worker_cancel.load(Ordering::SeqCst) {
                 break;
             }
-            let result = match exists {
-                Ok(true) => send(&sender_config, &text, &worker_cancel).map(|_| true),
-                Ok(false) => Ok(false),
-                Err(_) => Err("通知复查失败，已跳过".into()),
+            let result = if texts.is_empty() {
+                Ok(())
+            } else {
+                send(&sender_config, &batch_content(&texts), &worker_cancel)
             };
             let mut s = worker_status.lock().unwrap();
-            s.pending = s.pending.saturating_sub(1);
+            s.pending = s.pending.saturating_sub(count);
+            s.skipped += count - texts.len();
+            if recheck_failed {
+                s.detail = "部分通知复查失败，已跳过".into();
+            }
             match result {
-                Ok(true) => s.sent += 1,
-                Ok(false) => s.skipped += 1,
+                Ok(()) if !texts.is_empty() => {
+                    s.sent += texts.len();
+                    s.sent_batches += 1;
+                }
+                Ok(()) => {}
                 Err(e) => {
-                    s.failed += 1;
+                    s.failed += texts.len();
                     s.detail = e;
                 }
             }
@@ -472,7 +489,7 @@ fn monitor(
             }
         }
     });
-    update("正在监听；通知仍存在时转发".into());
+    update("正在监听；窗口内通知合并转发".into());
     while !cancel.load(Ordering::SeqCst) {
         let rows = store.lock().unwrap().scan(cursor);
         match rows {
@@ -489,11 +506,11 @@ fn monitor(
                     match dunyu::message::content(&payload) {
                         Ok(text) => {
                             let mut s = status.lock().unwrap();
-                            match tx.try_send((
+                            match tx.try_send(PendingNotification {
                                 id,
                                 text,
-                                Instant::now() + Duration::from_secs(c.delay_seconds.into()),
-                            )) {
+                                received_at: Instant::now(),
+                            }) {
                                 Ok(()) => {
                                     s.pending += 1;
                                     cursor = id;
@@ -589,6 +606,102 @@ mod tests {
 mod queue_tests {
     use super::*;
     #[test]
+    fn batch_delivery_rechecks_and_accounts_for_each_notification() {
+        use std::sync::atomic::AtomicUsize;
+        for scenario in ["success", "removed", "unreadable", "send_error", "cancel"] {
+            let path = std::env::temp_dir()
+                .join(format!("dunyu-batch-{}-{scenario}.db", std::process::id()));
+            let writer = rusqlite::Connection::open(&path).unwrap();
+            writer.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE Notification(id INTEGER PRIMARY KEY, Payload BLOB, type TEXT);").unwrap();
+            for id in 1..=2 {
+                writer
+                    .execute(
+                        "INSERT INTO Notification VALUES(?,?,'toast')",
+                        rusqlite::params![
+                            id,
+                            b"<toast><text>Telegram hello</text></toast>".as_slice()
+                        ],
+                    )
+                    .unwrap();
+            }
+            let store = Store::open(&path).unwrap();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let stop = cancel.clone();
+            let status = Arc::new(Mutex::new(Status::default()));
+            let stats = status.clone();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let sends = calls.clone();
+            let thread = std::thread::spawn(move || {
+                monitor(
+                    MessageConfig {
+                        poll_seconds: 1,
+                        delay_seconds: 1,
+                        ..Default::default()
+                    },
+                    stop,
+                    stats,
+                    0,
+                    store,
+                    0,
+                    move |_, text, _| {
+                        sends.fetch_add(1, Ordering::SeqCst);
+                        assert!(text.starts_with("通知汇总（共 2 条）"));
+                        if scenario == "send_error" {
+                            Err("test send failure".into())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                );
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while status.lock().unwrap().pending != 2 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(status.lock().unwrap().pending, 2);
+            match scenario {
+                "removed" => {
+                    writer.execute("DELETE FROM Notification", []).unwrap();
+                }
+                "unreadable" => {
+                    writer.execute("DROP TABLE Notification", []).unwrap();
+                }
+                "cancel" => cancel.store(true, Ordering::SeqCst),
+                _ => {}
+            }
+            while scenario != "cancel"
+                && status.lock().unwrap().pending != 0
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            cancel.store(true, Ordering::SeqCst);
+            thread.join().unwrap();
+            let s = status.lock().unwrap();
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                usize::from(matches!(scenario, "success" | "send_error"))
+            );
+            assert_eq!(s.sent, if scenario == "success" { 2 } else { 0 });
+            assert_eq!(s.sent_batches, usize::from(scenario == "success"));
+            assert_eq!(s.failed, if scenario == "send_error" { 2 } else { 0 });
+            assert_eq!(
+                s.skipped,
+                if matches!(scenario, "removed" | "unreadable") {
+                    2
+                } else {
+                    0
+                }
+            );
+            if scenario != "cancel" {
+                assert_eq!(s.pending, 0);
+            }
+            drop(writer);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
     fn delayed_recheck_history_and_backpressure() {
         let path =
             std::env::temp_dir().join(format!("dunyu-message-queue-{}.db", std::process::id()));
@@ -627,19 +740,26 @@ mod queue_tests {
         writer
             .execute("DELETE FROM Notification WHERE id=2", [])
             .unwrap();
-        let mut sent = 0;
-        while sent < 103 && Instant::now() < deadline {
+        let mut batches = 0;
+        while status.lock().unwrap().sent < 103 && Instant::now() < deadline {
             if rx.recv_timeout(Duration::from_millis(100)).is_ok() {
-                sent += 1;
+                batches += 1;
             }
         }
         cancel.store(true, Ordering::SeqCst);
         thread.join().unwrap();
         assert_eq!(
-            sent, 103,
+            status.lock().unwrap().sent,
+            103,
             "queue overflow must not lose rows; history and removed rows must not send"
         );
         assert_eq!(status.lock().unwrap().skipped, 1);
+        assert_eq!(status.lock().unwrap().pending, 0);
+        assert_eq!(
+            status.lock().unwrap().sent_batches,
+            batches + rx.try_iter().count()
+        );
+        assert!(batches < 103);
         drop(writer);
         std::fs::remove_file(path).unwrap();
     }

@@ -77,7 +77,7 @@ impl MessageConfig {
 
     pub fn validate(&self) -> Result<(), String> {
         if !(1..=3600).contains(&self.poll_seconds) || self.delay_seconds > 3600 {
-            return Err("检查间隔须为1～3600秒，转发延迟须为0～3600秒".into());
+            return Err("检查间隔须为1～3600秒，合并等待须为0～3600秒".into());
         }
         if self.enabled
             && (self.keywords.iter().all(|s| s.trim().is_empty()) || !self.credentials_complete())
@@ -158,6 +158,94 @@ pub fn limit_text(text: &str) -> String {
     }
     format!("{}{MARK}", &text[..end])
 }
+/// Queue timestamps define batch membership, independently of worker scheduling.
+pub struct PendingNotification {
+    pub id: i64,
+    pub text: String,
+    pub received_at: std::time::Instant,
+}
+
+/// Retains the first notification outside the window for the next batch.
+pub fn collect_batch(
+    rx: &std::sync::mpsc::Receiver<PendingNotification>,
+    next: &mut Option<PendingNotification>,
+    delay: std::time::Duration,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Option<Vec<PendingNotification>> {
+    use std::sync::{atomic::Ordering, mpsc};
+    use std::time::{Duration, Instant};
+    let tick = Duration::from_millis(100);
+    let first = loop {
+        if cancel.load(Ordering::SeqCst) {
+            return None;
+        }
+        if let Some(first) = next.take() {
+            break first;
+        }
+        match rx.recv_timeout(tick) {
+            Ok(first) => break first,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(_) => return None,
+        }
+    };
+    // Zero means snapshot the currently queued notifications without waiting.
+    let deadline = if delay.is_zero() {
+        Instant::now()
+    } else {
+        first.received_at + delay
+    };
+    let mut batch = vec![first];
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let received = if remaining.is_zero() {
+            rx.try_recv().ok()
+        } else {
+            match rx.recv_timeout(remaining.min(tick)) {
+                Ok(item) => Some(item),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(_) => None,
+            }
+        };
+        let Some(item) = received else { break };
+        if item.received_at >= deadline {
+            *next = Some(item);
+            break;
+        }
+        batch.push(item);
+    }
+    Some(batch)
+}
+
+pub fn batch_content(texts: &[String]) -> String {
+    if texts.len() == 1 {
+        return limit_text(&texts[0]);
+    }
+    if texts.is_empty() {
+        return String::new();
+    }
+    let mut text = format!("通知汇总（共 {} 条）", texts.len());
+    for (index, item) in texts.iter().enumerate() {
+        use std::fmt::Write;
+        let _ = write!(text, "\n\n{}. {}", index + 1, item);
+        if text.len() > 2048 {
+            break;
+        }
+    }
+    const MARK: &str = "\n[内容已截断，请到原应用查看]";
+    if text.len() > 2048 || texts.iter().any(|t| t.ends_with("[已截断]")) {
+        let mut end = text.len().min(2048 - MARK.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str(MARK);
+    }
+    text
+}
+
 pub struct Store(pub rusqlite::Connection);
 impl Store {
     pub fn open(path: &Path) -> Result<Self, rusqlite::Error> {
@@ -265,5 +353,98 @@ mod credential_tests {
                 .unwrap(),
             encrypted
         );
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use std::sync::{atomic::AtomicBool, mpsc};
+    use std::time::{Duration, Instant};
+
+    fn item(id: i64, received_at: Instant) -> PendingNotification {
+        PendingNotification {
+            id,
+            text: format!("message {id}"),
+            received_at,
+        }
+    }
+
+    #[test]
+    fn fixed_window_uses_enqueue_time_and_retains_boundary_item() {
+        let (tx, rx) = mpsc::channel();
+        let start = Instant::now() - Duration::from_secs(121);
+        for (id, offset) in [(1, 0), (2, 2), (3, 59), (4, 60), (5, 61)] {
+            tx.send(item(id, start + Duration::from_secs(offset)))
+                .unwrap();
+        }
+        let mut next = None;
+        let cancel = AtomicBool::new(false);
+        let delay = Duration::from_secs(60);
+        let first = collect_batch(&rx, &mut next, delay, &cancel).unwrap();
+        assert_eq!(first.iter().map(|n| n.id).collect::<Vec<_>>(), [1, 2, 3]);
+        let second = collect_batch(&rx, &mut next, delay, &cancel).unwrap();
+        assert_eq!(second.iter().map(|n| n.id).collect::<Vec<_>>(), [4, 5]);
+    }
+
+    #[test]
+    fn single_notification_waits_until_the_first_deadline() {
+        let (tx, rx) = mpsc::channel();
+        let start = Instant::now();
+        let delay = Duration::from_millis(20);
+        tx.send(item(1, start)).unwrap();
+        let batch = collect_batch(&rx, &mut None, delay, &AtomicBool::new(false)).unwrap();
+        assert_eq!(batch.len(), 1);
+        assert!(start.elapsed() >= delay);
+    }
+
+    #[test]
+    fn zero_delay_drains_available_notifications() {
+        let (tx, rx) = mpsc::channel();
+        let before = Instant::now() - Duration::from_secs(1);
+        tx.send(item(1, before)).unwrap();
+        tx.send(item(2, before)).unwrap();
+        let batch = collect_batch(&rx, &mut None, Duration::ZERO, &AtomicBool::new(false)).unwrap();
+        assert_eq!(batch.len(), 2);
+    }
+
+    #[test]
+    fn cancellation_discards_the_open_batch() {
+        use std::sync::{Arc, atomic::Ordering};
+        let (tx, rx) = mpsc::sync_channel(0);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let worker = std::thread::spawn(move || {
+            collect_batch(&rx, &mut None, Duration::from_secs(60), &worker_cancel)
+        });
+        // A rendezvous guarantees the collector has received the first item.
+        tx.send(item(1, Instant::now())).unwrap();
+        cancel.store(true, Ordering::SeqCst);
+        assert!(worker.join().unwrap().is_none());
+    }
+
+    #[test]
+    fn summary_preserves_order_count_and_single_message_format() {
+        assert_eq!(batch_content(&[]), "");
+        assert_eq!(batch_content(&["hello".into()]), "hello");
+        assert_eq!(
+            batch_content(&["first".into(), "second".into()]),
+            "通知汇总（共 2 条）\n\n1. first\n\n2. second"
+        );
+    }
+
+    #[test]
+    fn long_summary_is_one_utf8_message_with_omission_notice() {
+        let text = batch_content(&[
+            format!("汉{}", char::from_u32(0x1f41f).unwrap()).repeat(500),
+            "second".into(),
+            "third".into(),
+        ]);
+        assert!(text.len() <= 2048);
+        assert!(text.starts_with("通知汇总（共 3 条）"));
+        assert!(text.ends_with("[内容已截断，请到原应用查看]"));
+        let text = batch_content(&[limit_text(&"汉".repeat(900)), "second".into()]);
+        assert!(text.len() <= 2048);
+        assert!(text.ends_with("[内容已截断，请到原应用查看]"));
     }
 }
