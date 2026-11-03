@@ -680,6 +680,36 @@ impl App {
         }
     }
 }
+// Shared with UI regression tests so dialog dispatch and focus handling stay identical.
+unsafe fn dispatch_message(msg: &MSG) {
+    let ui = APP.with(|a| {
+        a.borrow()
+            .as_ref()
+            .and_then(|a| a.ui.as_ref().map(|u| u.window))
+    });
+    if scroll_ui::filter(msg) {
+        return;
+    }
+    if rest_ui::Runtime::filter(msg) {
+        return;
+    }
+    let focus = GetFocus();
+    if ui.is_some_and(|h| ui::capture_hotkey(h, msg) || IsDialogMessageW(h, msg) != 0) {
+        // IsDialogMessage also dispatches paint messages. Revealing the selected
+        // row after those can invalidate the window again and sustain a paint loop.
+        if matches!(msg.message, WM_KEYDOWN | WM_SYSKEYDOWN) || GetFocus() != focus {
+            APP.with(|cell| {
+                if let Some(a) = cell.borrow_mut().as_mut() {
+                    a.reveal_focus();
+                }
+            });
+        }
+        return;
+    }
+    TranslateMessage(msg);
+    DispatchMessageW(msg);
+}
+
 unsafe extern "system" fn procedure(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     let handled = std::panic::catch_unwind(|| {
         APP.with(|cell| {
@@ -1180,27 +1210,7 @@ pub fn run() {
             if result <= 0 {
                 break;
             }
-            let ui = APP.with(|a| {
-                a.borrow()
-                    .as_ref()
-                    .and_then(|a| a.ui.as_ref().map(|u| u.window))
-            });
-            if scroll_ui::filter(&msg) {
-                continue;
-            }
-            if rest_ui::Runtime::filter(&msg) {
-                continue;
-            }
-            if ui.is_some_and(|h| ui::capture_hotkey(h, &msg) || IsDialogMessageW(h, &msg) != 0) {
-                APP.with(|cell| {
-                    if let Some(a) = cell.borrow_mut().as_mut() {
-                        a.reveal_focus();
-                    }
-                });
-                continue;
-            }
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            dispatch_message(&msg);
         }
         APP.with(|cell| {
             let mut guard = cell.borrow_mut();

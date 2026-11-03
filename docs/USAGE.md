@@ -120,6 +120,8 @@ BMP 截图写入 `target/ui-preview`，CI 另将其转换为 PNG。 按钮文字
 
 Windows交互验收可设置 `DUNYU_UI_TRANSITION_CHECK=1` 后运行 `cargo test editor_drafts_selection_layout_and_target_state -- --test-threads=1`，连续采集切页过程到 `target/ui-preview/transition-*.bmp` 并检测大面积白块。该检查需暗色主题和可见、无遮挡的真实桌面；当前环境未执行。
 
+列表选中后的持续刷新回归包含在上述编辑器测试中，通过正式消息处理路径验证鼠标选择、键盘导航、静置和滚动位置保持，并对无法结束的重绘循环设置超时。交互式 Windows 桌面可设置 `DUNYU_UI_SELECTION_CHECK=1`，追加至少五秒的列表屏幕像素对照；保持窗口可见、无遮挡，不要操作电脑。失配时查看 `target/ui-preview/selection-first.bmp` 与 `selection-current.bmp`。采样间隙仍可能漏掉短暂闪烁，须结合实际观察，不能用编译通过代替视觉验收。
+
 分发运行只需 `dunyu.exe`：图标和锦鲤素材已嵌入EXE，无需额外的resources文件夹。运行时在程序旁的 `data` 文件夹保存配置、布局和窗口恢复记录；这是用户数据，请保留。
 
 ## 常见问题

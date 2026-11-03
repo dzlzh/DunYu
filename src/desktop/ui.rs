@@ -1277,14 +1277,22 @@ impl App {
                 let mut bounds: RECT = std::mem::zeroed();
                 GetClientRect(item(u.window, 119), &mut bounds);
                 let height = bounds.bottom * 96 / u.dpi as i32;
-                if selected * 64 < u.list_scroll {
-                    u.list_scroll = selected * 64;
+                let mut next = u.list_scroll;
+                if selected * 64 < next {
+                    next = selected * 64;
                 }
-                if (selected + 1) * 64 > u.list_scroll + height {
-                    u.list_scroll = (selected + 1) * 64 - height;
+                if (selected + 1) * 64 > next + height {
+                    next = (selected + 1) * 64 - height;
                 }
-                u.motions[1].snap(u.list_scroll as f64);
-                self.layout_ui();
+                let count = SendMessageW(u.list, LB_GETCOUNT, 0, 0).max(0) as i32;
+                next = next.clamp(0, (count * 64 - height).max(0));
+                // Paint messages must not restart layout or cancel an active scroll.
+                if next == u.list_scroll {
+                    return;
+                }
+                u.list_scroll = next;
+                u.motions[1].snap(next as f64);
+                self.layout_scrolled_ui();
             }
             return;
         }
@@ -2742,6 +2750,28 @@ mod capture_tests {
             }
         }
     }
+    fn test_app(host: HWND, dir: PathBuf) -> App {
+        App {
+            host,
+            config: AppConfig::default(),
+            dir,
+            records: vec![],
+            slots: vec![None; 4],
+            targets: HashMap::new(),
+            keys: HashMap::new(),
+            next_id: 0,
+            priority_hotkeys: None,
+            pending: vec![],
+            ui: None,
+            hook: null_mut(),
+            taskbar: 0,
+            can_write: true,
+            launch_results: Default::default(),
+            rest: Default::default(),
+            message: Default::default(),
+        }
+    }
+
     pub(super) unsafe fn fixture() -> Fixture {
         let graphics = theme::TestGraphicsScope::new();
         let classes: [(&str, WNDPROC); 2] = [
@@ -2778,25 +2808,7 @@ mod capture_tests {
         let external = create("UI test target");
         let dir = std::env::temp_dir().join(format!("dunyu-ui-test-{}", std::process::id()));
         let mut f = Fixture {
-            app: App {
-                host,
-                config: AppConfig::default(),
-                dir,
-                records: vec![],
-                slots: vec![None; 4],
-                targets: HashMap::new(),
-                keys: HashMap::new(),
-                next_id: 0,
-                priority_hotkeys: None,
-                pending: vec![],
-                ui: None,
-                hook: null_mut(),
-                taskbar: 0,
-                can_write: true,
-                launch_results: Default::default(),
-                rest: Default::default(),
-                message: Default::default(),
-            },
+            app: test_app(host, dir),
             external,
             _graphics: graphics,
         };
@@ -2869,10 +2881,177 @@ mod capture_tests {
             theme::verify_static_for_test(item(h, 114));
         }
     }
+
+    // Restore APP even if an assertion fails, before Fixture destroys its windows.
+    struct ActiveFixture<'a>(&'a mut Fixture);
+    impl Drop for ActiveFixture<'_> {
+        fn drop(&mut self) {
+            self.0.app = APP.with(|cell| cell.borrow_mut().take().unwrap());
+        }
+    }
+    unsafe fn selection_idle_regression(f: &mut Fixture) {
+        use std::time::Duration;
+        let with_app = |action: &mut dyn FnMut(&mut App)| {
+            APP.with(|cell| action(cell.borrow_mut().as_mut().unwrap()));
+        };
+        APP.with(|cell| {
+            assert!(cell.borrow().is_none());
+            *cell.borrow_mut() = Some(std::mem::replace(
+                &mut f.app,
+                test_app(null_mut(), PathBuf::new()),
+            ));
+        });
+        let _active = ActiveFixture(f);
+        let (h, list) = APP.with(|cell| {
+            let a = cell.borrow();
+            let u = a.as_ref().unwrap().ui.as_ref().unwrap();
+            (u.window, u.list)
+        });
+        with_app(&mut |app| {
+            app.config.rules = (0..24)
+                .map(|i| SummonRule {
+                    name: format!("Selection fixture {i}"),
+                    enabled: false,
+                    executable: "fixture.exe".into(),
+                    arguments: String::new(),
+                    working_directory: String::new(),
+                    process_path: String::new(),
+                    class: String::new(),
+                    title: String::new(),
+                    hotkey: Hotkey::new(3, 65),
+                    minimize: false,
+                    priority_hotkey: false,
+                })
+                .collect();
+            app.refresh_list();
+            app.fill_rule(Some(0));
+        });
+        SetFocus(list);
+        assert_eq!(GetFocus(), list);
+        let drain = || {
+            let start = Instant::now();
+            let mut msg: MSG = std::mem::zeroed();
+            while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                assert!(
+                    start.elapsed() < Duration::from_secs(2),
+                    "selection paint loop did not settle"
+                );
+                super::super::dispatch_message(&msg);
+            }
+        };
+        let idle = || {
+            let counts = diagnostics::capture_counters(|| {
+                let start = Instant::now();
+                while start.elapsed() < Duration::from_millis(100) {
+                    drain();
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+            assert_eq!(
+                counts.get("layout").map_or(0, |c| c.0),
+                0,
+                "idle selection caused layout"
+            );
+        };
+        drain();
+        idle();
+        // No-op focus checks must also preserve pending wheel animation.
+        let counts = diagnostics::capture_counters(|| {
+            with_app(&mut |app| {
+                app.ui.as_mut().unwrap().motions[1].target = 12.;
+                for _ in 0..5 {
+                    app.reveal_focus();
+                }
+                assert_eq!(app.ui.as_ref().unwrap().motions[1].target, 12.);
+                app.ui.as_mut().unwrap().motions[1].snap(0.);
+            })
+        });
+        assert_eq!(counts.get("layout").map_or(0, |c| c.0), 0);
+        // A real click reaches LBN_SELCHANGE through the production dispatcher.
+        for row in [1, 1, 2] {
+            for message in [WM_LBUTTONDOWN, WM_LBUTTONUP] {
+                let msg = MSG {
+                    hwnd: list,
+                    message,
+                    wParam: if message == WM_LBUTTONDOWN { 1 } else { 0 },
+                    lParam: (((row * 64 + 20) * GetDpiForWindow(list) as i32 / 96) as isize) << 16
+                        | 20,
+                    ..std::mem::zeroed()
+                };
+                super::super::dispatch_message(&msg);
+            }
+            assert_eq!(SendMessageW(list, LB_GETCURSEL, 0, 0), row as isize);
+            drain();
+            idle();
+        }
+        for key in [VK_END, VK_HOME, VK_NEXT, VK_DOWN, VK_PRIOR, VK_UP] {
+            let msg = MSG {
+                hwnd: list,
+                message: WM_KEYDOWN,
+                wParam: key as usize,
+                ..std::mem::zeroed()
+            };
+            super::super::dispatch_message(&msg);
+            drain();
+            with_app(&mut |app| {
+                let u = app.ui.as_ref().unwrap();
+                let selected = SendMessageW(list, LB_GETCURSEL, 0, 0) as i32;
+                assert_eq!(u.selected, Some(selected as usize));
+                let mut bounds: RECT = std::mem::zeroed();
+                GetClientRect(item(h, 119), &mut bounds);
+                let height = bounds.bottom * 96 / u.dpi as i32;
+                assert!(selected * 64 >= u.list_scroll);
+                assert!((selected + 1) * 64 <= u.list_scroll + height);
+            });
+            idle();
+        }
+        // Moving the viewport away from the selected row must survive paint traffic.
+        with_app(&mut |app| {
+            app.fill_rule(Some(0));
+            let u = app.ui.as_mut().unwrap();
+            u.list_scroll = 640;
+            u.motions[1].snap(640.);
+            app.layout_scrolled_ui();
+        });
+        drain();
+        idle();
+        with_app(&mut |app| assert_eq!(app.ui.as_ref().unwrap().list_scroll, 640));
+        with_app(&mut |app| {
+            app.ui.as_mut().unwrap().list_scroll = 0;
+            app.fill_rule(Some(1));
+        });
+        drain();
+        if std::env::var_os("DUNYU_UI_SELECTION_CHECK").is_some() {
+            std::fs::create_dir_all("target/ui-preview").unwrap();
+            let first = "target/ui-preview/selection-first.bmp";
+            let current = "target/ui-preview/selection-current.bmp";
+            theme::capture_screen(list, first).unwrap();
+            let expected = std::fs::read(first).unwrap();
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(5) {
+                drain();
+                theme::capture_screen(list, current).unwrap();
+                assert!(
+                    std::fs::read(current).unwrap() == expected,
+                    "idle list pixels changed; inspect selection-*.bmp"
+                );
+                std::thread::sleep(Duration::from_millis(16));
+            }
+        }
+        with_app(&mut |app| {
+            app.config.rules.clear();
+            app.refresh_list();
+            app.fill_rule(None);
+        });
+        SetFocus(h);
+        drain();
+    }
+
     #[test]
     fn editor_drafts_selection_layout_and_target_state() {
         unsafe {
             let mut f = fixture();
+            selection_idle_regression(&mut f);
             let external = f.external;
             let app = &mut f.app;
             let h = app.ui.as_ref().unwrap().window;
