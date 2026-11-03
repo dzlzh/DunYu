@@ -574,6 +574,18 @@ impl App {
             &mut u,
             0,
             "BUTTON",
+            "优先接管快捷键",
+            210,
+            244,
+            460,
+            600,
+            28,
+            BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
+        );
+        control(
+            &mut u,
+            0,
+            "BUTTON",
             "最小化代替隐藏",
             209,
             244,
@@ -1643,7 +1655,8 @@ impl App {
                         if id >= 6000 { 22 } else { 36 },
                     ))
                 }
-                209 if u.advanced => Some((form, 820, fw, 30)),
+                210 if u.advanced => Some((form, 820, fw, 30)),
+                209 if u.advanced => Some((form, 860, fw, 30)),
                 117 => None,
                 7001 => Some((24, 12, bw - 48, 32)),
                 350..=353 => {
@@ -2100,6 +2113,7 @@ impl App {
         let mut values = (200..=207).map(|id| text_at(h, id)).collect::<Vec<_>>();
         values.push(checked(h, 208).to_string());
         values.push(checked(h, 209).to_string());
+        values.push(checked(h, 210).to_string());
         values
     }
 
@@ -2243,6 +2257,7 @@ impl App {
             title: String::new(),
             hotkey: Hotkey::new(3, 65),
             minimize: false,
+            priority_hotkey: false,
         };
         let r = index.map(|i| &self.config.rules[i]).unwrap_or(&default);
         for (id, s) in [
@@ -2259,11 +2274,13 @@ impl App {
         }
         check(u.window, 208, r.enabled);
         check(u.window, 209, r.minimize);
+        check(u.window, 210, r.priority_hotkey);
         u.advanced = !r.arguments.is_empty()
             || !r.working_directory.is_empty()
             || !r.class.is_empty()
             || !r.title.is_empty()
             || r.minimize
+            || r.priority_hotkey
             || r.executable.to_lowercase().ends_with(".lnk")
             || (!r.process_path.is_empty() && r.process_path != r.executable);
         SendMessageW(u.list, LB_SETCURSEL, index.unwrap_or(usize::MAX), 0);
@@ -2507,6 +2524,7 @@ impl App {
                     title: text_at(h, 206),
                     hotkey: parse_key(&text_at(h, 207))?,
                     minimize: checked(h, 209),
+                    priority_hotkey: checked(h, 210),
                 };
                 let mut c = self.config.clone();
                 if let Some(i) = self.ui.as_ref().unwrap().selected {
@@ -2769,6 +2787,7 @@ mod capture_tests {
                 targets: HashMap::new(),
                 keys: HashMap::new(),
                 next_id: 0,
+                priority_hotkeys: None,
                 pending: vec![],
                 ui: None,
                 hook: null_mut(),
@@ -2956,6 +2975,33 @@ mod capture_tests {
             assert_eq!(app.rule_snapshot(), app.ui.as_ref().unwrap().baseline);
             // Adding the first rule must suppress the empty caption in both layouts;
             // clearing the list must restore it, and reloading must suppress it again.
+            let base = app.config.clone();
+            let mut priority = base.clone();
+            priority.rules[0].enabled = true;
+            priority.rules[0].hotkey = Hotkey::new(7, 0x7a);
+            assert_ne!(RegisterHotKey(app.host, 0x7ffe, 7 | MOD_NOREPEAT, 0x7a), 0);
+            assert!(app.apply_config(priority.clone()).is_err());
+            priority.rules[0].priority_hotkey = true;
+            app.apply_config(priority.clone()).unwrap();
+            assert_eq!(
+                app.priority_hotkeys.as_ref().unwrap().command(1, 0),
+                Some(Command::Summon(0))
+            );
+            let dir = app.dir.clone();
+            let blocked = dir.join("blocked-priority-save");
+            std::fs::write(&blocked, b"blocked").unwrap();
+            app.dir = blocked;
+            priority.rules[0].hotkey = Hotkey::new(7, 0x79);
+            assert!(app.apply_config(priority).is_err());
+            app.dir = dir;
+            assert_eq!(app.config.rules[0].hotkey, Hotkey::new(7, 0x7a));
+            assert_eq!(
+                app.priority_hotkeys.as_ref().unwrap().command(1, 0),
+                Some(Command::Summon(0))
+            );
+            app.apply_config(base).unwrap();
+            assert_eq!(app.priority_hotkeys.as_ref().unwrap().command(1, 0), None);
+            UnregisterHotKey(app.host, 0x7ffe);
             let saved_rules = app.config.rules.clone();
             app.scale_ui(96, None);
             for width in [800, 1100] {

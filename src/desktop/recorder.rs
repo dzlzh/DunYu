@@ -36,6 +36,8 @@ pub(super) unsafe fn start(field: HWND) {
     if !ui::is_hotkey_field(GetDlgCtrlID(field)) {
         return;
     }
+    super::priority_hotkey::RECORDING.store(true, std::sync::atomic::Ordering::SeqCst);
+    super::priority_hotkey::RECORDING_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     SESSION.with(|cell| {
         let mut s = cell.borrow_mut();
         s.field = field;
@@ -52,6 +54,8 @@ pub(super) unsafe fn stop_for(field: HWND) {
     }
 }
 pub(super) unsafe fn stop() {
+    super::priority_hotkey::RECORDING.store(false, std::sync::atomic::Ordering::SeqCst);
+    super::priority_hotkey::RECORDING_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let (hook, field, committed) = SESSION.with(|cell| {
         let mut s = cell.borrow_mut();
         let old = (s.hook, s.field, std::mem::take(&mut s.committed));

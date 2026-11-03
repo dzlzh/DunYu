@@ -1,4 +1,5 @@
 pub mod message;
+pub mod priority_hotkey;
 pub mod scroll;
 use serde::{Deserialize, Serialize};
 pub mod rest;
@@ -26,6 +27,8 @@ pub struct SummonRule {
     pub title: String,
     pub hotkey: Hotkey,
     pub minimize: bool,
+    #[serde(default)]
+    pub priority_hotkey: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Slot {
@@ -243,7 +246,24 @@ mod tests {
             title: "文档".into(),
             hotkey: Hotkey::new(3, 65),
             minimize: false,
+            priority_hotkey: false,
         };
+        let mut old = serde_json::to_value(&r).unwrap();
+        old.as_object_mut().unwrap().remove("priority_hotkey");
+        assert!(
+            !serde_json::from_value::<SummonRule>(old)
+                .unwrap()
+                .priority_hotkey
+        );
+        let mut c = AppConfig::default();
+        let mut taken = r.clone();
+        taken.priority_hotkey = true;
+        taken.hotkey = c.opacity_up.clone();
+        c.rules.push(taken);
+        assert!(
+            c.validate().is_err(),
+            "priority must not bypass internal duplicate checks"
+        );
         assert!(matches(&r, "c:\\A.EXE", "Editor", "文档 1"));
         assert!(!matches(&r, "c:\\b.exe", "Editor", "文档 1"));
     }

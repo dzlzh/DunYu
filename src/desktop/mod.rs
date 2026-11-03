@@ -4,6 +4,7 @@ mod buffering;
 mod design;
 mod fonts;
 mod message;
+mod priority_hotkey;
 mod recorder;
 mod rest_art;
 mod rest_ui;
@@ -181,6 +182,7 @@ struct App {
     targets: HashMap<usize, Token>,
     keys: HashMap<i32, (Hotkey, Command)>,
     next_id: i32,
+    priority_hotkeys: Option<priority_hotkey::Runtime>,
     pending: Vec<Pending>,
     ui: Option<Ui>,
     hook: HWINEVENTHOOK,
@@ -514,7 +516,16 @@ impl App {
     }
     unsafe fn register(&mut self, c: &AppConfig, save: bool) -> Result<(), String> {
         c.validate()?;
-        let desired = c.bindings();
+        let (priority, desired): (Vec<_>, Vec<_>) = c
+            .bindings()
+            .into_iter()
+            .partition(|(_, cmd)| matches!(cmd,Command::Summon(i) if c.rules[*i].priority_hotkey));
+        // Prepare without activating routes; failed saves leave old bindings active.
+        let prepared = if self.priority_hotkeys.is_none() && !priority.is_empty() {
+            Some(priority_hotkey::Runtime::new(self.host)?)
+        } else {
+            None
+        };
         let mut added = vec![];
         let mut changed = vec![];
         let result = (|| -> Result<(), String> {
@@ -574,6 +585,12 @@ impl App {
         for id in obsolete {
             UnregisterHotKey(self.host, id);
             self.keys.remove(&id);
+        }
+        if let Some(runtime) = prepared {
+            self.priority_hotkeys = Some(runtime);
+        }
+        if let Some(runtime) = &self.priority_hotkeys {
+            runtime.configure(priority);
         }
         for (k, cmd) in self.keys.values_mut() {
             *cmd = desired.iter().find(|(d, _)| d == k).unwrap().1;
@@ -689,6 +706,17 @@ unsafe extern "system" fn procedure(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                 }
                 OPEN => {
                     a.open_ui();
+                    Some(0)
+                }
+                priority_hotkey::ACTION => {
+                    if !priority_hotkey::RECORDING.load(std::sync::atomic::Ordering::SeqCst)
+                        && let Some(command) = a
+                            .priority_hotkeys
+                            .as_ref()
+                            .and_then(|r| r.command(w, l as usize))
+                    {
+                        a.execute(command);
+                    }
                     Some(0)
                 }
                 WM_HOTKEY => {
@@ -1114,6 +1142,7 @@ pub fn run() {
             targets: HashMap::new(),
             keys: HashMap::new(),
             next_id: 0,
+            priority_hotkeys: None,
             pending: vec![],
             ui: None,
             hook: null_mut(),
@@ -1179,6 +1208,7 @@ pub fn run() {
             for id in a.keys.keys() {
                 UnregisterHotKey(host, *id);
             }
+            a.priority_hotkeys.take();
             a.message.stop();
             a.rest.close();
             KillTimer(host, rest_ui::TIMER_ID);
@@ -1252,6 +1282,7 @@ mod tests {
                 targets: HashMap::new(),
                 keys: HashMap::new(),
                 next_id: 0,
+                priority_hotkeys: None,
                 pending: vec![],
                 ui: None,
                 hook: null_mut(),

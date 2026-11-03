@@ -310,6 +310,7 @@ fn ui_transition_diagnostics() {
                 title: String::new(),
                 hotkey: Hotkey::new(3, 65 + i),
                 minimize: false,
+                priority_hotkey: false,
             })
             .collect();
         app.refresh_list();
@@ -526,6 +527,7 @@ fn ui_performance_benchmark() {
                 title: String::new(),
                 hotkey: Hotkey::new(3, 65 + i),
                 minimize: false,
+                priority_hotkey: false,
             })
             .collect();
         app.refresh_list();
