@@ -67,6 +67,29 @@ pub(super) unsafe fn filter(msg: &MSG) -> bool {
         {
             return false;
         }
+        let keywords = ui::item(u.window, 911);
+        let mut keyword_rect: RECT = std::mem::zeroed();
+        GetWindowRect(keywords, &mut keyword_rect);
+        if u.page == 4
+            && p.x >= keyword_rect.left
+            && p.x < keyword_rect.right
+            && p.y >= keyword_rect.top
+            && p.y < keyword_rect.bottom
+        {
+            let mut lines = 3u32;
+            SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &mut lines as *mut _ as _, 0);
+            let lines = if lines == u32::MAX { 3 } else { lines };
+            u.keyword_wheel -= ((msg.wParam >> 16) as i16 as f64) / 120. * lines as f64;
+            let count = u.keyword_wheel.trunc() as i32;
+            u.keyword_wheel -= count as f64;
+            SendMessageW(
+                keywords,
+                windows_sys::Win32::UI::Controls::EM_LINESCROLL,
+                0,
+                count as isize,
+            );
+            return true;
+        }
         let mut clip: RECT = std::mem::zeroed();
         GetWindowRect(ui::item(u.window, 119), &mut clip);
         let list = u.page == 0

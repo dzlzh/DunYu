@@ -1,3 +1,4 @@
+pub mod message;
 pub mod scroll;
 use serde::{Deserialize, Serialize};
 pub mod rest;
@@ -46,6 +47,8 @@ pub struct AppConfig {
     pub hide_tray: bool,
     #[serde(default)]
     pub rest: rest::RestConfig,
+    #[serde(default)]
+    pub message: message::MessageConfig,
 }
 impl Default for AppConfig {
     fn default() -> Self {
@@ -66,6 +69,7 @@ impl Default for AppConfig {
             autostart: false,
             hide_tray: false,
             rest: Default::default(),
+            message: Default::default(),
         }
     }
 }
@@ -101,6 +105,7 @@ impl AppConfig {
     }
     pub fn validate(&self) -> Result<(), String> {
         self.rest.validate()?;
+        self.message.validate()?;
         if self.version != 1 {
             return Err("不支持的配置版本".into());
         }

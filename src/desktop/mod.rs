@@ -3,6 +3,7 @@ mod assets;
 mod buffering;
 mod design;
 mod fonts;
+mod message;
 mod recorder;
 mod rest_art;
 mod rest_ui;
@@ -151,6 +152,8 @@ struct Ui {
     controls: Vec<(usize, HWND)>,
     content: HWND,
     advanced: bool,
+    message_expanded: bool,
+    keyword_wheel: f64,
     scroll: i32,
     list_scroll: i32,
     motions: [dunyu::scroll::Motion; 2],
@@ -169,6 +172,7 @@ struct Ui {
 }
 struct App {
     rest: rest_ui::Runtime,
+    message: message::Runtime,
     host: HWND,
     config: AppConfig,
     dir: PathBuf,
@@ -701,6 +705,12 @@ unsafe extern "system" fn procedure(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                     }
                     Some(0)
                 }
+                message::UPDATE => {
+                    if let Some(u) = &a.ui {
+                        ui::set_text(u.window, 920, &a.message.text());
+                    }
+                    Some(0)
+                }
                 rest_ui::ACTION => {
                     a.rest.action(w, Some(l as usize), a.host);
                     Some(0)
@@ -1055,7 +1065,7 @@ pub fn run() {
             .join("data");
         let first = !dir.join("config.json").exists();
         let mut config_error = false;
-        let config = if first {
+        let mut config = if first {
             AppConfig::default()
         } else {
             match load(&dir.join("config.json")) {
@@ -1067,6 +1077,20 @@ pub fn run() {
                 }
             }
         };
+        let mut migrated = config.clone();
+        let migration = message::migrate(&mut migrated.message).and_then(|changed| {
+            if changed {
+                atomic_json(&dir.join("config.json"), &migrated).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        });
+        match migration {
+            Ok(()) => config = migrated,
+            Err(e) => {
+                error(&format!("企业微信配置未迁移，原文件已保留：{e}"));
+                config_error = true;
+            }
+        }
         let (records, can_write) = match std::fs::read(dir.join("recovery.json")) {
             Ok(b) => match serde_json::from_slice::<Vec<Record>>(&b) {
                 Ok(r) => (r, true),
@@ -1097,6 +1121,7 @@ pub fn run() {
             can_write,
             launch_results: Default::default(),
             rest: Default::default(),
+            message: Default::default(),
         };
         app.restore_all();
         if let Err(e) = app.register(&config, first) {
@@ -1113,6 +1138,7 @@ pub fn run() {
             WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
         );
         app.rest.configure(config.rest.clone(), host);
+        app.message.configure(config.message.clone(), host);
         windows_sys::Win32::System::RemoteDesktop::WTSRegisterSessionNotification(host, 0);
         app.tray();
         APP.with(|a| *a.borrow_mut() = Some(app));
@@ -1153,6 +1179,7 @@ pub fn run() {
             for id in a.keys.keys() {
                 UnregisterHotKey(host, *id);
             }
+            a.message.stop();
             a.rest.close();
             KillTimer(host, rest_ui::TIMER_ID);
             windows_sys::Win32::System::RemoteDesktop::WTSUnRegisterSessionNotification(host);
@@ -1232,6 +1259,7 @@ mod tests {
                 can_write: true,
                 launch_results: Default::default(),
                 rest: Default::default(),
+                message: Default::default(),
             };
             app.opacity(h, Some(128), 0).unwrap();
             let (mut color, mut alpha, mut flags) = (0, 0, 0);

@@ -225,7 +225,7 @@ pub(super) unsafe fn control(
         y,
         w,
         h,
-        if page == 99 || matches!(id, 113 | 330 | 506) {
+        if page == 99 || matches!(id, 113 | 330 | 506 | 918) {
             u.window
         } else {
             u.content
@@ -369,6 +369,8 @@ impl App {
             value_font: null_mut(),
             pending_opacity: None,
             advanced: false,
+            message_expanded: !self.config.message.credentials_complete(),
+            keyword_wheel: 0.,
             scroll: 0,
             list_scroll: 0,
             motions: Default::default(),
@@ -1046,6 +1048,96 @@ impl App {
             control(&mut u, 6, "STATIC", label, id, 0, 0, 0, 0, 0);
             u.controls.last_mut().unwrap().0 = 3;
         }
+        control(
+            &mut u,
+            4,
+            "BUTTON",
+            "启用传讯",
+            910,
+            0,
+            0,
+            0,
+            0,
+            WS_TABSTOP | BS_AUTOCHECKBOX as u32,
+        );
+        check(h, 910, self.config.message.enabled);
+        for (id, label, value) in [
+            (
+                911,
+                "关键词（每行一个，命中任一项）",
+                self.config.message.keywords.join("\r\n"),
+            ),
+            (
+                912,
+                "检查间隔（秒）",
+                self.config.message.poll_seconds.to_string(),
+            ),
+            (
+                913,
+                "转发延迟（秒）",
+                self.config.message.delay_seconds.to_string(),
+            ),
+            (914, "企业 ID", String::new()),
+            (915, "应用 ID", String::new()),
+            (916, "Secret", String::new()),
+            (917, "接收成员", String::new()),
+        ] {
+            control(&mut u, 4, "STATIC", label, 6000 + id, 0, 0, 0, 0, 0);
+            control(
+                &mut u,
+                4,
+                "EDIT",
+                &value,
+                id,
+                0,
+                0,
+                0,
+                0,
+                WS_TABSTOP
+                    | if id == 911 {
+                        ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32 | ES_WANTRETURN as u32
+                    } else {
+                        ES_AUTOHSCROLL as u32
+                    }
+                    | if (914..=917).contains(&id) {
+                        ES_PASSWORD as u32
+                    } else {
+                        0
+                    },
+            );
+        }
+        for (id, label) in [
+            (918, "保存设置"),
+            (919, "发送测试消息"),
+            (921, "清除企业微信配置"),
+            (922, "企业微信配置  +"),
+        ] {
+            control(&mut u, 4, "BUTTON", label, id, 0, 0, 0, 0, WS_TABSTOP);
+        }
+        control(
+            &mut u,
+            4,
+            "STATIC",
+            &self.message.text(),
+            920,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+        control(
+            &mut u,
+            4,
+            "STATIC",
+            "留空保留，填写替换；接收成员默认全部。",
+            923,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
         self.ui = Some(u);
         self.scale_ui(GetDpiForWindow(h).max(96), None);
         self.refresh_list();
@@ -1246,7 +1338,7 @@ impl App {
             let measured = theme::label_size(item(u.window, id));
             minimum.max((measured.cx * 96 + u.dpi as i32 - 1) / u.dpi as i32 + 24)
         };
-        let save_width = [113, 330, 506]
+        let save_width = [113, 330, 506, 918]
             .into_iter()
             .map(|id| button_width(id, 156))
             .max()
@@ -1287,7 +1379,13 @@ impl App {
                     738 + action_rows * 56 + 12
                 }
             }
-            4 => 0,
+            4 => {
+                if u.message_expanded {
+                    if width >= 688 { 508 } else { 644 }
+                } else {
+                    352
+                }
+            }
             _ => {
                 if columns == 2 {
                     390
@@ -1301,7 +1399,7 @@ impl App {
             height,
             split: u.split_ratio,
         };
-        let reference = super::design::reference_layout(columns, u.page, u.advanced);
+        let reference = u.page != 4 && super::design::reference_layout(columns, u.page, u.advanced);
         // The content host must stop above every fixed footer control. The save
         // button can grow with font metrics, so reserve its painted bounds too.
         let mut footer_top = if reference {
@@ -1313,6 +1411,7 @@ impl App {
             0 => Some(113),
             1 => Some(330),
             5 => Some(506),
+            4 => Some(918),
             _ => None,
         };
         if let Some(id) = save {
@@ -1405,7 +1504,9 @@ impl App {
                 }
                 cards.push(rect(44, common_y + 42 - u.scroll, bw - 88, 128));
             }
-            4 => {}
+            4 => {
+                cards.push(rect(24, 12 - u.scroll, bw - 48, extent - 12));
+            }
             _ => {
                 if columns == 2 {
                     let left = (bw - 64) * 3 / 5;
@@ -1466,7 +1567,7 @@ impl App {
         let mut placements = vec![];
         for (page, c) in &u.controls {
             let id = GetDlgCtrlID(*c);
-            let root = *page == 99 || matches!(id, 113 | 330 | 506);
+            let root = *page == 99 || matches!(id, 113 | 330 | 506 | 918);
             if scrolling && root {
                 continue;
             }
@@ -1482,7 +1583,9 @@ impl App {
                 119 => Some((36, 76, left_width - 40, (viewport - 160).max(64))),
                 120 => Some((24 + left_width, 12, 16, (viewport - 24).max(180))),
                 9001 => Some((24, height - 38, width - save_width - 64, 30)),
-                113 | 330 | 506 => Some((width - save_width - 24, height - 54, save_width, 44)),
+                113 | 330 | 506 | 918 => {
+                    Some((width - save_width - 24, height - 54, save_width, 44))
+                }
                 7000 => Some((44, 32, left_width - 40, 28)),
                 100 => Some((
                     0,
@@ -1677,6 +1780,66 @@ impl App {
                         40,
                     ))
                 }
+                910 => Some((44, 20, bw - 88, 28)),
+                6911 => Some((44, 104, bw - 88, 26)),
+                911 => Some((44, 134, bw - 88, 66)),
+                912 | 913 | 6912 | 6913 => {
+                    let field = if id >= 6000 { id - 6000 } else { id };
+                    let lane = (bw - 104) / 2;
+                    Some((
+                        44 + (field - 912) * (lane + 16) + if id >= 6000 { 0 } else { 148 },
+                        60,
+                        if id >= 6000 { 140 } else { lane - 148 },
+                        32,
+                    ))
+                }
+                922 => Some((44, 212, bw - 88, 32)),
+                923 if u.message_expanded => Some((44, 248, bw - 88, 28)),
+                914..=917 | 6914..=6917 if u.message_expanded => {
+                    let field = if id >= 6000 { id - 6000 } else { id };
+                    let slot = match field {
+                        914 => 0,
+                        915 => 1,
+                        917 => 2,
+                        _ => 3,
+                    };
+                    let narrow = bw < 688;
+                    let lane = (bw - 112) / 3;
+                    let (x, y, w) = if slot == 3 {
+                        (44, if narrow { 480 } else { 344 }, bw - 88)
+                    } else if narrow {
+                        (44, 276 + slot * 68, bw - 88)
+                    } else {
+                        (44 + slot * (lane + 12), 276, lane)
+                    };
+                    Some((
+                        x,
+                        y + if id >= 6000 { 0 } else { 28 },
+                        w,
+                        if id >= 6000 { 26 } else { 32 },
+                    ))
+                }
+                919 => Some((
+                    44,
+                    if u.message_expanded {
+                        if bw < 688 { 544 } else { 408 }
+                    } else {
+                        252
+                    },
+                    190,
+                    36,
+                )),
+                921 if u.message_expanded => Some((250, if bw < 688 { 544 } else { 408 }, 220, 36)),
+                920 => Some((
+                    44,
+                    if u.message_expanded {
+                        if bw < 688 { 588 } else { 452 }
+                    } else {
+                        296
+                    },
+                    bw - 88,
+                    48,
+                )),
                 7051 => None,
                 _ => None,
             };
@@ -1710,7 +1873,7 @@ impl App {
                 ));
             }
             if let Some((x, y, w, h)) = area {
-                let root = *page == 99 || matches!(id, 113 | 330 | 506);
+                let root = *page == 99 || matches!(id, 113 | 330 | 506 | 918);
                 let mut r = rect(
                     x,
                     if root
@@ -1757,11 +1920,15 @@ impl App {
                     }
                     r.left += scale(4);
                     r.right -= scale(4);
-                    let (top, bottom) = super::design::edit_inset(
-                        r.bottom - r.top,
-                        theme::font_line_height(*c),
-                        u.dpi,
-                    );
+                    let (top, bottom) = if id == 911 {
+                        (scale(4), scale(4))
+                    } else {
+                        super::design::edit_inset(
+                            r.bottom - r.top,
+                            theme::font_line_height(*c),
+                            u.dpi,
+                        )
+                    };
                     r.top += top;
                     r.bottom -= bottom;
                 }
@@ -1785,6 +1952,44 @@ impl App {
             }
         }
         if !scrolling {
+            set_text(
+                u.window,
+                922,
+                &format!(
+                    "企业微信配置 · {}  {}",
+                    if self.config.message.credentials_complete() {
+                        "已配置"
+                    } else {
+                        "未配置完整"
+                    },
+                    if u.message_expanded { "−" } else { "+" }
+                ),
+            );
+            for (id, value) in [
+                (914, &self.config.message.corp_id),
+                (915, &self.config.message.agent_id),
+                (916, &self.config.message.secret),
+                (917, &self.config.message.recipients),
+            ] {
+                let name = match id {
+                    914 => "企业 ID",
+                    915 => "应用 ID",
+                    916 => "Secret",
+                    _ => "接收成员",
+                };
+                set_text(
+                    u.window,
+                    id + 6000,
+                    &format!(
+                        "{name}（{}）",
+                        if value.is_empty() {
+                            "未配置"
+                        } else {
+                            "已配置"
+                        }
+                    ),
+                );
+            }
             set_text(
                 u.window,
                 116,
@@ -2090,6 +2295,87 @@ impl App {
     pub(super) unsafe fn ui_action(&mut self, id: i32) -> Result<(), String> {
         let h = self.ui.as_ref().unwrap().window;
         match id {
+            922 => {
+                let u = self.ui.as_mut().unwrap();
+                u.message_expanded = !u.message_expanded;
+                u.scroll = 0;
+                u.motions[0].snap(0.);
+                SetFocus(item(h, 922));
+                self.layout_ui();
+            }
+            918 => {
+                let mut next = self.config.clone();
+                let c = &mut next.message;
+                c.enabled = checked(h, 910);
+                c.keywords = dunyu::message::keywords(&text_at(h, 911));
+                c.poll_seconds = text_at(h, 912).parse().map_err(|_| "检查间隔须为整数")?;
+                c.delay_seconds = text_at(h, 913).parse().map_err(|_| "转发延迟须为整数")?;
+                for (id, value) in [
+                    (914, &mut c.corp_id),
+                    (915, &mut c.agent_id),
+                    (916, &mut c.secret),
+                    (917, &mut c.recipients),
+                ] {
+                    let entered = text_at(h, id);
+                    let entered = if id == 916 {
+                        entered.as_str()
+                    } else {
+                        entered.trim()
+                    };
+                    if !entered.is_empty() {
+                        *value = message::encrypted(entered)?;
+                    }
+                }
+                message::migrate(c)?;
+                if c.recipients.is_empty() {
+                    c.recipients = message::encrypted("@all")?;
+                }
+                c.validate()?;
+                if c.enabled {
+                    message::validate_credentials(c)?;
+                }
+                atomic_json(&self.dir.join("config.json"), &next).map_err(|e| e.to_string())?;
+                self.config = next;
+                for id in 914..=917 {
+                    set_text(h, id, "");
+                }
+                self.ui.as_mut().unwrap().message_expanded =
+                    !self.config.message.credentials_complete();
+                self.ui.as_mut().unwrap().motions[0].snap(0.);
+                self.ui.as_mut().unwrap().scroll = 0;
+                self.layout_ui();
+                self.message
+                    .configure(self.config.message.clone(), self.host);
+                set_text(h, 920, &self.message.text());
+                self.status_success("传讯设置已保存");
+            }
+            919 => {
+                let mut c = self.config.message.clone();
+                c.enabled = true;
+                c.validate()?;
+                self.message.test(c, self.host);
+                self.status("正在发送测试消息");
+            }
+            921 => {
+                let mut next = self.config.clone();
+                next.message.corp_id = Default::default();
+                next.message.agent_id = Default::default();
+                next.message.secret = Default::default();
+                next.message.recipients = Default::default();
+                next.message.enabled = false;
+                atomic_json(&self.dir.join("config.json"), &next).map_err(|e| e.to_string())?;
+                self.config = next;
+                self.message
+                    .configure(self.config.message.clone(), self.host);
+                check(h, 910, false);
+                for id in 914..=917 {
+                    set_text(h, id, "");
+                }
+                self.ui.as_mut().unwrap().message_expanded = true;
+                self.layout_ui();
+                set_text(h, 920, &self.message.text());
+                self.status_success("企业微信配置已清除，传讯已停用");
+            }
             800 | 817 => {
                 self.layout_ui();
             }
@@ -2490,6 +2776,7 @@ mod capture_tests {
                 can_write: true,
                 launch_results: Default::default(),
                 rest: Default::default(),
+                message: Default::default(),
             },
             external,
             _graphics: graphics,
@@ -2604,10 +2891,10 @@ mod capture_tests {
             set_text(h, 201, "C:\\测试\\demo.exe");
             check(h, 208, false);
             assert_ne!(app.rule_snapshot(), app.ui.as_ref().unwrap().baseline);
-            // Switching through the reserved page must not expose settings controls.
+            // Switching to message settings must not expose other pages.
             app.page(4);
-            for (_, child) in &app.ui.as_ref().unwrap().controls {
-                if GetParent(*child) == app.ui.as_ref().unwrap().content {
+            for (page, child) in &app.ui.as_ref().unwrap().controls {
+                if *page != 4 && GetParent(*child) == app.ui.as_ref().unwrap().content {
                     assert_eq!(
                         IsWindowVisible(*child),
                         0,
@@ -2889,6 +3176,111 @@ mod capture_tests {
                 }
             }
             app.scale_ui(96, None);
+            app.page(0);
+            app.page(4);
+            assert_ne!(IsWindowVisible(item(h, 918)), 0);
+            assert_ne!(IsWindowVisible(item(h, 911)), 0);
+            set_text(h, 911, "telegram\r\n Telegram \r\n微信");
+            app.ui_action(918).unwrap();
+            assert_eq!(
+                load(&app.dir.join("config.json")).unwrap().message.keywords,
+                vec!["telegram", "微信"]
+            );
+            set_text(h, 912, "0");
+            assert!(app.ui_action(918).is_err());
+            assert_eq!(app.config.message.poll_seconds, 10);
+            set_text(h, 912, "10");
+            assert_eq!(
+                GetWindowLongPtrW(item(h, 911), GWL_STYLE) as u32 & WS_VSCROLL,
+                0
+            );
+            for (id, value) in [
+                (914, "test-corporation"),
+                (915, "123456"),
+                (916, "test-application-secret"),
+                (917, "test-member"),
+            ] {
+                assert!(text_at(h, id).is_empty());
+                assert_ne!(
+                    GetWindowLongPtrW(item(h, id), GWL_STYLE) as u32 & ES_PASSWORD as u32,
+                    0
+                );
+                set_text(h, id, value);
+            }
+            for dpi in [96, 120, 144, 192] {
+                app.scale_ui(dpi, None);
+                let mut client: RECT = std::mem::zeroed();
+                GetClientRect(h, &mut client);
+                if client.right * 96 / dpi as i32 >= 688 {
+                    let mut row_y = None;
+                    for id in [914, 915, 917] {
+                        let mut r: RECT = std::mem::zeroed();
+                        GetWindowRect(item(h, id), &mut r);
+                        if let Some(y) = row_y {
+                            assert_eq!(r.top, y);
+                        } else {
+                            row_y = Some(r.top);
+                        }
+                        assert!(r.right > r.left);
+                    }
+                }
+                if client.bottom * 96 / dpi as i32 >= 651 && client.right * 96 / dpi as i32 >= 688 {
+                    assert_eq!(
+                        IsWindowVisible(item(h, 9003)),
+                        0,
+                        "default message layout should fit one page"
+                    );
+                }
+            }
+            app.scale_ui(96, None);
+            app.ui_action(918).unwrap();
+            let saved = app.config.message.clone();
+            assert!(!app.ui.as_ref().unwrap().message_expanded);
+            for id in 914..=917 {
+                assert!(text_at(h, id).is_empty());
+                assert_eq!(IsWindowVisible(item(h, id)), 0);
+            }
+            let disk = std::fs::read_to_string(app.dir.join("config.json")).unwrap();
+            for value in [
+                "test-corporation",
+                "test-application-secret",
+                "test-member",
+                "123456",
+            ] {
+                assert!(!disk.contains(value));
+            }
+            app.ui_action(922).unwrap();
+            set_text(h, 914, "replacement-corporation");
+            app.ui_action(922).unwrap();
+            app.ui_action(922).unwrap();
+            assert_eq!(text_at(h, 914), "replacement-corporation");
+            set_text(h, 912, "0");
+            assert!(app.ui_action(918).is_err());
+            assert_eq!(app.config.message, saved);
+            assert_eq!(text_at(h, 914), "replacement-corporation");
+            set_text(h, 912, "10");
+            app.ui_action(918).unwrap();
+            assert_ne!(app.config.message.corp_id, saved.corp_id);
+            assert_eq!(app.config.message.secret, saved.secret);
+            assert_eq!(app.config.message.agent_id, saved.agent_id);
+            assert_eq!(app.config.message.recipients, saved.recipients);
+            app.ui_action(922).unwrap();
+            if std::env::var_os("DUNYU_UI_SCREENSHOTS").is_some() {
+                std::fs::create_dir_all("target/ui-preview").unwrap();
+                theme::capture(h, "target/ui-preview/message-expanded.bmp").unwrap();
+                app.ui_action(922).unwrap();
+                theme::capture(h, "target/ui-preview/message-collapsed.bmp").unwrap();
+            }
+            app.ui_action(921).unwrap();
+            assert!(!app.config.message.enabled);
+            for value in [
+                &app.config.message.corp_id,
+                &app.config.message.agent_id,
+                &app.config.message.secret,
+                &app.config.message.recipients,
+            ] {
+                assert!(value.is_empty());
+            }
             app.page(0);
             if std::env::var_os("DUNYU_UI_SCREENSHOTS").is_some() {
                 app.ui.as_mut().unwrap().split_ratio = super::super::design::SPLIT;
