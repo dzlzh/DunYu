@@ -413,7 +413,7 @@ impl App {
             &mut u,
             99,
             "STATIC",
-            "就绪 · 关闭窗口后继续在托盘运行",
+            "就绪 · 关闭窗口后继续在后台运行",
             9001,
             20,
             560,
@@ -901,6 +901,31 @@ impl App {
         control(
             &mut u,
             3,
+            "BUTTON",
+            "隐藏托盘图标",
+            507,
+            244,
+            424,
+            500,
+            30,
+            BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
+        );
+        check(h, 507, self.config.hide_tray);
+        control(
+            &mut u,
+            3,
+            "STATIC",
+            "隐藏后，再次运行遁鱼可打开配置界面。",
+            7052,
+            244,
+            464,
+            500,
+            56,
+            0,
+        );
+        control(
+            &mut u,
+            3,
             "STATIC",
             "每次改变的不透明度百分点",
             7051,
@@ -1267,7 +1292,7 @@ impl App {
                 if columns == 2 {
                     390
                 } else {
-                    660
+                    772
                 }
             }
         };
@@ -1386,11 +1411,11 @@ impl App {
                     let left = (bw - 64) * 3 / 5;
                     cards.push(rect(24, 64 - u.scroll, left, 296));
                     cards.push(rect(40 + left, 64 - u.scroll, bw - left - 64, 156));
-                    cards.push(rect(40 + left, 236 - u.scroll, bw - left - 64, 124));
+                    cards.push(rect(40 + left, 236 - u.scroll, bw - left - 64, 232));
                 } else {
                     cards.push(rect(24, 64 - u.scroll, bw - 48, 296));
                     cards.push(rect(24, 376 - u.scroll, bw - 48, 140));
-                    cards.push(rect(24, 532 - u.scroll, bw - 48, 116));
+                    cards.push(rect(24, 532 - u.scroll, bw - 48, 228));
                 }
             }
         }
@@ -1584,7 +1609,7 @@ impl App {
                         36,
                     ))
                 }
-                7040 | 6504 | 504 | 7050 | 505 => {
+                7040 | 6504 | 504 | 7050 | 505 | 507 | 7052 => {
                     let x = if columns == 2 {
                         60 + (bw - 64) * 3 / 5
                     } else {
@@ -1597,6 +1622,8 @@ impl App {
                         6504 => Some((x, y + 48, w, 24)),
                         504 => Some((x, y + 80, w.min(160), 36)),
                         7050 => Some((x, if columns == 2 { 252 } else { 548 }, w, 32)),
+                        507 => Some((x, if columns == 2 { 340 } else { 634 }, w, 32)),
+                        7052 => Some((x, if columns == 2 { 380 } else { 674 }, w, 64)),
                         _ => Some((x, if columns == 2 { 300 } else { 594 }, w, 32)),
                     }
                 }
@@ -2249,12 +2276,14 @@ impl App {
                 c.restore_all = parse_key(&text_at(h, 503))?;
                 c.step = text_at(h, 504).parse().map_err(|_| "步长应为整数")?;
                 c.autostart = checked(h, 505);
+                c.hide_tray = checked(h, 507);
                 let old = self.config.clone();
                 self.apply_config(c.clone())?;
                 if let Err(e) = autostart(c.autostart) {
                     let _ = self.apply_config(old);
                     return Err(e);
                 }
+                self.tray();
             }
             _ => {}
         }
@@ -2542,6 +2571,28 @@ mod capture_tests {
             let app = &mut f.app;
             let h = app.ui.as_ref().unwrap().window;
             assert!(!item(h, 201).is_null());
+            assert!(!checked(h, 507));
+            app.page(5);
+            check(h, 507, true);
+            app.page(0);
+            app.page(5);
+            ShowWindow(h, SW_HIDE);
+            app.open_ui();
+            assert!(checked(h, 507), "hidden-tray draft must survive reopening");
+            assert!(!app.config.hide_tray, "unsaved draft must not take effect");
+            app.pending.push(Pending {
+                rule: 0,
+                started: Instant::now(),
+            });
+            assert!(app.ui_action(506).is_err());
+            assert!(
+                !app.config.hide_tray,
+                "failed save must keep the old setting"
+            );
+            assert!(checked(h, 507), "failed save must preserve the draft");
+            app.pending.clear();
+            check(h, 507, false);
+            app.page(0);
             assert_eq!(
                 IsWindowVisible(item(h, 9004)),
                 0,
@@ -2631,6 +2682,35 @@ mod capture_tests {
                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
                 );
                 app.layout_ui();
+                app.page(5);
+                for dpi in [96, 120, 144, 192] {
+                    app.scale_ui(dpi, None);
+                    for id in [507, 7052] {
+                        let child = item(h, id);
+                        assert_ne!(IsWindowVisible(child), 0);
+                        let mut bounds: RECT = std::mem::zeroed();
+                        GetClientRect(child, &mut bounds);
+                        let dc = GetDC(child);
+                        let old =
+                            SelectObject(dc, SendMessageW(child, WM_GETFONT, 0, 0) as HGDIOBJ);
+                        let mut needed = bounds;
+                        if id == 507 {
+                            needed.right -= 28 * dpi as i32 / 96;
+                        }
+                        DrawTextW(
+                            dc,
+                            wide(&title(child)).as_ptr(),
+                            -1,
+                            &mut needed,
+                            DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
+                        );
+                        SelectObject(dc, old);
+                        ReleaseDC(child, dc);
+                        assert!(needed.bottom <= bounds.bottom, "clipped tray option {id}");
+                    }
+                }
+                app.scale_ui(96, None);
+                app.page(0);
                 assert!(SendMessageW(app.ui.as_ref().unwrap().list, LB_GETCOUNT, 0, 0) > 0);
                 assert_eq!(IsWindowVisible(item(h, 118)), 0);
                 app.config.rules.clear();

@@ -604,6 +604,10 @@ impl App {
         n.cbSize = std::mem::size_of_val(&n) as u32;
         n.hWnd = self.host;
         n.uID = 1;
+        if self.config.hide_tray {
+            Shell_NotifyIconW(NIM_DELETE, &n);
+            return;
+        }
         n.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         n.uCallbackMessage = TRAY;
         n.hIcon = LoadIconW(GetModuleHandleW(null()), 101usize as _);

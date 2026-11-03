@@ -43,6 +43,8 @@ pub struct AppConfig {
     pub step: u8,
     pub autostart: bool,
     #[serde(default)]
+    pub hide_tray: bool,
+    #[serde(default)]
     pub rest: rest::RestConfig,
 }
 impl Default for AppConfig {
@@ -62,6 +64,7 @@ impl Default for AppConfig {
             restore_all: Hotkey::new(3, 8),
             step: 10,
             autostart: false,
+            hide_tray: false,
             rest: Default::default(),
         }
     }
@@ -215,6 +218,14 @@ mod tests {
         assert_eq!(c.bindings(), d.bindings());
     }
     #[test]
+    fn old_config_keeps_tray_visible() {
+        let mut value = serde_json::to_value(AppConfig::default()).unwrap();
+        value.as_object_mut().unwrap().remove("hide_tray");
+        let config: AppConfig = serde_json::from_value(value).unwrap();
+        config.validate().unwrap();
+        assert!(!config.hide_tray);
+    }
+    #[test]
     fn match_requires_process() {
         let r = SummonRule {
             name: "a".into(),
@@ -244,8 +255,13 @@ mod persistence_tests {
         assert_eq!(load(&path).unwrap().step, 10);
         let mut changed = AppConfig::default();
         changed.step = 20;
+        changed.hide_tray = true;
         atomic_json(&path, &changed).unwrap();
         assert_eq!(load(&path).unwrap().step, 20);
+        assert!(load(&path).unwrap().hide_tray);
+        changed.hide_tray = false;
+        atomic_json(&path, &changed).unwrap();
+        assert!(!load(&path).unwrap().hide_tray);
         fs::write(&path, b"broken config").unwrap();
         assert!(load(&path).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"broken config");
