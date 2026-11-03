@@ -16,7 +16,7 @@ impl Hotkey {
         Self { modifiers, key }
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SummonRule {
     pub name: String,
     pub enabled: bool,

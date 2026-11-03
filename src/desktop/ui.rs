@@ -2340,9 +2340,13 @@ impl App {
             return Err("程序正在启动，请稍后保存".into());
         }
         self.register(&c, true)?;
+        // Hidden targets cannot be rediscovered by find(); unrelated settings
+        // must preserve their tokens. Rule changes can invalidate index mappings.
+        if self.config.rules != c.rules {
+            self.targets.clear();
+        }
         self.config = c;
         self.slots.resize(self.config.slots.len(), None);
-        self.targets.clear();
         self.refresh_list();
         Ok(())
     }
@@ -3077,11 +3081,103 @@ mod capture_tests {
         drain();
     }
 
+    unsafe fn summon_target_survives_settings_save(f: &mut Fixture) {
+        let external = f.external;
+        APP.with(|cell| {
+            assert!(cell.borrow().is_none());
+            *cell.borrow_mut() = Some(std::mem::replace(
+                &mut f.app,
+                test_app(null_mut(), PathBuf::new()),
+            ));
+        });
+        let _active = ActiveFixture(f);
+        let with_app = |action: &mut dyn FnMut(&mut App)| {
+            APP.with(|cell| action(cell.borrow_mut().as_mut().unwrap()));
+        };
+        let h = APP.with(|cell| cell.borrow().as_ref().unwrap().ui.as_ref().unwrap().window);
+        let original = APP.with(|cell| cell.borrow().as_ref().unwrap().config.clone());
+        with_app(&mut |app| {
+            let mut config = original.clone();
+            config.rules.push(SummonRule {
+                name: "Settings save target".into(),
+                // Dispatch directly so this regression does not reserve global keys.
+                enabled: false,
+                executable: "unused-fixture.exe".into(),
+                arguments: String::new(),
+                working_directory: String::new(),
+                process_path: process(external).unwrap().2,
+                class: class(external),
+                title: title(external),
+                hotkey: Hotkey::new(3, 65),
+                minimize: false,
+                priority_hotkey: false,
+            });
+            app.apply_config(config).unwrap();
+            ShowWindow(external, SW_SHOWNOACTIVATE);
+            assert_eq!(app.find(0), Some(external));
+            app.summon(0).unwrap();
+            assert_eq!(app.targets[&0].hwnd, external as usize);
+        });
+        for hide_tray in [true, false, false] {
+            with_app(&mut |app| {
+                // A hidden window cannot be rediscovered by find().
+                ShowWindow(external, SW_HIDE);
+                assert!(app.find(0).is_none());
+                let tag = app.targets[&0].tag;
+                let mut config = app.config.clone();
+                config.hide_tray = hide_tray;
+                config.step += 1;
+                app.apply_config(config).unwrap();
+                // Fail before summon could accidentally launch a process.
+                assert_eq!(app.targets.get(&0).map(|t| t.tag), Some(tag));
+            });
+            SendMessageW(h, WM_CLOSE, 0, 0);
+            assert_eq!(IsWindowVisible(h), 0);
+            with_app(&mut |app| {
+                app.summon(0).unwrap();
+                assert_eq!(app.targets[&0].hwnd, external as usize);
+                assert!(app.pending.is_empty());
+                assert_ne!(IsWindowVisible(external), 0);
+                app.open_ui();
+            });
+        }
+        with_app(&mut |app| {
+            let config = app.config.clone();
+            let tag = app.targets[&0].tag;
+            app.apply_config(config.clone()).unwrap();
+            assert_eq!(app.targets[&0].tag, tag, "unchanged rules keep the target");
+
+            let mut changed = config.clone();
+            changed.rules[0].title.push_str(" changed");
+            let dir = app.dir.clone();
+            let blocked = dir.join("blocked-target-save");
+            std::fs::write(&blocked, b"not a directory").unwrap();
+            app.dir = blocked;
+            let result = app.apply_config(changed.clone());
+            app.dir = dir;
+            assert!(result.is_err());
+            assert_eq!(app.targets[&0].tag, tag, "failed save keeps the target");
+            assert_eq!(app.config.rules[0].title, config.rules[0].title);
+
+            app.apply_config(changed).unwrap();
+            assert!(app.targets.is_empty(), "edited rules invalidate targets");
+            app.apply_config(config).unwrap();
+            ShowWindow(external, SW_SHOWNOACTIVATE);
+            app.summon(0).unwrap();
+            assert!(app.targets.contains_key(&0));
+            app.apply_config(original.clone()).unwrap();
+            assert!(app.targets.is_empty(), "deleted rules invalidate targets");
+            app.fill_rule(None);
+        });
+        ShowWindow(external, SW_HIDE);
+    }
+
     #[test]
     fn editor_drafts_selection_layout_and_target_state() {
         unsafe {
             let mut f = fixture();
             selection_idle_regression(&mut f);
+            summon_target_survives_settings_save(&mut f);
             let external = f.external;
             let app = &mut f.app;
             let h = app.ui.as_ref().unwrap().window;
