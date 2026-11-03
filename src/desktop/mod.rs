@@ -3,6 +3,7 @@ mod assets;
 mod buffering;
 mod design;
 mod fonts;
+mod hotkey_diagnostics;
 mod message;
 mod priority_hotkey;
 mod recorder;
@@ -340,7 +341,13 @@ impl App {
                     self.records[i].show = Some(p.showCmd);
                 }
                 self.journal()?;
-                if ShowWindowAsync(h, if minimize { SW_MINIMIZE } else { SW_HIDE }) == 0 {
+                let shown = ShowWindowAsync(h, if minimize { SW_MINIMIZE } else { SW_HIDE });
+                hotkey_diagnostics::window_operation(
+                    h,
+                    if minimize { "minimize" } else { "hide" },
+                    shown,
+                );
+                if shown == 0 {
                     return Err("窗口隐藏请求失败".into());
                 }
             }
@@ -350,8 +357,11 @@ impl App {
                 } else {
                     SW_SHOW as u32
                 });
-                ShowWindowAsync(h, show as i32);
-                if SetForegroundWindow(h) == 0 {
+                let shown = ShowWindowAsync(h, show as i32);
+                hotkey_diagnostics::window_operation(h, "show", shown);
+                let activated = SetForegroundWindow(h);
+                hotkey_diagnostics::window_operation(h, "set_foreground", activated);
+                if activated == 0 {
                     let mut f = FLASHWINFO {
                         cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
                         hwnd: h,
@@ -476,6 +486,12 @@ impl App {
         Ok(())
     }
     unsafe fn execute(&mut self, c: Command) {
+        let _trace_scope = hotkey_diagnostics::SummonScope::new(match c {
+            Command::Summon(i) if hotkey_diagnostics::watches(&self.config.rules[i].hotkey) => {
+                Some(i)
+            }
+            _ => None,
+        });
         if matches!(c, Command::Opacity(_) | Command::Opaque | Command::Restore) {
             self.cancel_opacity();
         }
@@ -509,6 +525,20 @@ impl App {
                 Ok(())
             }
         };
+        if let Command::Summon(i) = c
+            && hotkey_diagnostics::watches(&self.config.rules[i].hotkey)
+        {
+            hotkey_diagnostics::emit(hotkey_diagnostics::Event {
+                kind: "summon_result",
+                index: i,
+                reason: if result.is_ok() {
+                    "request_accepted"
+                } else {
+                    "request_failed"
+                },
+                ..Default::default()
+            });
+        }
         if let Err(e) = result {
             error(&e);
         }
@@ -711,6 +741,10 @@ unsafe fn dispatch_message(msg: &MSG) {
 }
 
 unsafe extern "system" fn procedure(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    if msg == WM_INPUT {
+        hotkey_diagnostics::raw_input(l);
+        return DefWindowProcW(h, msg, w, l);
+    }
     let handled = std::panic::catch_unwind(|| {
         APP.with(|cell| {
             let Ok(mut guard) = cell.try_borrow_mut() else {
@@ -739,12 +773,33 @@ unsafe extern "system" fn procedure(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
                     Some(0)
                 }
                 priority_hotkey::ACTION => {
-                    if !priority_hotkey::RECORDING.load(std::sync::atomic::Ordering::SeqCst)
-                        && let Some(command) = a
-                            .priority_hotkeys
-                            .as_ref()
-                            .and_then(|r| r.command(w, l as usize))
-                    {
+                    let recording =
+                        priority_hotkey::RECORDING.load(std::sync::atomic::Ordering::SeqCst);
+                    let command = a
+                        .priority_hotkeys
+                        .as_ref()
+                        .and_then(|r| r.command(w, l as usize));
+                    let traced = a
+                        .priority_hotkeys
+                        .as_ref()
+                        .is_some_and(|r| r.diagnostic_route(w, l as usize));
+                    if traced {
+                        hotkey_diagnostics::emit(hotkey_diagnostics::Event {
+                            kind: "command_received",
+                            generation: w,
+                            index: l as usize,
+                            recording,
+                            reason: if recording {
+                                "recording_paused"
+                            } else if command.is_none() {
+                                "stale_route"
+                            } else {
+                                "executing"
+                            },
+                            ..Default::default()
+                        });
+                    }
+                    if !recording && let Some(command) = command {
                         a.execute(command);
                     }
                     Some(0)
@@ -1062,6 +1117,15 @@ unsafe extern "system" fn procedure(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> 
 }
 pub fn run() {
     unsafe {
+        let diagnostic_key = std::env::args()
+            .find_map(|arg| arg.strip_prefix("--diagnose-hotkey=").map(str::to_owned));
+        let diagnostic_key = match diagnostic_key.map(|s| ui::parse_key(&s)).transpose() {
+            Ok(key) => key,
+            Err(e) => {
+                error(&format!("诊断快捷键无效：{e}"));
+                return;
+            }
+        };
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         windows_sys::Win32::UI::Controls::InitCommonControls();
         let mutex = CreateMutexW(null(), 0, wide("Local\\DunYu.Singleton.1").as_ptr());
@@ -1070,6 +1134,11 @@ pub fn run() {
             return;
         }
         if GetLastError() == ERROR_ALREADY_EXISTS {
+            if diagnostic_key.is_some() {
+                error("请先从托盘退出正在运行的遁鱼，再启动快捷键诊断。尚未开始记录。");
+                CloseHandle(mutex);
+                return;
+            }
             let h = FindWindowW(wide(CLASS).as_ptr(), null());
             if !h.is_null() {
                 PostMessageW(h, OPEN, 0, 0);
@@ -1121,6 +1190,18 @@ pub fn run() {
             .parent()
             .unwrap()
             .join("data");
+        let _diagnostics = match diagnostic_key {
+            Some(key) => match hotkey_diagnostics::start(&dir, key, host) {
+                Ok(session) => Some(session),
+                Err(e) => {
+                    error(&format!("无法启动快捷键诊断：{e}"));
+                    DestroyWindow(host);
+                    CloseHandle(mutex);
+                    return;
+                }
+            },
+            None => None,
+        };
         let first = !dir.join("config.json").exists();
         let mut config_error = false;
         let mut config = if first {

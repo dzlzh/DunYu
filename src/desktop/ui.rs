@@ -48,23 +48,48 @@ pub(super) unsafe fn capture_hotkey(window: HWND, msg: &MSG) -> bool {
 }
 
 unsafe fn capture_key_message(field: HWND, msg: &MSG) -> bool {
+    let watched_key = if msg.message == WM_HOTKEY {
+        (msg.lParam as u32 >> 16) & 0xffff
+    } else {
+        msg.wParam as u32
+    };
+    if matches!(
+        msg.message,
+        WM_HOTKEY | WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP
+    ) && hotkey_diagnostics::watches_key(watched_key)
+    {
+        hotkey_diagnostics::emit(hotkey_diagnostics::Event {
+            source: "fallback",
+            kind: "recording_fallback",
+            field: field as usize,
+            focus: GetFocus() as usize,
+            control_id: GetDlgCtrlID(field),
+            key: watched_key,
+            message: msg.message,
+            ..Default::default()
+        });
+    }
+    let keyboard_modifiers = || {
+        let mut modifiers = 0;
+        for (vk, flag) in [
+            (VK_CONTROL, MOD_CONTROL),
+            (VK_MENU, MOD_ALT),
+            (VK_SHIFT, MOD_SHIFT),
+            (VK_LWIN, MOD_WIN),
+            (VK_RWIN, MOD_WIN),
+        ] {
+            if GetKeyState(vk as i32) < 0 {
+                modifiers |= flag;
+            }
+        }
+        modifiers
+    };
     let (modifiers, key) = match msg.message {
         // Registered combinations arrive here instead of as ordinary keydowns.
         // Consume them so recording an existing binding never executes it.
         WM_HOTKEY => (msg.lParam as u32 & 15, (msg.lParam as u32 >> 16) & 0xffff),
         WM_KEYDOWN | WM_SYSKEYDOWN => {
-            let mut modifiers = 0;
-            for (vk, flag) in [
-                (VK_CONTROL, MOD_CONTROL),
-                (VK_MENU, MOD_ALT),
-                (VK_SHIFT, MOD_SHIFT),
-                (VK_LWIN, MOD_WIN),
-                (VK_RWIN, MOD_WIN),
-            ] {
-                if GetKeyState(vk as i32) < 0 {
-                    modifiers |= flag;
-                }
-            }
+            let modifiers = keyboard_modifiers();
             let key = msg.wParam as u32;
             if key == VK_TAB as u32 && modifiers & !MOD_SHIFT == 0 {
                 return false;
@@ -73,24 +98,28 @@ unsafe fn capture_key_message(field: HWND, msg: &MSG) -> bool {
                 SetFocus(GetNextDlgTabItem(GetParent(field), field, 0));
                 return true;
             }
-            if msg.lParam & (1 << 30) != 0 || matches!(key, 0x10..=0x12 | 0x5b..=0x5c | 0xa0..=0xa5)
-            {
+            if matches!(key, 0x10..=0x12 | 0x5b..=0x5c | 0xa0..=0xa5) {
+                super::recorder::fallback(field, 0, modifiers);
+                return true;
+            }
+            if msg.lParam & (1 << 30) != 0 {
                 return true;
             }
             (modifiers, key)
         }
-        WM_KEYUP | WM_SYSKEYUP | WM_CHAR | WM_SYSCHAR | WM_DEADCHAR | WM_SYSDEADCHAR => {
+        WM_KEYUP | WM_SYSKEYUP => {
+            if matches!(msg.wParam as u32, 0x10..=0x12 | 0x5b..=0x5c | 0xa0..=0xa5) {
+                super::recorder::fallback(field, 0, keyboard_modifiers());
+            }
             return true;
         }
+        WM_CHAR | WM_SYSCHAR | WM_DEADCHAR | WM_SYSDEADCHAR => return true,
         _ => return false,
     };
     if modifiers != 0
         && matches!(key, 8 | 0x20 | 0x25 | 0x27 | 0x30..=0x39 | 0x41..=0x5a | 0x70..=0x7a)
     {
-        SetWindowTextW(
-            field,
-            wide(&hotkey_text(&Hotkey::new(modifiers, key))).as_ptr(),
-        );
+        super::recorder::fallback(field, key, modifiers);
     } else {
         windows_sys::Win32::System::Diagnostics::Debug::MessageBeep(MB_ICONWARNING);
     }
@@ -2720,6 +2749,7 @@ pub(super) unsafe fn autostart(enabled: bool) -> Result<(), String> {
 #[cfg(test)]
 mod capture_tests {
     use super::*;
+    include!("recorder_checks.rs");
 
     pub(super) struct Fixture {
         pub(super) app: App,

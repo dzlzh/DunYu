@@ -1247,13 +1247,13 @@ unsafe extern "system" fn procedure(
         }
         WM_ACTIVATE if role == Role::Surface && GetAncestor(h, GA_ROOT) == h => {
             if w & 0xffff == WA_INACTIVE as usize {
-                super::recorder::stop();
+                super::recorder::stop_with_reason("window_deactivated");
             } else {
                 super::recorder::start(GetFocus());
             }
         }
         WM_SHOWWINDOW if w == 0 && role == Role::Surface => {
-            super::recorder::stop();
+            super::recorder::stop_with_reason("surface_hidden");
         }
         super::recorder::RECORDED => {
             super::recorder::deliver(h, w, l);
@@ -1285,7 +1285,7 @@ unsafe extern "system" fn procedure(
                     super::recorder::start(h);
                 }
                 if m == WM_KILLFOCUS {
-                    super::recorder::stop();
+                    super::recorder::stop_with_reason("field_lost_focus");
                 }
             }
             InvalidateRect(h, null(), 0);

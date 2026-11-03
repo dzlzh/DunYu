@@ -181,3 +181,53 @@ python scripts/prepare-assets.py --check
 接管模式按下只触发一次，长按不会反复隐藏／显示。录入快捷键期间暂停接管；修改或保存失败保留原绑定。停用规则或退出遁鱼后恢复原快捷键行为。取消接管时若普通注册仍有冲突，保存会失败，旧接管规则继续生效；可先停用规则或更换组合键。
 
 此功能无法保证覆盖所有系统组合键；Ctrl+Alt+Del、安全桌面、锁屏等不属于普通键盘钩子可保证接管的范围。其他软件的键盘钩子及权限差异也可能影响效果。Win/Alt 组合使用空操作按键屏蔽菜单误弹；若系统拒绝此操作，该次按键放行。程序模拟注入的按键不会触发接管召唤。Windows 实机需验证系统动作不再触发、Win/Alt 松开不误弹菜单、左右修饰键、录入、长按、保存失败与退出后的恢复。
+
+## Win+Q 首次漏接诊断
+
+诊断版保留原来的接管行为。将诊断包中的 `dunyu.exe` 和 `run-hotkey-diagnostics.cmd` 放在原程序目录，保留已有 `data` 文件夹。先从托盘退出旧进程，再双击脚本。也可运行 `dunyu.exe --diagnose-hotkey=Win+Q`。普通启动不记录；已有实例运行时诊断启动会报提示，不会将开关悄悄交给旧实例。
+
+确认 Win+Q 规则启用且已保存“优先接管”。分别把桌面、普通 Windows Terminal、普通 WezTerm 放到前台，每种情况重复三轮：完整按下并松开一次 Win+Q；若只弹出搜索，再按一次。每轮第一次按键前必须重新把焦点移回被测程序。记录测试顺序和每轮结果，最后从托盘正常退出遁鱼，将本次 `data/hotkey-diagnostics-时间-进程号.jsonl` 提供给开发者。
+
+日志记录目标主键、修饰键变化、异步键态、模拟输入标志、匹配／暂停／放行原因、辅助输入结果和命令投递／接收／执行请求结果。`request_accepted` 只代表召唤请求未返回错误，不保证窗口已成功置前。前台窗口句柄和进程号在事件发生时采集，进程名及完整性级别在日志线程读取；读取失败为 null。不会记录窗口标题、终端文本、其他普通按键或配置凭据。其他规则改动与命令日志只保留被监控组合的关联元数据。
+
+`menu_mask_failed` 表示辅助输入失败后放行；`unmatched_or_repeat` 结合 modifiers、repeated 和前面的修饰键事件判断是否漏识别；`injected_passthrough` 表示模拟输入被跳过；`recording_paused` 表示正在录入；`command_post_failed` 表示投递失败；`stale_route` 表示配置更新后旧命令被忽略。错误值不能单独证明 UIPI 权限限制。规则版本与规则索引关联发送和接收，时间以会话启动后的微秒记录；异步写入的行顺序不代表处理先后。
+
+钩子通过容量为256的非阻塞队列传递日志，文件写入和进程查询在独立线程完成。正常结束写入 `session_end`；缺少结束记录、`complete=false` 或 dropped 非零表示采集不完整。没有某次按键日志不能单独证明钩子被系统移除。仅编译通过不代表已在终端场景复现或修复。
+
+
+### Win+Q v2 对照记录
+
+v2 历史诊断包的日志首行为 `revision=winq-trace-v2`，并包含 Windows 构建号、UBR 和远程会话标志（该标志只识别系统远程会话，不能排除所有远程控制工具）。普通启动仍不采集。
+
+- `hook_entry` 与 `key_decision` 用 `callback_id` 对应；`n_code`、`scan_code`、`input_time_ms` 标明入口条件。负 nCode 仅记录 `hook_bypass` 元数据，不读取按键结构。
+- `raw_input_registration` 和 `foreground_registration` 的 count 均应为1；否则该观察通道不可用，error 记录注册错误。Raw Input 使用 INPUTSINK，不设置 NOLEGACY 或 NOHOTKEYS，也不触发召唤。只保留目标键和左右修饰键。
+- `raw_input` 与钩子记录按键码、方向、扫描码和系统毫秒时间对照；Raw Input 缺失本身不能证明键盘没有发送事件。该时间与会话 `us` 使用不同时间基准，且32位系统毫秒会回绕。
+- `foreground_initial` / `foreground_changed` 给出前台变化；变化事件的 HWND 来自系统通知，进程查询仍在写入线程完成。`window_operation` 记录目标 HWND、规则索引、show/hide/minimize/set_foreground 动作及 API 返回值 count。ShowWindowAsync 返回成功仅代表请求提交；结合后续前台事件核实激活。
+- `async_key_down_before_event` 明确表示回调读取到的异步键态；保留的 repeated 字段含义相同，松开时为 true 不表示重复触发。`recording_state_reset` 和 epoch_before/after 记录录入状态变化造成的按键状态清理。
+- seq 为提交日志的唯一序号，跨线程文件顺序可以不同；丢失会形成缺号。dropped_so_far 是写入时的累计丢失数，session_end 的 attempted_events、dropped、complete 给出最终统计。callback_id 仅关联钩子入口与处理结果，不是 UI 命令编号。
+
+测试每种前台程序五轮，关注启动后的首次按键，以及成功召唤并隐藏 Telegram、返回终端后的再次按键。每次完整松开 Win 和 Q，记录是否弹出搜索。正常退出后检查 session_end 和两个观察通道的注册结果；诊断包本身不代表首次漏接已经修复。
+
+### 快捷键录入诊断 v4
+
+先退出遁鱼，解压整个 `DunYu-hotkey-diagnostics-v4.zip`，双击 `run-recording-diagnostics.cmd`。保持测试窗口可见、松开全部按键，测试期间不要切换窗口或输入。测试使用临时配置和停用的虚构召唤规则，不改动用户配置。
+
+脚本依次运行四个独立进程：`none`（无诊断）、`log`（仅事件日志）、`foreground`（日志加前台观察器）、`raw`（日志加 Raw Input）。每组执行相同案例，避免观察器和钩子状态跨组残留。后两组仅用于实验对照，其失败仍如实计入汇总；需要结合各组结果判断受影响的运行方式，不能将观察路径的失败直接推广为所有 Windows 环境的结论。
+
+检测 Ctrl+Alt、左右 Win 的预览及完整录入、松键、失焦、保存；另有停用录入钩子但保留会话的 Ctrl+Alt+W 备用路径检查、WM_HOTKEY 提交检查、过期会话消息及切页／关闭后的清理检查。独立的测试计数器检查实际钩子回调，避免备用路径成功掩盖钩子无回调。
+
+请提供整个 `recording-results-*` 目录：顶层 `comparison.json` 为对照汇总，各组有 `checks.jsonl`、`summary.json`、`stdout.log`、`stderr.log`，启用日志的组另有诊断 JSONL。`FAIL` 表示已有检查失败，优先于 `INCOMPLETE`；焦点无法在两秒内就绪、输入注入或观察器注册失败会标记未完成。后续未完成不会抹去前面的失败。测试进程意外退出时，启动脚本仍会收集已写入的检查结果。
+
+普通 `--diagnose-hotkey=Win+Q` 默认只记录现有事件及事件发生时的前台快照，不额外注册 Raw Input 或前台观察器。v4 首行的 `observers` 明确标记本次请求的观察通道；启用观察器时还需检查对应注册事件的 count 是否为1。普通启动不采集日志。
+
+`winq-trace-v4` 保留录入会话、安装结果与错误码、停止原因、回调判断、投递与提交、备用消息路径。`recording_session` 关联会话，`field_hwnd`／`focus_hwnd` 和 `control_id` 定位焦点；`source` 区分 recorder、priority、fallback。只记录指定主键和修饰键，不采集日常文字。没有回调本身不能证明钩子超时移除。日志 `session_end.complete` 仅表示日志写入完整，与测试通过无关。
+
+自动测试使用 SendInput；它不能替代物理键盘验证系统保留快捷键。通过自动检测后，在实际程序中检查录入已有绑定不会召唤、切页及关闭设置后恢复触发，并用 `run-hotkey-diagnostics.cmd` 验证 Win+Q 保存后的接管。录入诊断与全局接管是不同阶段。
+
+#### v4 本轮实机验收
+
+2026-11-03，Windows build 26300、UBR 9818 的 `recording-results-20261103-143001-400` 报告中，无诊断、仅日志、日志加前台观察三组均为 54/54 通过。Raw Input 组有 12 项检查失败、1 个案例未完成，且没有录入钩子入口记录；左右 Win+Q 触发了系统搜索。故障集中在额外开启 Raw Input 的观察路径，底层机制尚未确认。
+
+Ctrl+Alt+W 的失焦保留与保存检查在四组中均通过。测试者另外确认 v4 普通启动时，物理键盘录入、保存及 Win+Q 召唤正常，本轮功能修复据此验收。此结论限于本次环境和测试范围。
+
+Raw Input 实验组继续保留真实的 FAIL，不改成通过或忽略；因此四组对照的汇总仍为 FAIL。普通启动和默认诊断均不启用该观察器。已完成本轮验收的用户无需为诊断提示文案更新重复整套对照。

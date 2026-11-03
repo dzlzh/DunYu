@@ -1,3 +1,4 @@
+pub mod hotkey_trace;
 pub mod message;
 pub mod priority_hotkey;
 pub mod scroll;

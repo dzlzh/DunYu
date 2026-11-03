@@ -1,6 +1,7 @@
 //! A dedicated hook thread only filters input and posts commands to the host.
+use super::hotkey_diagnostics::{self as diagnostics, Event};
 use super::*;
-use dunyu::priority_hotkey::KeyState;
+use dunyu::priority_hotkey::{Delivery, KeyState, deliver};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -13,6 +14,7 @@ pub static RECORDING_EPOCH: AtomicUsize = AtomicUsize::new(0);
 struct Routes {
     bindings: Vec<(Hotkey, Command)>,
     generation: usize,
+    diagnostic_routes: Vec<(usize, usize)>,
 }
 struct Context {
     routes: Arc<Mutex<Routes>>,
@@ -49,11 +51,21 @@ impl Runtime {
                 let _ = tx.send(Err("无法安装快捷键接管钩子".to_string()));
                 return;
             }
+            diagnostics::emit(Event {
+                source: "priority",
+                kind: "hook_installed",
+                ..Default::default()
+            });
             let _ = tx.send(Ok(GetCurrentThreadId()));
             while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
+            diagnostics::emit(Event {
+                source: "priority",
+                kind: "hook_thread_exit",
+                ..Default::default()
+            });
             UnhookWindowsHookEx(hook);
             CONTEXT.with(|c| *c.borrow_mut() = None);
         });
@@ -76,6 +88,42 @@ impl Runtime {
         }
         r.bindings = bindings;
         r.generation = r.generation.wrapping_add(1);
+        let generation = r.generation;
+        let watched: Vec<_> = r
+            .bindings
+            .iter()
+            .enumerate()
+            .filter(|(_, (key, _))| diagnostics::watches(key))
+            .map(|(i, _)| (generation, i))
+            .collect();
+        for &(generation, index) in &watched {
+            diagnostics::emit(Event {
+                source: "priority",
+                kind: "route_configured",
+                generation,
+                index,
+                count: match r.bindings[index].1 {
+                    Command::Summon(rule) => rule as u32,
+                    _ => u32::MAX,
+                },
+                ..Default::default()
+            });
+        }
+        diagnostics::emit(Event {
+            source: "priority",
+            kind: "routes_updated",
+            generation,
+            count: watched.len() as u32,
+            ..Default::default()
+        });
+        r.diagnostic_routes.extend(watched);
+    }
+    pub fn diagnostic_route(&self, generation: usize, index: usize) -> bool {
+        self.routes
+            .lock()
+            .unwrap()
+            .diagnostic_routes
+            .contains(&(generation, index))
     }
     pub fn command(&self, generation: usize, index: usize) -> Option<Command> {
         let r = self.routes.lock().unwrap();
@@ -94,7 +142,7 @@ impl Drop for Runtime {
         self.thread.take();
     }
 }
-unsafe fn mask_menu() -> bool {
+unsafe fn mask_menu() -> (u32, u32) {
     let mut events: [INPUT; 2] = std::mem::zeroed();
     for (i, event) in events.iter_mut().enumerate() {
         event.r#type = INPUT_KEYBOARD;
@@ -106,29 +154,78 @@ unsafe fn mask_menu() -> bool {
             dwExtraInfo: 0x44554e59,
         };
     }
-    SendInput(2, events.as_ptr(), std::mem::size_of::<INPUT>() as i32) == 2
+    SetLastError(0);
+    let count = SendInput(2, events.as_ptr(), std::mem::size_of::<INPUT>() as i32);
+    let error = GetLastError();
+    (count, error)
 }
 unsafe extern "system" fn keyboard(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     if code < 0 {
+        diagnostics::emit(Event {
+            source: "priority",
+            kind: "hook_bypass",
+            code,
+            message: w as u32,
+            ..Default::default()
+        });
         return CallNextHookEx(null_mut(), code, w, l);
     }
     let event = &*(l as *const KBDLLHOOKSTRUCT);
+    let traced = diagnostics::watches_key(event.vkCode);
+    let mut trace = Event {
+        source: "priority",
+        kind: "key_decision",
+        code,
+        input_time: event.time,
+        scan_code: event.scanCode,
+        key: event.vkCode,
+        message: w as u32,
+        flags: event.flags,
+        ..Default::default()
+    };
+    if traced {
+        trace.callback_id = diagnostics::callback_id();
+        diagnostics::snapshot(&mut trace);
+        diagnostics::emit(Event {
+            source: "priority",
+            kind: "hook_entry",
+            ..trace
+        });
+    }
     if event.flags & LLKHF_INJECTED != 0 {
+        if traced {
+            trace.reason = "injected_passthrough";
+            trace.duration_us = diagnostics::elapsed_since(trace.micros);
+            diagnostics::emit(trace);
+        }
         return CallNextHookEx(null_mut(), code, w, l);
     }
     let consumed = CONTEXT.with(|cell| {
         let Ok(mut guard) = cell.try_borrow_mut() else {
+            trace.reason = "context_busy";
             return false;
         };
         let Some(c) = guard.as_mut() else {
+            trace.reason = "context_missing";
             return false;
         };
         let epoch = RECORDING_EPOCH.load(Ordering::SeqCst);
+        trace.epoch_before = c.epoch;
+        trace.epoch_after = epoch;
         if epoch != c.epoch {
             c.epoch = epoch;
             c.state.clear();
+            if traced {
+                diagnostics::emit(Event {
+                    source: "priority",
+                    kind: "recording_state_reset",
+                    ..trace
+                });
+            }
         }
-        if RECORDING.load(Ordering::SeqCst) {
+        trace.recording = RECORDING.load(Ordering::SeqCst);
+        if trace.recording {
+            trace.reason = "recording_paused";
             return false;
         }
         let mut modifiers = 0;
@@ -142,11 +239,14 @@ unsafe extern "system" fn keyboard(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
                 modifiers |= flag;
             }
         }
+        trace.modifiers = modifiers;
+        trace.repeated = GetAsyncKeyState(event.vkCode as i32) < 0;
         let routes = c.routes.lock().unwrap();
+        trace.generation = routes.generation;
         let (handled, command) = c.state.event(
             event.vkCode,
             matches!(w as u32, WM_KEYDOWN | WM_SYSKEYDOWN),
-            GetAsyncKeyState(event.vkCode as i32) < 0,
+            trace.repeated,
             modifiers,
             &routes.bindings,
         );
@@ -161,18 +261,69 @@ unsafe extern "system" fn keyboard(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
             )
         });
         drop(routes);
+        trace.reason = if handled {
+            "owned_key"
+        } else {
+            "unmatched_or_repeat"
+        };
         if let Some((generation, index)) = delivery {
-            if modifiers & (MOD_WIN | MOD_ALT) != 0 && !mask_menu() {
-                c.state.release(event.vkCode);
-                return false;
-            }
-            if PostMessageW(handle(c.host), ACTION, generation, index as isize) == 0 {
+            trace.index = index;
+            let result = deliver(
+                modifiers,
+                || {
+                    let (count, error) = mask_menu();
+                    if traced {
+                        diagnostics::emit(Event {
+                            source: "priority",
+                            kind: "menu_mask",
+                            callback_id: trace.callback_id,
+                            key: event.vkCode,
+                            generation,
+                            index,
+                            count,
+                            error,
+                            ..Default::default()
+                        });
+                    }
+                    count == 2
+                },
+                || {
+                    SetLastError(0);
+                    let posted = PostMessageW(handle(c.host), ACTION, generation, index as isize);
+                    let error = GetLastError();
+                    if traced {
+                        diagnostics::emit(Event {
+                            source: "priority",
+                            kind: "command_posted",
+                            callback_id: trace.callback_id,
+                            key: event.vkCode,
+                            generation,
+                            index,
+                            count: posted as u32,
+                            error,
+                            ..Default::default()
+                        });
+                    }
+                    posted != 0
+                },
+            );
+            trace.reason = match result {
+                Delivery::Accepted => "matched_delivered",
+                Delivery::MaskFailed => "menu_mask_failed",
+                Delivery::PostFailed => "command_post_failed",
+            };
+            if result != Delivery::Accepted {
                 c.state.release(event.vkCode);
                 return false;
             }
         }
         handled
     });
+    if traced {
+        trace.consumed = consumed;
+        trace.duration_us = diagnostics::elapsed_since(trace.micros);
+        diagnostics::emit(trace);
+    }
     if consumed {
         1
     } else {

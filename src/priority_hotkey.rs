@@ -66,3 +66,55 @@ mod tests {
         assert_eq!(s.event(66, true, false, 2, &routes), (false, None));
     }
 }
+
+/// Delivery policy shared by the native callback and fault-injection tests.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Delivery {
+    Accepted,
+    MaskFailed,
+    PostFailed,
+}
+pub fn deliver(
+    modifiers: u32,
+    mask: impl FnOnce() -> bool,
+    post: impl FnOnce() -> bool,
+) -> Delivery {
+    if modifiers & (8 | 1) != 0 && !mask() {
+        return Delivery::MaskFailed;
+    }
+    if !post() {
+        return Delivery::PostFailed;
+    }
+    Delivery::Accepted
+}
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+    #[test]
+    fn failed_mask_does_not_deliver_and_failed_post_is_distinct() {
+        assert_eq!(
+            deliver(8, || false, || panic!("must not post")),
+            Delivery::MaskFailed
+        );
+        assert_eq!(deliver(8, || true, || false), Delivery::PostFailed);
+        assert_eq!(deliver(8, || true, || true), Delivery::Accepted);
+        assert_eq!(
+            deliver(2, || panic!("Ctrl needs no menu mask"), || true),
+            Delivery::Accepted
+        );
+    }
+    #[test]
+    fn input_classification_and_delivery_keep_release_ownership() {
+        let routes = [(crate::Hotkey::new(8, 81), crate::Command::Summon(0))];
+        for failed in [true, false] {
+            let mut state = KeyState::default();
+            assert_eq!(state.event(81, true, false, 0, &routes), (false, None));
+            let (handled, command) = state.event(81, true, false, 8, &routes);
+            assert!(handled && command.is_some());
+            if deliver(8, || !failed, || true) != Delivery::Accepted {
+                state.release(81);
+            }
+            assert_eq!(state.event(81, false, false, 8, &routes), (!failed, None));
+        }
+    }
+}
