@@ -138,7 +138,17 @@ struct TabItemCache {
     key: TabItemKey,
     buffer: Option<super::buffering::BackBuffer>,
 }
+#[derive(PartialEq)]
+struct StaticKey {
+    label: String,
+    font: usize,
+    dpi: u32,
+    bounds: (i32, i32),
+    origin: (i32, i32),
+    canvas: (i32, i32, i32),
+}
 struct PaintState {
+    static_key: Option<StaticKey>,
     tabs: RefCell<[Option<TabItemCache>; super::ui::PAGES.len()]>,
     buffer: Option<super::buffering::BackBuffer>,
     _theme: Rc<Theme>,
@@ -164,6 +174,7 @@ impl Drop for PaintState {
 const SUBCLASS: usize = 0x44554e59;
 pub(super) unsafe fn attach(h: HWND, role: Role, theme: Rc<Theme>) {
     let state = Box::new(PaintState {
+        static_key: None,
         tabs: RefCell::new(std::array::from_fn(|_| None)),
         buffer: None,
         _theme: theme,
@@ -208,6 +219,21 @@ pub(super) unsafe fn scene(h: HWND, dpi: u32, cards: Vec<RECT>, fields: Vec<(HWN
     let mut ptr = 0;
     if GetWindowSubclass(h, Some(procedure), SUBCLASS, &mut ptr) != 0 {
         let state = &mut *(ptr as *mut PaintState);
+        let rect_eq = |a: &RECT, b: &RECT| {
+            (a.left, a.top, a.right, a.bottom) == (b.left, b.top, b.right, b.bottom)
+        };
+        if state.dpi == dpi
+            && state.cards.len() == cards.len()
+            && state.fields.len() == fields.len()
+            && state.cards.iter().zip(&cards).all(|(a, b)| rect_eq(a, b))
+            && state
+                .fields
+                .iter()
+                .zip(&fields)
+                .all(|((ha, a), (hb, b))| ha == hb && rect_eq(a, b))
+        {
+            return;
+        }
         state.dpi = dpi;
         state.cards = cards;
         state.fields = fields;
@@ -1089,6 +1115,12 @@ unsafe extern "system" fn procedure(
         return DefSubclassProc(h, m, w, l);
     }
     let role = (*ptr).role;
+    if matches!(
+        m,
+        WM_SETTEXT | WM_SETFONT | WM_SETTINGCHANGE | WM_THEMECHANGED | WM_SYSCOLORCHANGE
+    ) {
+        (*ptr).static_key = None;
+    }
     if role == Role::Tab
         && matches!(
             m,
@@ -1235,7 +1267,28 @@ unsafe extern "system" fn procedure(
                 {
                     #[cfg(test)]
                     let _draw = super::ui::diagnostics::measure("paint.draw");
-                    paint(h, memory, &*ptr, true);
+                    let key = if matches!(role, Role::Heading | Role::Brand) && !high_contrast() {
+                        canvas(h);
+                        let mut origin = POINT { x: 0, y: 0 };
+                        MapWindowPoints(h, GetAncestor(h, GA_ROOT), &mut origin, 1);
+                        Some(StaticKey {
+                            label: title(h),
+                            font: SendMessageW(h, WM_GETFONT, 0, 0) as usize,
+                            dpi: (*ptr).dpi,
+                            bounds: (bounds.right, bounds.bottom),
+                            origin: (origin.x, origin.y),
+                            canvas: CANVAS.get(),
+                        })
+                    } else {
+                        None
+                    };
+                    if key.is_some() && key == (*ptr).static_key {
+                        #[cfg(test)]
+                        let _hit = super::ui::diagnostics::measure("paint.static.cache_copy");
+                    } else {
+                        paint(h, memory, &*ptr, true);
+                        (*ptr).static_key = key;
+                    }
                 }
                 {
                     #[cfg(test)]
@@ -1515,6 +1568,39 @@ pub(super) unsafe fn sync_list_scroll(list: HWND) {
 }
 
 #[cfg(test)]
+pub(super) unsafe fn compare_frames_for_test(width: i32, height: i32, draw: impl Fn(HDC, bool)) {
+    navigation_tests::compare_frames(width, height, draw);
+}
+#[cfg(test)]
+pub(super) unsafe fn diagnose_frames_for_test(
+    width: i32,
+    height: i32,
+    path: &std::path::Path,
+    draw: impl FnMut(HDC, bool),
+) -> serde_json::Value {
+    navigation_tests::diagnose_frames(width, height, path, draw)
+}
+#[cfg(test)]
+pub(super) unsafe fn verify_static_for_test(h: HWND) {
+    let mut ptr = 0;
+    assert_ne!(GetWindowSubclass(h, Some(procedure), SUBCLASS, &mut ptr), 0);
+    let mut r: RECT = std::mem::zeroed();
+    GetClientRect(h, &mut r);
+    compare_frames_for_test(r.right, r.bottom, |dc, reference| {
+        if reference {
+            paint(h, dc, &*(ptr as *const PaintState), false);
+        } else {
+            SendMessageW(h, WM_PRINTCLIENT, dc as usize, 0);
+            let c = super::ui::diagnostics::capture_counters(|| {
+                SendMessageW(h, WM_PRINTCLIENT, dc as usize, 0);
+            });
+            if !high_contrast() {
+                assert!(c.contains_key("paint.static.cache_copy"));
+            }
+        }
+    });
+}
+#[cfg(test)]
 pub(super) unsafe fn verify_navigation_for_test(h: HWND) {
     unsafe { navigation_tests::verify_real_control(h) }
 }
@@ -1583,6 +1669,121 @@ mod navigation_tests {
                 DeleteObject(self.bitmap);
                 DeleteDC(self.dc);
             }
+        }
+    }
+    pub(super) unsafe fn compare_frames(width: i32, height: i32, draw: impl Fn(HDC, bool)) {
+        let a = Pixels::new(width, height);
+        let b = Pixels::new(width, height);
+        draw(a.dc, false);
+        draw(b.dc, true);
+        assert!(
+            a.rgb() == b.rgb(),
+            "cached and reference pixels differ ({width}x{height})"
+        );
+    }
+    pub(super) unsafe fn diagnose_frames(
+        width: i32,
+        height: i32,
+        path: &std::path::Path,
+        mut draw: impl FnMut(HDC, bool),
+    ) -> serde_json::Value {
+        let a = Pixels::new(width, height);
+        let b = Pixels::new(width, height);
+        draw(a.dc, false);
+        draw(b.dc, true);
+        let actual = a.rgb();
+        let reference = b.rgb();
+        let mut count = 0usize;
+        let mut bounds = [width, height, 0, 0];
+        let mut maximum = 0u8;
+        let mut first = None;
+        let mut diff = vec![0u8; width as usize * height as usize * 3];
+        for (i, (a, b)) in actual
+            .chunks_exact(3)
+            .zip(reference.chunks_exact(3))
+            .enumerate()
+        {
+            if a != b {
+                count += 1;
+                let (x, y) = (i as i32 % width, i as i32 / width);
+                bounds = [
+                    bounds[0].min(x),
+                    bounds[1].min(y),
+                    bounds[2].max(x + 1),
+                    bounds[3].max(y + 1),
+                ];
+                if first.is_none() {
+                    first = Some(serde_json::json!({"x":x,"y":y,"actual_bgr":a,"reference_bgr":b}));
+                }
+                for c in 0..3 {
+                    maximum = maximum.max(a[c].abs_diff(b[c]));
+                }
+                diff[i * 3..i * 3 + 3].copy_from_slice(&[255, 0, 255]);
+            }
+        }
+        if count != 0 {
+            std::fs::create_dir_all(path).unwrap();
+            for (name, data) in [
+                ("actual.bmp", &actual),
+                ("reference.bmp", &reference),
+                ("diff.bmp", &diff),
+            ] {
+                let mut bmp = vec![0u8; 54];
+                let len = 54 + width as u32 * height as u32 * 4;
+                bmp[..2].copy_from_slice(b"BM");
+                bmp[2..6].copy_from_slice(&len.to_le_bytes());
+                bmp[10..14].copy_from_slice(&54u32.to_le_bytes());
+                bmp[14..18].copy_from_slice(&40u32.to_le_bytes());
+                bmp[18..22].copy_from_slice(&width.to_le_bytes());
+                bmp[22..26].copy_from_slice(&(-height).to_le_bytes());
+                bmp[26..28].copy_from_slice(&1u16.to_le_bytes());
+                bmp[28..30].copy_from_slice(&32u16.to_le_bytes());
+                for pixel in data.chunks_exact(3) {
+                    bmp.extend_from_slice(pixel);
+                    bmp.push(255);
+                }
+                std::fs::write(path.join(name), bmp).unwrap();
+            }
+        }
+        serde_json::json!({"passed":count == 0,"different_pixels":count,
+            "difference_bounds": if count == 0 { None } else { Some(bounds) },
+            "max_channel_difference":maximum,"first_difference":first,
+            "artifacts":if count == 0 { None } else { Some(path.to_string_lossy()) }})
+    }
+    #[test]
+    fn pixel_diagnostics_save_exact_difference_and_pass_clean_frames() {
+        unsafe {
+            let path = std::env::temp_dir().join(format!(
+                "dunyu-pixel-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let draw = |dc: HDC, reference: bool| {
+                PatBlt(dc, 0, 0, 3, 2, BLACKNESS);
+                if !reference {
+                    SetPixelV(dc, 2, 1, 0x0000ff);
+                }
+            };
+            let result = diagnose_frames(3, 2, &path, draw);
+            assert_eq!(result["different_pixels"], 1);
+            assert_eq!(result["difference_bounds"], serde_json::json!([2, 1, 3, 2]));
+            assert_eq!(result["max_channel_difference"], 255);
+            let bmp = std::fs::read(path.join("actual.bmp")).unwrap();
+            assert_eq!(&bmp[..2], b"BM");
+            assert_eq!(bmp.len(), 54 + 3 * 2 * 4);
+            assert_eq!(&bmp[74..78], &[0, 0, 255, 255]);
+            assert!(path.join("reference.bmp").is_file() && path.join("diff.bmp").is_file());
+            let clean = path.join("clean");
+            let result = diagnose_frames(3, 2, &clean, |dc, _| {
+                PatBlt(dc, 0, 0, 3, 2, BLACKNESS);
+            });
+            assert_eq!(result["passed"], true);
+            assert!(result["difference_bounds"].is_null());
+            assert!(!clean.exists());
+            std::fs::remove_dir_all(path).unwrap();
         }
     }
     pub(super) unsafe fn verify_real_control(h: HWND) {

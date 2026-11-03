@@ -52,7 +52,11 @@ unsafe extern "system" fn procedure(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LR
             InvalidateRect(h, &dirty, 0);
             0
         }
-        WM_SETTINGCHANGE => {
+        WM_SETTINGCHANGE | WM_THEMECHANGED | WM_SYSCOLORCHANGE => {
+            let cache = GetPropW(h, wide("DunYu.BackBuffer").as_ptr()) as *mut RestBuffers;
+            if !cache.is_null() {
+                (*cache).key = None;
+            }
             update_animation(h);
             InvalidateRect(h, null(), 0);
             0
@@ -104,8 +108,7 @@ unsafe extern "system" fn procedure(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LR
             0
         }
         WM_NCDESTROY => {
-            let buffer = RemovePropW(h, wide("DunYu.BackBuffer").as_ptr())
-                as *mut Option<super::buffering::BackBuffer>;
+            let buffer = RemovePropW(h, wide("DunYu.BackBuffer").as_ptr()) as *mut RestBuffers;
             if !buffer.is_null() {
                 drop(Box::from_raw(buffer));
             }
@@ -154,6 +157,88 @@ unsafe fn pond_color(value: u32, system: i32) -> u32 {
         (value & 255) << 16 | value & 0xff00 | value >> 16
     }
 }
+#[derive(Default)]
+struct RestBuffers {
+    frame: Option<super::buffering::BackBuffer>,
+    backdrop: Option<super::buffering::BackBuffer>,
+    key: Option<(i32, i32)>,
+}
+fn animation_rect(r: RECT) -> RECT {
+    let l = super::swim::Layout::new(r.right as f32, r.bottom as f32);
+    let a = l.rect(586., 186., 500., 500.);
+    RECT {
+        left: a[0].floor() as i32,
+        top: a[1].floor() as i32,
+        right: (a[0] + a[2]).ceil() as i32,
+        bottom: (a[1] + a[3]).ceil() as i32,
+    }
+}
+// Build at the same device coordinates as a full frame, then crop. Rendering
+// into a translated small bitmap changes GDI+ sampling at fractional scales.
+unsafe fn prepare_backdrop(dc: HDC, r: RECT, cache: &mut RestBuffers) -> Option<HDC> {
+    use windows_sys::Win32::Graphics::GdiPlus::*;
+    let area = animation_rect(r);
+    let memory = super::buffering::BackBuffer::prepare(
+        &mut cache.backdrop,
+        dc,
+        area.right - area.left,
+        area.bottom - area.top,
+    )?;
+    if cache.key != Some((r.right, r.bottom)) {
+        #[cfg(test)]
+        let _build = super::ui::diagnostics::measure("paint.rest.static_build");
+        // dc is the existing full-size offscreen frame, before dirty clipping.
+        // Only paper and ring enter the cache; dynamic layers are drawn later.
+        theme::paper(dc, r);
+        let mut g = null_mut();
+        if GdipCreateFromHDC(dc, &mut g) != 0 {
+            return None;
+        }
+        GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
+        let l = super::swim::Layout::new(r.right as f32, r.bottom as f32);
+        super::assets::ring(g, l.rect(661., 261., 350., 350.));
+        GdipDeleteGraphics(g);
+        if BitBlt(
+            memory,
+            0,
+            0,
+            area.right - area.left,
+            area.bottom - area.top,
+            dc,
+            area.left,
+            area.top,
+            SRCCOPY,
+        ) == 0
+        {
+            return None;
+        }
+        cache.key = Some((r.right, r.bottom));
+    }
+    Some(memory)
+}
+fn clipped_dirty(dirty: RECT, client: RECT) -> Option<RECT> {
+    let r = RECT {
+        left: dirty.left.max(client.left),
+        top: dirty.top.max(client.top),
+        right: dirty.right.min(client.right),
+        bottom: dirty.bottom.min(client.bottom),
+    };
+    (r.left < r.right && r.top < r.bottom).then_some(r)
+}
+#[cfg(test)]
+thread_local! {
+    static PAINT_CLOCK: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static PAINT_DIRTY: std::cell::Cell<Option<RECT>> = const { std::cell::Cell::new(None) };
+    static PAINT_MOVING: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static REFERENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+unsafe fn paint_clock() -> u64 {
+    #[cfg(test)]
+    if let Some(t) = PAINT_CLOCK.get() {
+        return t;
+    }
+    GetTickCount64()
+}
 unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
     #[cfg(test)]
     let _measurement = super::ui::diagnostics::measure("paint");
@@ -168,37 +253,89 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
     GetClientRect(h, &mut r);
     #[cfg(test)]
     let _role = super::ui::diagnostics::measure("paint.rest");
-    let mut dirty = if message == WM_PAINT { ps.rcPaint } else { r };
-    let cache =
-        GetPropW(h, wide("DunYu.BackBuffer").as_ptr()) as *mut Option<super::buffering::BackBuffer>;
+    let dirty = if message == WM_PAINT { ps.rcPaint } else { r };
+    #[cfg(test)]
+    let dirty = PAINT_DIRTY.get().unwrap_or(dirty);
+    let Some(dirty) = clipped_dirty(dirty, r) else {
+        if message == WM_PAINT {
+            EndPaint(h, &ps);
+        }
+        return;
+    };
+    let cache = GetPropW(h, wide("DunYu.BackBuffer").as_ptr()) as *mut RestBuffers;
     let memory = if cache.is_null() {
         None
     } else {
-        super::buffering::BackBuffer::prepare(&mut *cache, dc, r.right, r.bottom)
+        super::buffering::BackBuffer::prepare(&mut (*cache).frame, dc, r.right, r.bottom)
     };
     let buffered = memory.is_some();
-    let memory = memory.unwrap_or_else(|| {
-        dirty = r;
-        dc
-    });
+    let memory = memory.unwrap_or(dc);
     let saved = SaveDC(memory);
-    let brush = CreateSolidBrush(pond_color(theme::BACKGROUND, COLOR_WINDOW));
-    let buffer = RECT {
-        left: 0,
-        top: 0,
-        right: dirty.right - dirty.left,
-        bottom: dirty.bottom - dirty.top,
-    };
-    SetBrushOrgEx(memory, -dirty.left, -dirty.top, null_mut());
+    SetBrushOrgEx(memory, 0, 0, null_mut());
     theme::canvas(h);
-    theme::paper(memory, buffer);
-    DeleteObject(brush);
+    let use_cache = true;
+    #[cfg(test)]
+    let use_cache = use_cache && !REFERENCE.get();
+    let backdrop = if use_cache
+        && buffered
+        && !cache.is_null()
+        && !GetPropW(h, wide("DunYu.Full").as_ptr()).is_null()
+        && !theme::high_contrast()
+    {
+        prepare_backdrop(memory, r, &mut *cache)
+    } else {
+        None
+    };
+    // Keep offscreen rasterization identical to a full frame. A small graphics
+    // clip changes GDI+ image sampling even when the world coordinates match.
+    // Only the final copy is limited to dirty; every subsequently submitted
+    // region has its background restored first, so off-region scratch pixels
+    // are never used as an authoritative previous frame.
+    let render_clip = if buffered { r } else { dirty };
+    IntersectClipRect(
+        memory,
+        render_clip.left,
+        render_clip.top,
+        render_clip.right,
+        render_clip.bottom,
+    );
+    theme::paper(memory, dirty);
+    let static_cached = backdrop.is_some_and(|backdrop| {
+        let area = animation_rect(r);
+        let Some(clip) = clipped_dirty(dirty, area) else {
+            return true;
+        };
+        #[cfg(test)]
+        let _copy = super::ui::diagnostics::measure("paint.rest.static_copy");
+        BitBlt(
+            memory,
+            clip.left,
+            clip.top,
+            clip.right - clip.left,
+            clip.bottom - clip.top,
+            backdrop,
+            clip.left - area.left,
+            clip.top - area.top,
+            SRCCOPY,
+        ) != 0
+    });
+    if backdrop.is_some() && !static_cached {
+        // A failed cache copy must not leave a partially composited ring behind.
+        theme::paper(memory, dirty);
+    }
     let full = !GetPropW(h, wide("DunYu.Full").as_ptr()).is_null();
     let scale = GetPropW(h, wide("DunYu.LayoutDpi").as_ptr()) as usize as f32 / 96.;
     let mut g = null_mut();
     if GdipCreateFromHDC(memory, &mut g) == 0 {
         GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
-        GdipTranslateWorldTransform(g, -dirty.left as f32, -dirty.top as f32, MatrixOrderPrepend);
+        GdipSetClipRectI(
+            g,
+            render_clip.left,
+            render_clip.top,
+            render_clip.right - render_clip.left,
+            render_clip.bottom - render_clip.top,
+            CombineModeIntersect,
+        );
         let argb = |hex, sys| {
             let c = pond_color(hex, sys);
             0xff000000 | (c & 255) << 16 | c & 0xff00 | c >> 16
@@ -214,8 +351,10 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
         let left = GetPropW(h, wide("DunYu.Left").as_ptr()) as usize as u64;
         let stamp = GetPropW(h, wide("DunYu.Stamp").as_ptr()) as usize as u64;
         let moving = motion_enabled();
+        #[cfg(test)]
+        let moving = PAINT_MOVING.get().unwrap_or(moving);
         let elapsed = if full && moving {
-            GetTickCount64().saturating_sub(stamp).min(1000)
+            paint_clock().saturating_sub(stamp).min(1000)
         } else {
             0
         };
@@ -228,7 +367,7 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
             GdipSetPenWidth(pen, 2. * scale);
             if theme::high_contrast() {
                 GdipDrawEllipse(g, pen, x, y, d, d);
-            } else {
+            } else if !static_cached {
                 super::assets::ring(g, [x, y, d, d]);
             }
             GdipSetPenColor(pen, argb(theme::ACCENT, COLOR_HIGHLIGHT));
@@ -256,7 +395,7 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
                 (r.right as f32 / 2., layout.y + 436. * layout.scale),
                 layout.scale,
                 progress,
-                GetTickCount64().saturating_sub(GetPropW(h, wide("DunYu.MotionStart").as_ptr()) as usize as u64),
+                paint_clock().saturating_sub(GetPropW(h, wide("DunYu.MotionStart").as_ptr()) as usize as u64),
                 moving,
             );
         }
@@ -269,10 +408,10 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
         super::assets::stroke(
             memory,
             RECT {
-                left: x as i32 - dirty.left,
-                top: y as i32 - dirty.top,
-                right: (x + w) as i32 - dirty.left,
-                bottom: (y + h) as i32 - dirty.top,
+                left: x as i32,
+                top: y as i32,
+                right: (x + w) as i32,
+                bottom: (y + h) as i32,
             },
             false,
         );
@@ -298,8 +437,8 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
     if !logo.is_null() {
         DrawIconEx(
             memory,
-            (logo_x * logo_scale) as i32 - dirty.left,
-            (logo_y * logo_scale) as i32 - dirty.top,
+            (logo_x * logo_scale) as i32,
+            (logo_y * logo_scale) as i32,
             logo,
             (logo_size * logo_scale) as i32,
             (logo_size * logo_scale) as i32,
@@ -313,11 +452,11 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
             dc,
             dirty.left,
             dirty.top,
-            buffer.right,
-            buffer.bottom,
+            dirty.right - dirty.left,
+            dirty.bottom - dirty.top,
             memory,
-            0,
-            0,
+            dirty.left,
+            dirty.top,
             SRCCOPY,
         );
     }
@@ -332,6 +471,8 @@ unsafe extern "system" fn monitor(_: HMONITOR, _: HDC, r: *mut RECT, data: LPARA
 }
 impl Runtime {
     pub unsafe fn close(&mut self) {
+        #[cfg(test)]
+        let _measurement = super::ui::diagnostics::measure("rest.close");
         self.generation = self.generation.wrapping_add(1);
         for h in self.windows.drain(..) {
             DestroyWindow(h);
@@ -556,8 +697,9 @@ impl Runtime {
                 GetMonitorInfoW(MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST), &mut mi);
                 bounds.push(mi.rcWork);
             }
+            let skin = theme::Theme::new();
             for r in bounds {
-                self.create(r, fullscreen, phase, host);
+                self.create(r, fullscreen, phase, host, skin.clone());
             }
         }
         self.display_failed = self.windows.is_empty();
@@ -611,7 +753,26 @@ impl Runtime {
         };
         let stamp = GetTickCount64();
         for h in &self.windows {
-            let _redraw = super::buffering::RedrawBatch::new(*h, *h);
+            let mut client: RECT = std::mem::zeroed();
+            GetClientRect(*h, &mut client);
+            let mut damage = if fullscreen {
+                animation_rect(client)
+            } else {
+                client
+            };
+            for (id, text) in [(10, counter.as_str()), (12, heading.as_str()), (13, body)] {
+                let child = GetDlgItem(*h, id);
+                if title(child) != text {
+                    let mut r: RECT = std::mem::zeroed();
+                    GetWindowRect(child, &mut r);
+                    MapWindowPoints(null_mut(), *h, &mut r as *mut _ as *mut POINT, 2);
+                    damage.left = damage.left.min(r.left);
+                    damage.top = damage.top.min(r.top);
+                    damage.right = damage.right.max(r.right);
+                    damage.bottom = damage.bottom.max(r.bottom);
+                }
+            }
+            let _redraw = super::buffering::RedrawBatch::region(*h, damage);
             for (id, text) in [(10, counter.as_str()), (12, heading.as_str()), (13, body)] {
                 let child = GetDlgItem(*h, id);
                 if title(child) != text {
@@ -633,11 +794,13 @@ impl Runtime {
             SetPropW(*h, wide("DunYu.Duration").as_ptr(), duration as HANDLE);
             SetPropW(*h, wide("DunYu.Left").as_ptr(), left as HANDLE);
             SetPropW(*h, wide("DunYu.Stamp").as_ptr(), stamp as HANDLE);
-            InvalidateRect(*h, null(), 0);
+            InvalidateRect(*h, &damage, 0);
         }
         // Every monitor's initial state is ready before any new window is shown.
         for h in &self.windows {
             if IsWindowVisible(*h) == 0 {
+                #[cfg(test)]
+                let _show = super::ui::diagnostics::measure("rest.show_and_paint");
                 ShowWindow(*h, SW_SHOWNOACTIVATE);
                 RedrawWindow(
                     *h,
@@ -645,7 +808,16 @@ impl Runtime {
                     null_mut(),
                     RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW,
                 );
+            }
+        }
+        for h in &self.windows {
+            if GetPropW(*h, wide("DunYu.AnimationStarted").as_ptr()).is_null() {
                 update_animation(*h);
+                SetPropW(
+                    *h,
+                    wide("DunYu.AnimationStarted").as_ptr(),
+                    1usize as HANDLE,
+                );
             }
         }
         if !preview {
@@ -665,7 +837,16 @@ impl Runtime {
             }
         }
     }
-    unsafe fn create(&mut self, r: RECT, full: bool, phase: Phase, host: HWND) {
+    unsafe fn create(
+        &mut self,
+        r: RECT,
+        full: bool,
+        phase: Phase,
+        host: HWND,
+        skin: std::rc::Rc<theme::Theme>,
+    ) {
+        #[cfg(test)]
+        let _measurement = super::ui::diagnostics::measure("rest.create");
         let h = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_COMPOSITED,
             wide(REST_CLASS).as_ptr(),
@@ -683,7 +864,7 @@ impl Runtime {
         if h.is_null() {
             return;
         }
-        let buffer = Box::into_raw(Box::new(None::<super::buffering::BackBuffer>));
+        let buffer = Box::into_raw(Box::new(RestBuffers::default()));
         if SetPropW(h, wide("DunYu.BackBuffer").as_ptr(), buffer as HANDLE) == 0 {
             drop(Box::from_raw(buffer));
         }
@@ -733,10 +914,38 @@ impl Runtime {
                 DeleteObject(region);
             }
         }
-        let skin = theme::Theme::new();
+        let layout = super::swim::Layout::new(width as f32, height as f32);
+        let area = |id: i32, fallback: [i32; 4]| -> [i32; 4] {
+            if !full {
+                return fallback;
+            }
+            let r = match id {
+                12 => layout.rect(510., 165., 652., 64.),
+                10 => layout.rect(686., 374., 300., 128.),
+                13 => layout.rect(500., 647., 672., 54.),
+                3 => layout.rect(699., 737., 274., 64.),
+                4 => [
+                    width as f32 - 76. * layout.scale,
+                    28. * layout.scale,
+                    48. * layout.scale,
+                    48. * layout.scale,
+                ],
+                _ => return fallback,
+            };
+            r.map(|v| v.round() as i32)
+        };
         let make_font = |size: i32, name: &str| {
             let mut lf: LOGFONTW = std::mem::zeroed();
-            lf.lfHeight = -px(size);
+            lf.lfHeight = if full {
+                -(match name {
+                    "DunYu.RestTitle" => 36.,
+                    "DunYu.RestTimer" => 96.,
+                    _ => 28.,
+                } * layout.scale)
+                    .round() as i32
+            } else {
+                -px(size)
+            };
             let face = wide(if name == "DunYu.RestTitle" {
                 super::fonts::FACE
             } else if name == "DunYu.RestTimer" && full {
@@ -745,7 +954,11 @@ impl Runtime {
                 super::fonts::FACE
             });
             lf.lfFaceName[..face.len()].copy_from_slice(&face);
-            let font = CreateFontIndirectW(&lf);
+            let font = {
+                #[cfg(test)]
+                let _font = super::ui::diagnostics::measure("rest.font");
+                CreateFontIndirectW(&lf)
+            };
             SetPropW(h, wide(name).as_ptr(), font);
             font
         };
@@ -766,27 +979,28 @@ impl Runtime {
             (10, timer_y, if full { 100 } else { 64 }, timer_font),
             (13, body_y, 52, font),
         ] {
+            let rect = area(
+                id,
+                [
+                    if id == 12 { px(64) } else { left },
+                    top + px(offset),
+                    if id == 12 {
+                        (width - px(128)).max(1)
+                    } else {
+                        body_width
+                    },
+                    px(tall),
+                ],
+            );
             let label = CreateWindowExW(
                 0,
                 wide("STATIC").as_ptr(),
                 wide("").as_ptr(),
                 WS_CHILD | WS_VISIBLE | windows_sys::Win32::System::SystemServices::SS_CENTER,
-                if id == 12 {
-                    px(64)
-                } else if full && id == 10 {
-                    (width - px(210)) / 2
-                } else {
-                    left
-                },
-                top + px(offset),
-                if id == 12 {
-                    (width - px(128)).max(1)
-                } else if full && id == 10 {
-                    px(210)
-                } else {
-                    body_width
-                },
-                px(tall),
+                rect[0],
+                rect[1],
+                rect[2],
+                rect[3],
                 h,
                 id as HMENU,
                 GetModuleHandleW(null()),
@@ -795,15 +1009,16 @@ impl Runtime {
             SendMessageW(label, WM_SETFONT, f as usize, 0);
         }
         // Reserve a separate header lane for the logo, title and close control.
+        let rect = area(4, [width - px(56), px(16), px(40), px(40)]);
         let close = CreateWindowExW(
             0,
             wide("BUTTON").as_ptr(),
             wide("×").as_ptr(),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            width - px(56),
-            px(16),
-            px(40),
-            px(40),
+            rect[0],
+            rect[1],
+            rect[2],
+            rect[3],
             h,
             4 as HMENU,
             GetModuleHandleW(null()),
@@ -831,19 +1046,19 @@ impl Runtime {
         };
         let bw = ((body_width - px(8) * (buttons.len() as i32 - 1)) / buttons.len() as i32).max(1);
         for (i, (id, text)) in buttons.iter().enumerate() {
+            let rect = area(
+                *id as i32,
+                [left + i as i32 * (bw + px(8)), top + px(210), bw, px(48)],
+            );
             let b = CreateWindowExW(
                 0,
                 wide("BUTTON").as_ptr(),
                 wide(text).as_ptr(),
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                if full {
-                    (width - px(180)) / 2
-                } else {
-                    left + i as i32 * (bw + px(8))
-                },
-                top + px(if full { 430 } else { 210 }),
-                if full { px(180) } else { bw },
-                px(48),
+                rect[0],
+                rect[1],
+                rect[2],
+                rect[3],
                 h,
                 *id as HMENU,
                 GetModuleHandleW(null()),
@@ -856,59 +1071,6 @@ impl Runtime {
         }
 
         if full {
-            let layout = super::swim::Layout::new(width as f32, height as f32);
-            let put = |id, area: [f32; 4]| {
-                MoveWindow(
-                    GetDlgItem(h, id),
-                    area[0].round() as i32,
-                    area[1].round() as i32,
-                    area[2].round() as i32,
-                    area[3].round() as i32,
-                    0,
-                );
-            };
-            for (id, area) in [
-                (12, [510., 165., 652., 64.]),
-                (10, [686., 374., 300., 128.]),
-                (13, [500., 647., 672., 54.]),
-                (3, [699., 737., 274., 64.]),
-            ] {
-                put(id, layout.rect(area[0], area[1], area[2], area[3]));
-            }
-            put(
-                4,
-                [
-                    width as f32 - 76. * layout.scale,
-                    28. * layout.scale,
-                    48. * layout.scale,
-                    48. * layout.scale,
-                ],
-            );
-            for (id, size, name) in [
-                (12, 36., "DunYu.RestTitle"),
-                (10, 96., "DunYu.RestTimer"),
-                (13, 28., "DunYu.RestFont"),
-            ] {
-                let mut lf: LOGFONTW = std::mem::zeroed();
-                lf.lfHeight = -(size * layout.scale).round() as i32;
-                let face = wide(if id == 10 {
-                    "Segoe UI Light"
-                } else {
-                    super::fonts::FACE
-                });
-                lf.lfFaceName[..face.len()].copy_from_slice(&face);
-                let font = CreateFontIndirectW(&lf);
-                let old = GetPropW(h, wide(name).as_ptr());
-                SetPropW(h, wide(name).as_ptr(), font);
-                SendMessageW(GetDlgItem(h, id), WM_SETFONT, font as usize, 0);
-                if id == 13 {
-                    SendMessageW(GetDlgItem(h, 3), WM_SETFONT, font as usize, 0);
-                }
-                if id == 12 {
-                    SendMessageW(GetDlgItem(h, 4), WM_SETFONT, font as usize, 0);
-                }
-                DeleteObject(old);
-            }
             theme::outline(GetDlgItem(h, 3));
         }
         if !full && buttons.len() == 1 {
@@ -1035,8 +1197,399 @@ fn layout_scale(width: i32, height: i32) -> f32 {
 }
 
 #[cfg(test)]
+pub(super) unsafe fn benchmark(runtime: &mut Runtime, host: HWND) -> serde_json::Value {
+    use serde_json::json;
+    unsafe fn pump(ms: u64) {
+        let start = Instant::now();
+        while start.elapsed().as_millis() < ms as u128 {
+            let mut msg: MSG = std::mem::zeroed();
+            while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+                if start.elapsed().as_millis() >= ms as u128 {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    unsafe fn cpu() -> u64 {
+        let mut a: FILETIME = std::mem::zeroed();
+        let mut b = a;
+        let mut k = a;
+        let mut u = a;
+        assert_ne!(
+            GetProcessTimes(GetCurrentProcess(), &mut a, &mut b, &mut k, &mut u),
+            0
+        );
+        let value = |t: FILETIME| ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64;
+        value(k) + value(u)
+    }
+    let mut runs = Vec::new();
+    for kind in ["first_fullscreen", "reopen", "card_to_fullscreen"] {
+        for _ in 0..if kind == "first_fullscreen" { 1 } else { 10 } {
+            if kind == "card_to_fullscreen" {
+                runtime.configure(RestConfig::default(), host);
+                runtime.action(23, None, host);
+                pump(200);
+            } else {
+                runtime.close();
+                pump(200);
+            }
+            let mut handler = 0.;
+            let measurement = super::ui::diagnostics::sample_action(|| {
+                let start = Instant::now();
+                runtime.configure(
+                    RestConfig {
+                        fullscreen: true,
+                        ..Default::default()
+                    },
+                    host,
+                );
+                runtime.action(23, None, host);
+                handler = start.elapsed().as_secs_f64() * 1000.;
+                pump(200);
+            });
+            runs.push(json!({"scenario":kind,"handler_ms":handler,"measurement":measurement}));
+        }
+    }
+    runtime.preview_until = GetTickCount64() + 10000;
+    pump(1000);
+    let monitors: Vec<_> = runtime
+        .windows
+        .iter()
+        .map(|h| {
+            let mut r: RECT = std::mem::zeroed();
+            GetWindowRect(*h, &mut r);
+            json!({"rect":[r.left,r.top,r.right,r.bottom],"dpi":GetDpiForWindow(*h)})
+        })
+        .collect();
+    let begin = cpu();
+    let start = Instant::now();
+    let animation = super::ui::diagnostics::sample_action(|| {
+        for _ in 0..5 {
+            runtime.tick(host);
+            pump(1000);
+        }
+    });
+    let wall_ms = start.elapsed().as_secs_f64() * 1000.;
+    let cpu_ms = (cpu() - begin) as f64 / 10000.;
+    runtime.close();
+    json!({"runs":runs,"animation":animation,"cpu_ms":cpu_ms,"wall_ms":wall_ms,
+        "monitors":monitors,"high_contrast":theme::high_contrast(),"motion_enabled":motion_enabled()})
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires an interactive Windows desktop"]
+    fn cached_rest_matches_original() {
+        struct Owner(Runtime);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                unsafe {
+                    self.0.close();
+                }
+            }
+        }
+        unsafe {
+            let _graphics = theme::TestGraphicsScope::new();
+            windows_sys::Win32::UI::Controls::InitCommonControls();
+            let host = theme::TestWindow(CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                wide("").as_ptr(),
+                0,
+                0,
+                0,
+                1,
+                1,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            ));
+            let mut owner = Owner(Runtime::default());
+            let runtime = &mut owner.0;
+            struct PaintReset;
+            impl Drop for PaintReset {
+                fn drop(&mut self) {
+                    PAINT_CLOCK.set(None);
+                    PAINT_DIRTY.set(None);
+                    PAINT_MOVING.set(None);
+                    REFERENCE.set(false);
+                }
+            }
+            let _reset = PaintReset;
+            let directory = std::path::PathBuf::from(format!(
+                "rest-pixel-diagnostics-{}-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&directory).unwrap();
+            println!("Rest pixel artifacts: {}", directory.display());
+            let mut report = serde_json::json!({"protocol":"rest-pixels-v1",
+                "build":option_env!("DUNYU_DIAGNOSTIC_REVISION"),"high_contrast":theme::high_contrast(),
+                "clock_base_ms":10000,"motion_enabled_in_test":true,"expected_cases":96,"complete":false,"cases":[]});
+            let save = |report: &serde_json::Value| {
+                std::fs::write(
+                    directory.join("report.json"),
+                    serde_json::to_vec_pretty(report).unwrap(),
+                )
+                .unwrap();
+            };
+            save(&report);
+            let mut probes = Vec::new();
+            let mut failed = 0;
+            // Register the production class, then use hidden windows with explicit
+            // client sizes: no monitor mode changes and no timer-driven test state.
+            runtime.configure(
+                RestConfig {
+                    fullscreen: true,
+                    ..Default::default()
+                },
+                host.0,
+            );
+            runtime.action(23, None, host.0);
+            assert!(
+                !runtime.windows.is_empty(),
+                "fullscreen preview was not created"
+            );
+            runtime.close();
+            KillTimer(host.0, TIMER_ID);
+            for (width, height) in [(1920, 1080), (1672, 941), (3440, 1440), (1080, 1920)] {
+                runtime.create(
+                    RECT {
+                        left: 0,
+                        top: 0,
+                        right: width,
+                        bottom: height,
+                    },
+                    true,
+                    Phase::Resting,
+                    host.0,
+                    theme::Theme::new(),
+                );
+                assert_eq!(runtime.windows.len(), 1);
+                let h = runtime.windows[0];
+                let mut r: RECT = std::mem::zeroed();
+                GetClientRect(h, &mut r);
+                assert_eq!((r.right, r.bottom), (width, height));
+                for (key, value) in [
+                    ("DunYu.Duration", 20000usize),
+                    ("DunYu.Left", 20000),
+                    ("DunYu.Stamp", 10000),
+                    ("DunYu.MotionStart", 10000),
+                ] {
+                    assert_ne!(SetPropW(h, wide(key).as_ptr(), value as HANDLE), 0);
+                }
+                for offset in [0, 333, 999] {
+                    for kind in [
+                        "reference_repeat",
+                        "cached_full_cold",
+                        "cached_full_warm",
+                        "uncached_partial",
+                        "cached_partial",
+                        "clip_small",
+                        "clip_overlap",
+                        "clip_second_only",
+                        "clip_aba",
+                        "clip_bab",
+                        "clip_empty",
+                        "clip_outside",
+                        "clip_bounds",
+                        "cached_rebuild",
+                    ] {
+                        if offset != 0 && (kind.starts_with("clip_") || kind == "cached_rebuild") {
+                            continue;
+                        }
+                        let name = format!("{width}x{height}-{offset}-{kind}");
+                        let mut measurements = Vec::new();
+                        let mut result = theme::diagnose_frames_for_test(
+                            width,
+                            height,
+                            &directory.join(&name),
+                            |dc, reference| {
+                                let cache = GetPropW(h, wide("DunYu.BackBuffer").as_ptr())
+                                    as *mut RestBuffers;
+                                assert!(!cache.is_null());
+                                // Independent buffers for the two sides and each case.
+                                *cache = RestBuffers::default();
+                                REFERENCE.set(
+                                    reference
+                                        || matches!(kind, "reference_repeat" | "uncached_partial"),
+                                );
+                                PAINT_MOVING.set(Some(true));
+                                PAINT_DIRTY.set(None);
+                                let partial = !reference
+                                    && matches!(kind, "uncached_partial" | "cached_partial");
+                                PAINT_CLOCK.set(Some(if partial { 10000 } else { 10000 + offset }));
+                                let mut steps = Vec::new();
+                                let counters = super::super::ui::diagnostics::capture_counters(
+                                    || {
+                                        if kind.starts_with("clip_") {
+                                            // A black destination makes any writes outside the requested
+                                            // damage visible. Reference renders a full frame and clips only
+                                            // the destination; the candidate uses the actual dirty path.
+                                            PatBlt(dc, 0, 0, width, height, BLACKNESS);
+                                            let area = animation_rect(r);
+                                            let small = RECT {
+                                                left: area.left + 80,
+                                                top: area.top + 20,
+                                                right: area.left + 210,
+                                                bottom: area.top + 150,
+                                            };
+                                            let second = RECT {
+                                                left: small.left + 40,
+                                                top: small.top + 30,
+                                                right: small.right + 80,
+                                                bottom: small.bottom + 70,
+                                            };
+                                            let rects = match kind {
+                                                "clip_small" => vec![small],
+                                                "clip_overlap" => vec![small, second],
+                                                "clip_second_only" => vec![second],
+                                                "clip_aba" => vec![small, second, small],
+                                                "clip_bab" => vec![second, small, second],
+                                                "clip_empty" => vec![RECT {
+                                                    left: 20,
+                                                    top: 20,
+                                                    right: 20,
+                                                    bottom: 40,
+                                                }],
+                                                "clip_outside" => vec![RECT {
+                                                    left: width + 10,
+                                                    top: 20,
+                                                    right: width + 50,
+                                                    bottom: 40,
+                                                }],
+                                                _ => vec![
+                                                    RECT {
+                                                        left: -30,
+                                                        top: -20,
+                                                        right: 100,
+                                                        bottom: 100,
+                                                    },
+                                                    RECT {
+                                                        left: width - 30,
+                                                        top: height - 20,
+                                                        right: width + 100,
+                                                        bottom: height + 100,
+                                                    },
+                                                ],
+                                            };
+                                            for (index, rect) in rects.into_iter().enumerate() {
+                                                let time =
+                                                    if matches!(kind, "clip_aba" | "clip_bab") {
+                                                        [0, 333, 999][index]
+                                                    } else {
+                                                        0
+                                                    };
+                                                PAINT_CLOCK.set(Some(10000 + time));
+                                                steps.push(serde_json::json!({"offset_ms":time,
+                                                    "rect":[rect.left,rect.top,rect.right,rect.bottom]}));
+                                                let saved = SaveDC(dc);
+                                                if reference {
+                                                    IntersectClipRect(
+                                                        dc,
+                                                        rect.left,
+                                                        rect.top,
+                                                        rect.right,
+                                                        rect.bottom,
+                                                    );
+                                                } else {
+                                                    PAINT_DIRTY.set(Some(rect));
+                                                }
+                                                paint(h, WM_PRINTCLIENT, dc as usize);
+                                                RestoreDC(dc, saved);
+                                            }
+                                            return;
+                                        }
+                                        if !reference && kind == "cached_rebuild" {
+                                            paint(h, WM_PRINTCLIENT, dc as usize);
+                                            SendMessageW(h, WM_THEMECHANGED, 0, 0);
+                                            KillTimer(h, ANIMATION_TIMER);
+                                        }
+                                        if partial || (!reference && kind == "cached_full_warm") {
+                                            paint(h, WM_PRINTCLIENT, dc as usize);
+                                        }
+                                        PAINT_CLOCK.set(Some(10000 + offset));
+                                        if partial {
+                                            PAINT_DIRTY.set(Some(animation_rect(r)));
+                                        }
+                                        paint(h, WM_PRINTCLIENT, dc as usize);
+                                    },
+                                );
+                                if !reference
+                                    && !REFERENCE.get()
+                                    && !theme::high_contrast()
+                                    && !kind.starts_with("clip_")
+                                {
+                                    assert!(
+                                        counters.contains_key("paint.rest.static_copy"),
+                                        "cache was not used"
+                                    );
+                                    assert_eq!(
+                                        counters.get("paint.rest.static_build").map(|v| v.0),
+                                        Some(if kind == "cached_rebuild" { 2 } else { 1 }),
+                                        "unexpected cache build count"
+                                    );
+                                }
+                                measurements.push(
+                                    serde_json::json!({"reference":reference,"counters":counters,"steps":steps}),
+                                );
+                                for buffer in [&mut (*cache).frame, &mut (*cache).backdrop]
+                                    .into_iter()
+                                    .flatten()
+                                {
+                                    probes.push(buffer.observe_release());
+                                }
+                                PAINT_CLOCK.set(None);
+                                PAINT_DIRTY.set(None);
+                                PAINT_MOVING.set(None);
+                                REFERENCE.set(false);
+                            },
+                        );
+                        result["scenario"] = kind.into();
+                        result["size"] = serde_json::json!([width, height]);
+                        result["offset_ms"] = offset.into();
+                        result["dpi"] = GetDpiForWindow(h).into();
+                        result["measurements"] = measurements.into();
+                        if result["passed"] != true {
+                            failed += 1;
+                        }
+                        println!("{name}: different_pixels={}", result["different_pixels"]);
+                        report["cases"].as_array_mut().unwrap().push(result);
+                        save(&report);
+                    }
+                }
+                runtime.close();
+            }
+            runtime.close();
+            KillTimer(host.0, TIMER_ID);
+            for probe in probes {
+                probe.assert_released("rest pixel buffer");
+            }
+            assert_eq!(
+                report["cases"].as_array().unwrap().len(),
+                96,
+                "incomplete rest pixel coverage"
+            );
+            report["complete"] = true.into();
+            report["failed_cases"] = failed.into();
+            save(&report);
+            assert_eq!(
+                failed,
+                0,
+                "Rest pixel differences; see {}",
+                directory.display()
+            );
+        }
+    }
     #[test]
     fn preview_is_isolated_and_fullscreen_uses_each_monitor() {
         struct Cleanup {
@@ -1120,6 +1673,7 @@ mod tests {
                     false,
                     phase,
                     host,
+                    theme::Theme::new(),
                 );
                 let popup = sample.windows[0];
                 let label = GetDlgItem(popup, 10);

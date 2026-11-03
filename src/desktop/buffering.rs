@@ -5,6 +5,7 @@ pub(super) struct RedrawBatch {
     window: HWND,
     damage: HWND,
     active: bool,
+    region: Option<RECT>,
 }
 impl RedrawBatch {
     pub(super) unsafe fn new(window: HWND, damage: HWND) -> Self {
@@ -18,7 +19,15 @@ impl RedrawBatch {
             window,
             damage,
             active,
+            region: None,
         }
+    }
+}
+impl RedrawBatch {
+    pub(super) unsafe fn region(window: HWND, region: RECT) -> Self {
+        let mut batch = Self::new(window, window);
+        batch.region = Some(region);
+        batch
     }
 }
 impl Drop for RedrawBatch {
@@ -28,7 +37,7 @@ impl Drop for RedrawBatch {
                 SendMessageW(self.window, WM_SETREDRAW, 1, 0);
                 RedrawWindow(
                     self.damage,
-                    null(),
+                    self.region.as_ref().map_or(null(), |r| r as *const RECT),
                     null_mut(),
                     RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
                 );

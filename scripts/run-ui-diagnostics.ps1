@@ -77,18 +77,39 @@ $log = Join-Path $PSScriptRoot 'diagnostic-run.log'
 Set-Content -LiteralPath $log -Value 'DunYu diagnostics: process exit and test runner result determine success.' -Encoding UTF8
 $exe = Join-Path $PSScriptRoot 'dunyu-ui-tests.exe'
 $stages = @(@{Name='buffer'; Filter='desktop::buffering::tests::buffer_reuses_size_replaces_and_releases_gdi_objects'; Timeout=120; Ignored=''})
+$stages += @{Name='rest-pixels'; Filter='desktop::rest_ui::tests::cached_rest_matches_original'; Timeout=600; Ignored='--ignored'}
 foreach ($i in 1..3) {
     $stages += @{Name="navigation-$i"; Filter='desktop::theme::navigation_tests::cached_navigation_matches_original'; Timeout=120; Ignored='--ignored'}
 }
 $stages += @{Name='navigation-real'; Filter='desktop::ui::capture_tests::real_navigation_uses_cache'; Timeout=120; Ignored='--ignored'}
-$stages += @{Name='transitions'; Filter='desktop::ui::diagnostics::ui_transition_diagnostics'; Timeout=600; Ignored='--ignored'}
+$stages += @{Name='static-pixels'; Filter='desktop::ui::capture_tests::static_controls_match_original'; Timeout=120; Ignored='--ignored'}
+$stages += @{Name='transitions' ; Filter='desktop::ui::diagnostics::ui_transition_diagnostics'; Timeout=600; Ignored='--ignored'}
 foreach ($stage in $stages) {
     $arguments = "--exact $($stage.Filter) $($stage.Ignored) --test-threads=1 --nocapture"
     $code = Invoke-DiagnosticStage $stage.Name $exe $arguments $stage.Timeout $PSScriptRoot $log
     if ($code -ne 0) {
-        Write-Host "FAILED: $($stage.Name), exit_code=$code. See diagnostic-run.log and stage logs. Later stages were not run."
+        Write-Host "FAILED: $($stage.Name), exit_code=$code. See diagnostic-run.log, stage logs and any rest-pixel-diagnostics-* folder. Later stages were not run."
         exit $code
     }
+}
+$baseline = Join-Path $PSScriptRoot 'dunyu-ui-baseline.exe'
+if (Test-Path -LiteralPath $baseline) {
+    $previousReport = $env:DUNYU_BENCH_REPORT
+    try {
+        foreach ($i in 1..3) {
+            foreach ($variant in @('baseline','candidate')) {
+                $name = "benchmark-$variant-$i"
+                $env:DUNYU_BENCH_REPORT = Join-Path $PSScriptRoot "$name.json"
+                Remove-Item -LiteralPath $env:DUNYU_BENCH_REPORT -ErrorAction SilentlyContinue
+                $program = if ($variant -eq 'baseline') { $baseline } else { $exe }
+                $code = Invoke-DiagnosticStage $name $program '--exact desktop::ui::diagnostics::ui_performance_benchmark --ignored --test-threads=1 --nocapture' 600 $PSScriptRoot $log
+                if ($code -ne 0) { exit $code }
+            }
+        }
+        & (Join-Path $PSScriptRoot 'compare-performance.ps1') -Directory $PSScriptRoot
+    } finally { $env:DUNYU_BENCH_REPORT = $previousReport }
+} else {
+    Write-Host 'No calibrated baseline included; performance comparison was not run.'
 }
 Write-Host 'ALL STAGES COMPLETED. Review report.json, capture gaps and frames before visual/performance acceptance.'
 exit 0

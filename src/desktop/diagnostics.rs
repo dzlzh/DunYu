@@ -13,12 +13,19 @@ use std::{
 #[path = "diagnostic_pixels.rs"]
 mod pixels;
 thread_local! {
+    static SAMPLES: RefCell<HashMap<&'static str, Vec<f64>>> = RefCell::new(HashMap::new());
     static COUNTERS: RefCell<Option<HashMap<&'static str, (u64, f64)>>> = const { RefCell::new(None) };
 }
 pub(crate) fn capture_counters(action: impl FnOnce()) -> HashMap<&'static str, (u64, f64)> {
     COUNTERS.with(|c| assert!(c.borrow_mut().replace(HashMap::new()).is_none()));
     action();
     COUNTERS.with(|c| c.borrow_mut().take().unwrap())
+}
+pub(crate) fn sample_action(action: impl FnOnce()) -> serde_json::Value {
+    SAMPLES.with(|s| s.borrow_mut().clear());
+    let counters = capture_counters(action);
+    let samples = SAMPLES.with(|s| std::mem::take(&mut *s.borrow_mut()));
+    json!({"counters":counters,"samples_ms":samples})
 }
 pub(crate) struct Measurement {
     name: &'static str,
@@ -37,7 +44,15 @@ impl Drop for Measurement {
                 if let Some(c) = c.borrow_mut().as_mut() {
                     let entry = c.entry(self.name).or_default();
                     entry.0 += 1;
-                    entry.1 += start.elapsed().as_secs_f64() * 1000.;
+                    let ms = start.elapsed().as_secs_f64() * 1000.;
+                    entry.1 += ms;
+                    SAMPLES.with(|samples| {
+                        let mut samples = samples.borrow_mut();
+                        let values = samples.entry(self.name).or_default();
+                        if values.len() < 100_000 {
+                            values.push(ms);
+                        }
+                    });
                 }
             });
         }
@@ -203,14 +218,11 @@ unsafe fn action(app: &mut App, index: usize) -> String {
             format!("page-{}", index % 6)
         }
         18..=21 => {
-            app.page(0);
             app.ui_action(116).unwrap();
             "advanced-toggle".into()
         }
         22..=25 => {
-            app.page(0);
             app.fill_rule(Some(index % 2));
-            app.layout_ui();
             "rule-switch".into()
         }
         26 | 28 => {
@@ -284,7 +296,7 @@ fn ui_transition_diagnostics() {
         pump_for(Duration::from_millis(800));
         let mut client: RECT = std::mem::zeroed();
         GetClientRect(h, &mut client);
-        let mut report = json!({"version":env!("CARGO_PKG_VERSION"),"build":option_env!("DUNYU_DIAGNOSTIC_REVISION"),
+        let mut report = json!({"measurement_protocol":"transitions-v2","version":env!("CARGO_PKG_VERSION"),"build":option_env!("DUNYU_DIAGNOSTIC_REVISION"),
             "os":std::process::Command::new("cmd").args(["/C","ver"]).output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned()),
             "dpi":GetDpiForWindow(h),"client_size":[client.right,client.bottom],"requested_interval_ms":16,
             "notes":"Direct production action methods with normal message pumping. Handler time is not input-to-display latency. Layout/paint totals may overlap handler time. Mixed-frame flags require human review; animation and focus can trigger them. Timing pass runs before sampling, so sampling is warmed. Hidden/obscured windows are not captured. First use means first use within this prepared fixture, not cold application startup.","runs":[]});
@@ -303,6 +315,10 @@ fn ui_transition_diagnostics() {
             SetCursorPos(window.left + 5, window.top + 5);
             pump_for(Duration::from_millis(200));
             for index in 0..33 {
+                if matches!(index, 18..=25) {
+                    app.page(0);
+                    pump_for(Duration::from_millis(200));
+                }
                 let start = Instant::now();
                 let stop = Arc::new(AtomicBool::new(false));
                 let ready = Arc::new(Barrier::new(2));
@@ -453,5 +469,52 @@ fn ui_transition_diagnostics() {
             visual_failures.is_empty(),
             "visual regression candidates: {visual_failures:?}; review saved frames"
         );
+    }
+}
+
+#[test]
+#[ignore = "requires an interactive Windows desktop"]
+fn ui_performance_benchmark() {
+    unsafe {
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let mut f = super::capture_tests::fixture();
+        let app = &mut f.app;
+        // Test data only; never write configuration or register global shortcuts.
+        app.config.rules = (0..2)
+            .map(|i| SummonRule {
+                name: format!("Diagnostic rule {i}"),
+                enabled: true,
+                executable: "diagnostic.exe".into(),
+                arguments: String::new(),
+                working_directory: String::new(),
+                process_path: String::new(),
+                class: String::new(),
+                title: String::new(),
+                hotkey: Hotkey::new(3, 65 + i),
+                minimize: false,
+            })
+            .collect();
+        app.refresh_list();
+        app.fill_rule(Some(0));
+        app.layout_ui();
+        pump_for(Duration::from_millis(500));
+        let mut pages = Vec::new();
+        for index in 0..18 {
+            let mut handler = 0.;
+            let measurement = sample_action(|| {
+                let start = Instant::now();
+                f.app.page(index % 6);
+                handler = start.elapsed().as_secs_f64() * 1000.;
+                pump_for(Duration::from_millis(200));
+            });
+            if index >= 6 {
+                pages.push(json!({"handler_ms":handler,"measurement":measurement}));
+            }
+        }
+        let rest = super::super::rest_ui::benchmark(&mut f.app.rest, f.app.host);
+        let report = json!({"protocol":"performance-v2", "os":std::env::consts::OS, "build":option_env!("DUNYU_DIAGNOSTIC_REVISION"),
+            "pages":pages,"rest":rest});
+        let path = std::env::var("DUNYU_BENCH_REPORT").expect("DUNYU_BENCH_REPORT required");
+        std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
     }
 }

@@ -2516,6 +2516,25 @@ mod capture_tests {
     }
 
     #[test]
+    #[ignore = "requires an interactive Windows desktop"]
+    fn static_controls_match_original() {
+        unsafe {
+            let mut f = fixture();
+            let h = f.app.ui.as_ref().unwrap().window;
+            for page in [0, 1, 2, 0] {
+                f.app.page(page);
+                for id in [9002, 114, 7001] {
+                    let control = item(h, id);
+                    theme::verify_static_for_test(control);
+                    SendMessageW(control, WM_THEMECHANGED, 0, 0);
+                    theme::verify_static_for_test(control);
+                }
+            }
+            set_text(h, 114, "测试标题变化");
+            theme::verify_static_for_test(item(h, 114));
+        }
+    }
+    #[test]
     fn editor_drafts_selection_layout_and_target_state() {
         unsafe {
             let mut f = fixture();

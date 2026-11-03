@@ -31,7 +31,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     old, before = summarize(args.baseline)
     new, after = summarize(args.candidate)
-    comparable = all(old.get(k) == new.get(k) for k in ['dpi', 'client_size', 'os'])
+    comparable = all(old.get(k) == new.get(k) for k in ['dpi', 'client_size', 'os', 'measurement_protocol'])
     if args.goal == 'navigation':
         goal_met = (before['paint.tab'] is not None and after['paint.tab'] is not None
                     and after['paint.tab'] <= before['paint.tab'] * 0.5

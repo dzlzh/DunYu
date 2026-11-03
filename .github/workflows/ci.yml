@@ -19,6 +19,8 @@ jobs:
       - run: cargo fmt --all -- --check
       - if: runner.os == 'Windows'
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/run-ui-diagnostics.ps1 -SelfTest
+      - if: runner.os == 'Windows'
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-compare-performance.ps1
       - run: cargo test --locked --all-targets
         env:
           DUNYU_UI_SCREENSHOTS: '1'
