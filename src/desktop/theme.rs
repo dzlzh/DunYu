@@ -240,17 +240,110 @@ pub(super) unsafe fn scene(h: HWND, dpi: u32, cards: Vec<RECT>, fields: Vec<(HWN
     }
     InvalidateRect(h, null(), 0);
 }
-struct Paper(HBRUSH);
+type PaperKey = (i32, i32, i32);
+struct Paper {
+    brush: HBRUSH,
+    #[cfg(test)]
+    release: Option<Rc<std::cell::Cell<Option<BOOL>>>>,
+}
+impl Paper {
+    unsafe fn build(dc: HDC, key: PaperKey) -> Option<Self> {
+        #[cfg(test)]
+        let _build = super::ui::diagnostics::measure("paint.paper.build");
+        let mut buffer = None;
+        let memory = super::buffering::BackBuffer::prepare(&mut buffer, dc, key.0, key.1)?;
+        super::assets::background(memory, key.0, key.1, key.2);
+        let bitmap = GetCurrentObject(memory, OBJ_BITMAP as u32);
+        let brush = CreatePatternBrush(bitmap);
+        if brush.is_null() {
+            return None;
+        }
+        Some(Self {
+            brush,
+            #[cfg(test)]
+            release: None,
+        })
+    }
+}
 impl Drop for Paper {
     fn drop(&mut self) {
-        unsafe {
-            DeleteObject(self.0);
+        let _released = unsafe { DeleteObject(self.brush) };
+        #[cfg(test)]
+        if let Some(probe) = &self.release {
+            probe.set(Some(_released));
         }
     }
 }
+struct PaperCache {
+    // Oldest first; the small entry limit keeps lookup and promotion cheap.
+    entries: Vec<(PaperKey, Paper)>,
+    bytes: u64,
+    budget: u64,
+    limit: usize,
+    // WM_CTLCOLOR callers use the returned brush after the callback returns.
+    // Keep an oversized, uncached brush alive until the next successful lookup.
+    temporary: Option<Paper>,
+}
+impl Default for PaperCache {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            bytes: 0,
+            budget: 128 * 1024 * 1024,
+            limit: 16,
+            temporary: None,
+        }
+    }
+}
+impl PaperCache {
+    fn cost(key: PaperKey) -> u64 {
+        key.0.max(1) as u64 * key.1.max(1) as u64 * 4
+    }
+    fn record(&self, _key: PaperKey, _event: &str) {
+        #[cfg(test)]
+        super::ui::diagnostics::paper_cache_event(_key, _event, self.bytes, self.entries.len());
+    }
+    fn get_or_build(
+        &mut self,
+        key: PaperKey,
+        build: impl FnOnce() -> Option<Paper>,
+    ) -> Option<HBRUSH> {
+        if let Some(index) = self.entries.iter().position(|(k, _)| *k == key) {
+            let entry = self.entries.remove(index);
+            let brush = entry.1.brush;
+            self.entries.push(entry);
+            self.temporary = None;
+            self.record(key, "hits");
+            return Some(brush);
+        }
+        self.record(key, "misses");
+        let Some(paper) = build() else {
+            self.record(key, "failures");
+            return None;
+        };
+        let brush = paper.brush;
+        let cost = Self::cost(key);
+        if cost > self.budget {
+            self.temporary = Some(paper);
+            self.record(key, "temporary_builds");
+        } else {
+            while self.entries.len() >= self.limit || self.bytes + cost > self.budget {
+                let (evicted, paper) = self.entries.remove(0);
+                self.bytes -= Self::cost(evicted);
+                drop(paper);
+                self.record(evicted, "evictions");
+            }
+            self.entries.push((key, paper));
+            self.bytes += cost;
+            self.temporary = None;
+            self.record(key, "builds");
+        }
+        Some(brush)
+    }
+}
 thread_local! {
-    static PAPER: RefCell<HashMap<(i32,i32,i32), Paper>> = RefCell::new(HashMap::new());
-    static CANVAS: std::cell::Cell<(i32,i32,i32)> = const { std::cell::Cell::new((1024,650,0)) };
+    static PAPER: RefCell<PaperCache> = RefCell::new(PaperCache::default());
+    static CANVAS: std::cell::Cell<PaperKey> = const { std::cell::Cell::new((1024,650,0)) };
 }
 pub(super) unsafe fn canvas(h: HWND) {
     let mut r: RECT = std::mem::zeroed();
@@ -267,24 +360,17 @@ pub(super) unsafe fn canvas(h: HWND) {
 }
 unsafe fn paper_brush(dc: HDC) -> HBRUSH {
     let size = CANVAS.get();
-    PAPER.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if !cache.contains_key(&size) {
-            if cache.len() >= 4 {
-                cache.clear();
-            }
-            let memory = CreateCompatibleDC(dc);
-            let bitmap = CreateCompatibleBitmap(dc, size.0, size.1);
-            let old = SelectObject(memory, bitmap);
-            super::assets::background(memory, size.0, size.1, size.2);
-            let brush = CreatePatternBrush(bitmap);
-            SelectObject(memory, old);
-            DeleteObject(bitmap);
-            DeleteDC(memory);
-            cache.insert(size, Paper(brush));
-        }
-        cache[&size].0
-    })
+    PAPER
+        .with(|cache| {
+            cache
+                .borrow_mut()
+                .get_or_build(size, || Paper::build(dc, size))
+        })
+        .unwrap_or_else(|| {
+            // Stock DC brush is borrowed, never owned by the cache. Retry next paint.
+            SetDCBrushColor(dc, rgb(if size.2 == 3 { SURFACE } else { BACKGROUND }));
+            GetStockObject(DC_BRUSH)
+        })
 }
 pub(super) unsafe fn background_brush(dc: HDC) -> HBRUSH {
     if high_contrast() {
@@ -2059,6 +2145,184 @@ mod navigation_tests {
             drop(_root_owner);
             drop(graphics);
             println!("Navigation cleanup completed; awaiting test runner result.");
+        }
+    }
+}
+
+#[cfg(test)]
+mod paper_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires Windows GDI and an interactive desktop"]
+    fn paper_cache_reuses_evicts_and_matches_pixels() {
+        unsafe {
+            let _graphics = TestGraphicsScope::new();
+            let cache = RefCell::new(PaperCache::default());
+            let probes = RefCell::new(Vec::new());
+            let builds = std::cell::Cell::new(0);
+            // The actual six-key working set: settings, fullscreen, then card.
+            let keys = [
+                (1024, 651, 0),
+                (1024, 651, 3),
+                (1920, 1080, 1),
+                (1920, 1080, 3),
+                (480, 310, 2),
+                (480, 310, 3),
+            ];
+            for _ in 0..2 {
+                for key in keys {
+                    compare_frames_for_test(key.0, key.1, |dc, reference| {
+                        let fresh;
+                        let brush = if reference {
+                            fresh = Paper::build(dc, key).expect("reference brush");
+                            fresh.brush
+                        } else {
+                            cache
+                                .borrow_mut()
+                                .get_or_build(key, || {
+                                    builds.set(builds.get() + 1);
+                                    let mut paper = Paper::build(dc, key)?;
+                                    let probe = Rc::new(std::cell::Cell::new(None));
+                                    paper.release = Some(probe.clone());
+                                    probes.borrow_mut().push(probe);
+                                    Some(paper)
+                                })
+                                .expect("cached brush")
+                        };
+                        // Include the brush origin used by child controls.
+                        SetBrushOrgEx(dc, -13, -27, null_mut());
+                        assert_ne!(
+                            FillRect(
+                                dc,
+                                &RECT {
+                                    left: 0,
+                                    top: 0,
+                                    right: key.0,
+                                    bottom: key.1
+                                },
+                                brush
+                            ),
+                            0
+                        );
+                    });
+                }
+            }
+            assert_eq!(
+                builds.get(),
+                6,
+                "warm scene switches must not rebuild paper"
+            );
+            assert_eq!(cache.borrow().entries.len(), 6);
+            assert!(cache.borrow().bytes <= cache.borrow().budget);
+            drop(cache);
+            for probe in probes.into_inner() {
+                assert_ne!(
+                    probe.get().expect("paper destructor ran"),
+                    0,
+                    "DeleteObject failed"
+                );
+            }
+
+            // Small real brushes with declared dimensions isolate accounting and
+            // ownership tests from large allocations. Pixel rendering is above.
+            let releases = RefCell::new(Vec::new());
+            let make = || {
+                let brush = CreateSolidBrush(rgb(BACKGROUND));
+                assert!(!brush.is_null());
+                let probe = Rc::new(std::cell::Cell::new(None));
+                releases.borrow_mut().push(probe.clone());
+                Some(Paper {
+                    brush,
+                    release: Some(probe),
+                })
+            };
+            let mut cache = PaperCache::default();
+            for key in keys.into_iter().chain([
+                (3840, 2160, 1),
+                (3840, 2160, 3),
+                (2560, 1440, 1),
+                (2560, 1440, 3),
+            ]) {
+                cache.get_or_build(key, &make).unwrap();
+            }
+            assert!(cache.bytes <= cache.budget);
+            // 1080p + 4K + 1440p and the settings/card backgrounds all fit.
+            assert_eq!(cache.entries.len(), 10);
+            for key in keys {
+                cache
+                    .get_or_build(key, || panic!("unexpected eviction"))
+                    .unwrap();
+            }
+            drop(cache);
+
+            let mut cache = PaperCache {
+                budget: 48,
+                limit: 2,
+                ..Default::default()
+            };
+            let a = (2, 2, 0);
+            let b = (2, 2, 1);
+            let c = (2, 2, 2);
+            let original = cache.get_or_build(a, &make).unwrap();
+            cache.get_or_build(b, &make).unwrap();
+            assert_eq!(cache.get_or_build(a, || panic!("miss")), Some(original));
+            cache.get_or_build(c, &make).unwrap();
+            assert_ne!(
+                releases.borrow()[11]
+                    .get()
+                    .expect("LRU victim released immediately"),
+                0
+            );
+            assert_eq!(
+                cache.entries.iter().map(|e| e.0).collect::<Vec<_>>(),
+                vec![a, c]
+            );
+            assert_eq!(cache.get_or_build(b, || None), None);
+            assert_eq!(
+                cache.entries.len(),
+                2,
+                "failed creation must retain working set"
+            );
+            cache.get_or_build(b, &make).unwrap();
+            cache.get_or_build((3, 3, 0), &make).unwrap();
+            assert_eq!(cache.entries.len(), 1, "byte budget eviction");
+            assert_eq!(cache.bytes, 36);
+            cache.get_or_build((4, 4, 0), &make).unwrap();
+            assert!(cache.temporary.is_some());
+            assert_eq!(
+                cache.bytes, 36,
+                "oversized brush must not enter reusable cache"
+            );
+            cache.get_or_build((3, 3, 0), || panic!("miss")).unwrap();
+            assert!(cache.temporary.is_none());
+            drop(cache);
+            for probe in releases.into_inner() {
+                assert_ne!(probe.get().expect("all owned brushes released"), 0);
+            }
+            let unavailable = super::super::ui::diagnostics::sample_action(|| {});
+            assert_eq!(unavailable["paper_cache"]["available"], false);
+            let mut cache = PaperCache::default();
+            let report = super::super::ui::diagnostics::sample_action(|| {
+                cache
+                    .get_or_build(a, || {
+                        let brush = CreateSolidBrush(rgb(BACKGROUND));
+                        assert!(!brush.is_null());
+                        Some(Paper {
+                            brush,
+                            release: None,
+                        })
+                    })
+                    .unwrap();
+                cache
+                    .get_or_build(a, || panic!("diagnostic warm miss"))
+                    .unwrap();
+            });
+            assert_eq!(report["paper_cache"]["available"], true);
+            assert_eq!(report["paper_cache"]["retained_bytes"], 16);
+            assert_eq!(report["paper_cache"]["keys"]["2x2:scene0"]["builds"], 1);
+            assert_eq!(report["paper_cache"]["keys"]["2x2:scene0"]["hits"], 1);
+            println!("Paper cache reuse, pixel equality, budget, retry and release checks passed.");
         }
     }
 }

@@ -16,7 +16,38 @@ thread_local! {
     static SAMPLES: RefCell<HashMap<&'static str, Vec<f64>>> = RefCell::new(HashMap::new());
     static COUNTERS: RefCell<Option<HashMap<&'static str, (u64, f64)>>> = const { RefCell::new(None) };
 }
+// Additive candidate-only diagnostics. Old baselines have no producer and report
+// available=false, rather than misleading zero cache misses.
+thread_local! {
+    static PAPER_STATS: RefCell<Option<serde_json::Value>> = const { RefCell::new(None) };
+}
+pub(crate) fn paper_cache_event(key: (i32, i32, i32), event: &str, bytes: u64, entries: usize) {
+    if !COUNTERS.with(|c| c.borrow().is_some()) {
+        return;
+    }
+    PAPER_STATS.with(|stats| {
+        let mut stats = stats.borrow_mut();
+        let stats = stats
+            .get_or_insert_with(|| json!({"available":true,"keys":{},"peak_retained_bytes":0}));
+        stats["retained_bytes"] = bytes.into();
+        stats["entries"] = entries.into();
+        stats["peak_retained_bytes"] = stats["peak_retained_bytes"]
+            .as_u64()
+            .unwrap()
+            .max(bytes)
+            .into();
+        let keys = stats["keys"].as_object_mut().unwrap();
+        let name = format!("{}x{}:scene{}", key.0, key.1, key.2);
+        if keys.len() < 256 || keys.contains_key(&name) {
+            let counts = keys.entry(name).or_insert_with(|| json!({}));
+            counts[event] = (counts[event].as_u64().unwrap_or(0) + 1).into();
+        } else {
+            stats["truncated"] = true.into();
+        }
+    });
+}
 pub(crate) fn capture_counters(action: impl FnOnce()) -> HashMap<&'static str, (u64, f64)> {
+    PAPER_STATS.with(|s| *s.borrow_mut() = None);
     COUNTERS.with(|c| assert!(c.borrow_mut().replace(HashMap::new()).is_none()));
     action();
     COUNTERS.with(|c| c.borrow_mut().take().unwrap())
@@ -25,7 +56,10 @@ pub(crate) fn sample_action(action: impl FnOnce()) -> serde_json::Value {
     SAMPLES.with(|s| s.borrow_mut().clear());
     let counters = capture_counters(action);
     let samples = SAMPLES.with(|s| std::mem::take(&mut *s.borrow_mut()));
-    json!({"counters":counters,"samples_ms":samples})
+    let paper = PAPER_STATS
+        .with(|s| s.borrow_mut().take())
+        .unwrap_or_else(|| json!({"available":false}));
+    json!({"counters":counters,"samples_ms":samples,"paper_cache":paper})
 }
 pub(crate) struct Measurement {
     name: &'static str,

@@ -77,6 +77,7 @@ $log = Join-Path $PSScriptRoot 'diagnostic-run.log'
 Set-Content -LiteralPath $log -Value 'DunYu diagnostics: process exit and test runner result determine success.' -Encoding UTF8
 $exe = Join-Path $PSScriptRoot 'dunyu-ui-tests.exe'
 $stages = @(@{Name='buffer'; Filter='desktop::buffering::tests::buffer_reuses_size_replaces_and_releases_gdi_objects'; Timeout=120; Ignored=''})
+$stages += @{Name='paper-cache'; Filter='desktop::theme::paper_tests::paper_cache_reuses_evicts_and_matches_pixels'; Timeout=180; Ignored='--ignored'}
 $stages += @{Name='rest-pixels'; Filter='desktop::rest_ui::tests::cached_rest_matches_original'; Timeout=600; Ignored='--ignored'}
 foreach ($i in 1..3) {
     $stages += @{Name="navigation-$i"; Filter='desktop::theme::navigation_tests::cached_navigation_matches_original'; Timeout=120; Ignored='--ignored'}
