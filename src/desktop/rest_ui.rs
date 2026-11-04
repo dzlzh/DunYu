@@ -772,13 +772,10 @@ impl Runtime {
                     damage.bottom = damage.bottom.max(r.bottom);
                 }
             }
-            let _redraw = super::buffering::RedrawBatch::region(*h, damage);
-            for (id, text) in [(10, counter.as_str()), (12, heading.as_str()), (13, body)] {
-                let child = GetDlgItem(*h, id);
-                if title(child) != text {
-                    SetWindowTextW(child, wide(text).as_ptr());
-                }
-            }
+            // WM_SETREDRAW temporarily clears WS_VISIBLE. Keep fullscreen
+            // windows visible throughout each tick so the shell retains their
+            // fullscreen coverage instead of exposing the taskbar.
+            let _redraw = (!fullscreen).then(|| super::buffering::RedrawBatch::region(*h, damage));
             let duration = if preview {
                 5000
             } else if phase == Phase::Warning {
@@ -794,7 +791,17 @@ impl Runtime {
             SetPropW(*h, wide("DunYu.Duration").as_ptr(), duration as HANDLE);
             SetPropW(*h, wide("DunYu.Left").as_ptr(), left as HANDLE);
             SetPropW(*h, wide("DunYu.Stamp").as_ptr(), stamp as HANDLE);
-            InvalidateRect(*h, &damage, 0);
+            for (id, text) in [(10, counter.as_str()), (12, heading.as_str()), (13, body)] {
+                let child = GetDlgItem(*h, id);
+                if title(child) != text {
+                    SetWindowTextW(child, wide(text).as_ptr());
+                }
+            }
+            if fullscreen {
+                RedrawWindow(*h, &damage, null_mut(), RDW_INVALIDATE | RDW_ALLCHILDREN);
+            } else {
+                InvalidateRect(*h, &damage, 0);
+            }
         }
         // Every monitor's initial state is ready before any new window is shown.
         for h in &self.windows {
@@ -1282,6 +1289,127 @@ pub(super) unsafe fn benchmark(runtime: &mut Runtime, host: HWND) -> serde_json:
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fullscreen_countdown_stays_visible_during_text_updates() {
+        #[derive(Default)]
+        struct Observation {
+            updates: std::cell::Cell<usize>,
+            hidden: std::cell::Cell<bool>,
+        }
+        unsafe extern "system" fn observe(
+            h: HWND,
+            m: u32,
+            w: WPARAM,
+            l: LPARAM,
+            id: usize,
+            data: usize,
+        ) -> LRESULT {
+            let observation = &*(data as *const Observation);
+            if m == WM_SETTEXT {
+                observation.updates.set(observation.updates.get() + 1);
+                // Check inside the update: the old batch restored visibility
+                // before advance returned, hiding the transient loss from tests.
+                if IsWindowVisible(GetAncestor(h, GA_ROOT)) == 0 {
+                    observation.hidden.set(true);
+                }
+            }
+            if m == WM_NCDESTROY {
+                RemoveWindowSubclass(h, Some(observe), id);
+            }
+            DefSubclassProc(h, m, w, l)
+        }
+        struct Cleanup {
+            runtime: Runtime,
+            host: theme::TestWindow,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                unsafe {
+                    self.runtime.close();
+                    KillTimer(self.host.0, TIMER_ID);
+                }
+            }
+        }
+        unsafe {
+            let _graphics = theme::TestGraphicsScope::new();
+            windows_sys::Win32::UI::Controls::InitCommonControls();
+            for preview in [false, true] {
+                // Outlive the windows and their subclasses, including on panic.
+                let observation = Box::<Observation>::default();
+                let host = theme::TestWindow(CreateWindowExW(
+                    0,
+                    wide("STATIC").as_ptr(),
+                    wide("rest-visibility-test").as_ptr(),
+                    0,
+                    0,
+                    0,
+                    1,
+                    1,
+                    null_mut(),
+                    null_mut(),
+                    GetModuleHandleW(null()),
+                    null(),
+                ));
+                assert!(!host.0.is_null());
+                let mut cleanup = Cleanup {
+                    runtime: Runtime::default(),
+                    host,
+                };
+                let host = cleanup.host.0;
+                let runtime = &mut cleanup.runtime;
+                let now = GetTickCount64();
+                runtime.scheduler = RestScheduler::new(
+                    RestConfig {
+                        enabled: !preview,
+                        fullscreen: true,
+                        ..Default::default()
+                    },
+                    now,
+                );
+                if preview {
+                    runtime.preview_until = now + 5000;
+                } else {
+                    runtime.scheduler.start(now);
+                }
+                runtime.advance(host, now, false, false);
+                let windows = runtime.windows.clone();
+                let generation = runtime.generation;
+                assert!(!windows.is_empty());
+                for h in &windows {
+                    assert_ne!(IsWindowVisible(*h), 0);
+                    assert_ne!(
+                        SetWindowSubclass(
+                            GetDlgItem(*h, 10),
+                            Some(observe),
+                            0xD175,
+                            &*observation as *const Observation as usize,
+                        ),
+                        0
+                    );
+                }
+                for second in 1..=3 {
+                    runtime.advance(host, now + second * 1000, false, false);
+                    assert_eq!(runtime.windows, windows);
+                    assert_eq!(runtime.generation, generation);
+                    assert!(
+                        !observation.hidden.get(),
+                        "preview={preview}, second={second}"
+                    );
+                    assert_eq!(observation.updates.get(), second as usize * windows.len());
+                    let left = if preview { 5 } else { 20 } - second;
+                    for h in &windows {
+                        assert_ne!(IsWindowVisible(*h), 0);
+                        assert_eq!(title(GetDlgItem(*h, 10)), format!("00:{left:02}"));
+                        assert_eq!(
+                            GetPropW(*h, wide("DunYu.Left").as_ptr()) as usize as u64,
+                            left * 1000
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     #[ignore = "requires an interactive Windows desktop"]
     fn cached_rest_matches_original() {
