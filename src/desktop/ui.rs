@@ -1896,7 +1896,8 @@ impl App {
             let area =
                 if !super::design::state_allows(id, !self.config.rules.is_empty(), u.advanced) {
                     None
-                } else if reference {
+                } else if reference || (columns == 2 && matches!(id, 9 | 9002)) {
+                    // Keep the header geometry independent of the page's content layout.
                     design
                         .control(id)
                         .map(|mut r| {
