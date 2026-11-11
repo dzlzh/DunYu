@@ -62,6 +62,8 @@ unsafe extern "system" fn procedure(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LR
             0
         }
         WM_PAINT | WM_PRINTCLIENT => {
+            #[cfg(test)]
+            super::ui::resident_diagnostics::count(5);
             paint(h, m, w);
             0
         }
@@ -176,6 +178,8 @@ fn animation_rect(r: RECT) -> RECT {
 // Build at the same device coordinates as a full frame, then crop. Rendering
 // into a translated small bitmap changes GDI+ sampling at fractional scales.
 unsafe fn prepare_backdrop(dc: HDC, r: RECT, cache: &mut RestBuffers) -> Option<HDC> {
+    #[cfg(test)]
+    let _profile = super::rest_profile::stage("backdrop.prepare");
     use windows_sys::Win32::Graphics::GdiPlus::*;
     let area = animation_rect(r);
     let memory = super::buffering::BackBuffer::prepare(
@@ -187,6 +191,8 @@ unsafe fn prepare_backdrop(dc: HDC, r: RECT, cache: &mut RestBuffers) -> Option<
     if cache.key != Some((r.right, r.bottom)) {
         #[cfg(test)]
         let _build = super::ui::diagnostics::measure("paint.rest.static_build");
+        #[cfg(test)]
+        let _profile = super::rest_profile::stage("backdrop.build");
         // dc is the existing full-size offscreen frame, before dirty clipping.
         // Only paper and ring enter the cache; dynamic layers are drawn later.
         theme::paper(dc, r);
@@ -240,6 +246,12 @@ unsafe fn paint_clock() -> u64 {
     GetTickCount64()
 }
 unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
+    #[cfg(test)]
+    let _window = super::rest_profile::window(h);
+    #[cfg(test)]
+    let _total = super::rest_profile::stage("paint.total");
+    #[cfg(test)]
+    let setup = super::rest_profile::stage("paint.prepare");
     #[cfg(test)]
     let _measurement = super::ui::diagnostics::measure("paint");
     use windows_sys::Win32::Graphics::GdiPlus::*;
@@ -299,6 +311,10 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
         render_clip.right,
         render_clip.bottom,
     );
+    #[cfg(test)]
+    drop(setup);
+    #[cfg(test)]
+    let background = super::rest_profile::stage("background.restore");
     theme::paper(memory, dirty);
     let static_cached = backdrop.is_some_and(|backdrop| {
         let area = animation_rect(r);
@@ -307,6 +323,8 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
         };
         #[cfg(test)]
         let _copy = super::ui::diagnostics::measure("paint.rest.static_copy");
+        #[cfg(test)]
+        let _profile = super::rest_profile::stage("backdrop.copy");
         BitBlt(
             memory,
             clip.left,
@@ -323,6 +341,10 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
         // A failed cache copy must not leave a partially composited ring behind.
         theme::paper(memory, dirty);
     }
+    #[cfg(test)]
+    drop(background);
+    #[cfg(test)]
+    let mut state = Some(super::rest_profile::stage("graphics.state"));
     let full = !GetPropW(h, wide("DunYu.Full").as_ptr()).is_null();
     let scale = GetPropW(h, wide("DunYu.LayoutDpi").as_ptr()) as usize as f32 / 96.;
     let mut g = null_mut();
@@ -361,6 +383,10 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
         let progress = super::swim::progress(duration, left, elapsed);
         let percent = (progress * 100.).clamp(0., 100.);
         let layout = super::swim::Layout::new(r.right as f32, r.bottom as f32);
+        #[cfg(test)]
+        drop(state.take());
+        #[cfg(test)]
+        let ring = super::rest_profile::stage("ring.progress");
         if full {
             let [x, y, d, _] = layout.rect(661., 261., 350., 350.);
             GdipSetPenColor(pen, argb(theme::INK, COLOR_WINDOWTEXT));
@@ -389,7 +415,11 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
                 y,
             );
         }
+        #[cfg(test)]
+        drop(ring);
         if full {
+            #[cfg(test)]
+            let _koi = super::rest_profile::stage("koi");
             rest_art::koi(
                 g,
                 (r.right as f32 / 2., layout.y + 436. * layout.scale),
@@ -399,9 +429,15 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
                 moving,
             );
         }
+        #[cfg(test)]
+        let _cleanup = super::rest_profile::stage("graphics.cleanup");
         GdipDeletePen(pen);
         GdipDeleteGraphics(g);
     }
+    #[cfg(test)]
+    drop(state);
+    #[cfg(test)]
+    let stroke = super::rest_profile::stage("stroke");
     if full && !theme::high_contrast() {
         let l = super::swim::Layout::new(r.right as f32, r.bottom as f32);
         let [x, y, w, h] = l.rect(699., 220., 140., 10.);
@@ -416,6 +452,10 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
             false,
         );
     }
+    #[cfg(test)]
+    drop(stroke);
+    #[cfg(test)]
+    let icon = super::rest_profile::stage("icon");
     let logo_scale = if full {
         layout_scale(r.right, r.bottom)
     } else {
@@ -447,6 +487,10 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
             DI_NORMAL,
         );
     }
+    #[cfg(test)]
+    drop(icon);
+    #[cfg(test)]
+    let present = super::rest_profile::stage("present");
     if buffered {
         BitBlt(
             dc,
@@ -460,6 +504,10 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
             SRCCOPY,
         );
     }
+    #[cfg(test)]
+    drop(present);
+    #[cfg(test)]
+    let _cleanup = super::rest_profile::stage("paint.cleanup");
     RestoreDC(memory, saved);
     if message == WM_PAINT {
         EndPaint(h, &ps);
@@ -470,6 +518,13 @@ unsafe extern "system" fn monitor(_: HMONITOR, _: HDC, r: *mut RECT, data: LPARA
     1
 }
 impl Runtime {
+    #[cfg(test)]
+    pub(super) unsafe fn resident_visible_windows(&self) -> usize {
+        self.windows
+            .iter()
+            .filter(|&&h| IsWindowVisible(h) != 0)
+            .count()
+    }
     pub unsafe fn close(&mut self) {
         #[cfg(test)]
         let _measurement = super::ui::diagnostics::measure("rest.close");
@@ -593,6 +648,10 @@ impl Runtime {
         }
     }
     pub unsafe fn tick(&mut self, host: HWND) {
+        #[cfg(test)]
+        let _tick = super::rest_profile::stage("rest.tick");
+        #[cfg(test)]
+        super::ui::resident_diagnostics::count(4);
         let now = GetTickCount64();
         let mut input = LASTINPUTINFO {
             cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,

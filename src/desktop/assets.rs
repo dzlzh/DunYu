@@ -125,12 +125,18 @@ pub(super) unsafe fn navigation(dc: HDC, r: RECT, index: usize) {
     });
 }
 pub(super) unsafe fn koi(g: *mut GpGraphics, elapsed: u64, moving: bool) {
+    #[cfg(test)]
+    let lookup = super::rest_profile::stage("koi.lookup");
     KOI.with(|cache| {
         let mut cache = cache.borrow_mut();
         let image = cache.get_or_insert_with(|| {
             Image::load(include_bytes!("../../resources/koi-natural-frames.png"))
         });
         let frame = if moving { (elapsed % 2000) / 40 } else { 0 };
+        #[cfg(test)]
+        drop(lookup);
+        #[cfg(test)]
+        let _draw = super::rest_profile::stage("koi.draw");
         image.draw(
             g,
             [-48., -48., 96., 96.],

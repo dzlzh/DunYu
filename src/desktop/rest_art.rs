@@ -9,6 +9,8 @@ pub(super) unsafe fn koi(
     elapsed: u64,
     moving: bool,
 ) {
+    #[cfg(test)]
+    let transform = super::rest_profile::stage("koi.transform");
     let (x, y, heading) = super::swim::orbit(progress);
     let mut saved = 0;
     GdipSaveGraphics(g, &mut saved);
@@ -20,7 +22,11 @@ pub(super) unsafe fn koi(
     );
     GdipRotateWorldTransform(g, heading + 90., MatrixOrderPrepend);
     GdipScaleWorldTransform(g, scale, scale, MatrixOrderPrepend);
+    #[cfg(test)]
+    drop(transform);
     assets::koi(g, elapsed, moving);
+    #[cfg(test)]
+    let _restore = super::rest_profile::stage("koi.restore");
     GdipRestoreGraphics(g, saved);
 }
 

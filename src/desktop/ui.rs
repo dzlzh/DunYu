@@ -2801,7 +2801,7 @@ mod capture_tests {
             }
         }
     }
-    fn test_app(host: HWND, dir: PathBuf) -> App {
+    pub(super) fn test_app(host: HWND, dir: PathBuf) -> App {
         App {
             host,
             config: AppConfig::default(),
@@ -2824,6 +2824,9 @@ mod capture_tests {
     }
 
     pub(super) unsafe fn fixture() -> Fixture {
+        fixture_with_ui(true)
+    }
+    pub(super) unsafe fn fixture_with_ui(open: bool) -> Fixture {
         let graphics = theme::TestGraphicsScope::new();
         let classes: [(&str, WNDPROC); 2] = [
             ("DunYu.Settings.1", Some(procedure)),
@@ -2869,10 +2872,11 @@ mod capture_tests {
         for (i, (key, cmd)) in app.config.bindings().into_iter().enumerate() {
             app.keys.insert(i as i32 + 1, (key, cmd));
         }
-        app.open_ui();
-
-        app.ui.as_mut().unwrap().target = None;
-        app.refresh_state();
+        if open {
+            app.open_ui();
+            app.ui.as_mut().unwrap().target = None;
+            app.refresh_state();
+        }
         f
     }
 
@@ -4162,3 +4166,7 @@ mod capture_tests {
 #[cfg(test)]
 #[path = "diagnostics.rs"]
 pub(crate) mod diagnostics;
+
+#[cfg(test)]
+#[path = "resident_diagnostics.rs"]
+pub(crate) mod resident_diagnostics;

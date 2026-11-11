@@ -8,6 +8,8 @@ mod message;
 mod priority_hotkey;
 mod recorder;
 mod rest_art;
+#[cfg(test)]
+mod rest_profile;
 mod rest_ui;
 mod scroll_ui;
 mod swim;
@@ -71,6 +73,8 @@ unsafe fn class(h: HWND) -> String {
     String::from_utf16_lossy(&b[..n.max(0) as usize])
 }
 unsafe fn process(h: HWND) -> Option<(u32, u64, String)> {
+    #[cfg(test)]
+    ui::resident_diagnostics::count(0);
     let mut pid = 0;
     GetWindowThreadProcessId(h, &mut pid);
     let p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
@@ -200,6 +204,8 @@ unsafe extern "system" fn enumerate(h: HWND, p: LPARAM) -> BOOL {
     1
 }
 unsafe fn windows() -> Vec<usize> {
+    #[cfg(test)]
+    ui::resident_diagnostics::count(1);
     let mut v = vec![];
     EnumWindows(Some(enumerate), &mut v as *mut _ as LPARAM);
     v
@@ -628,6 +634,8 @@ impl App {
         Ok(())
     }
     unsafe fn tick(&mut self) {
+        #[cfg(test)]
+        ui::resident_diagnostics::count(6);
         let ids: Vec<_> = self.pending.iter().map(|p| p.rule).collect();
         let mut scan = (ids.len() > 1).then(|| dunyu::window_search::Scan::new(windows()));
         for i in ids {

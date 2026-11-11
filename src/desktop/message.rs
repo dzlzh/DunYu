@@ -491,6 +491,8 @@ fn monitor(
     });
     update("正在监听；窗口内通知合并转发".into());
     while !cancel.load(Ordering::SeqCst) {
+        #[cfg(test)]
+        ui::resident_diagnostics::count(2);
         let rows = store.lock().unwrap().scan(cursor);
         match rows {
             Err(_) => update("通知数据库暂不可读，稍后重试".into()),
@@ -544,6 +546,8 @@ fn wait(cancel: &AtomicBool, duration: Duration) -> bool {
             return false;
         }
         std::thread::sleep(remaining.min(Duration::from_millis(100)));
+        #[cfg(test)]
+        ui::resident_diagnostics::count(3);
     }
     true
 }
@@ -794,4 +798,27 @@ mod migration_tests {
         c.corp_id = ProtectedValue::Encrypted(vec![1, 2, 3]);
         assert!(validate_credentials(&c).is_err());
     }
+}
+
+#[cfg(test)]
+pub(super) fn resident_listener(
+    path: &std::path::Path,
+    host: HWND,
+) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+    let store = Store::open(path).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let stop = cancel.clone();
+    let host = host as usize;
+    let worker = std::thread::spawn(move || {
+        monitor(
+            MessageConfig::default(),
+            stop,
+            Default::default(),
+            host,
+            store,
+            0,
+            |_, _, _| Ok(()),
+        )
+    });
+    (cancel, worker)
 }
