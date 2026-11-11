@@ -9,6 +9,9 @@ struct Profile {
     values: BTreeMap<String, BTreeMap<&'static str, Vec<f64>>>,
 }
 thread_local! { static PROFILE: RefCell<Profile> = RefCell::new(Profile::default()); }
+pub(super) fn enabled() -> bool {
+    PROFILE.with(|p| p.borrow().enabled)
+}
 pub(super) fn start() {
     PROFILE.with(|p| {
         *p.borrow_mut() = Profile {

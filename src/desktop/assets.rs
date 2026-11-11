@@ -23,26 +23,29 @@ impl Image {
             _theme: theme,
         }
     }
-    unsafe fn draw(&self, g: *mut GpGraphics, dest: [f32; 4], source: [f32; 4], key: bool) {
+    unsafe fn draw(&self, g: *mut GpGraphics, dest: [f32; 4], source: [f32; 4], key: bool) -> bool {
         if self.image.is_null() {
-            return;
+            return false;
         }
         let mut attributes = null_mut();
+        let mut attributes_ok = true;
         if key {
             GdipCreateImageAttributes(&mut attributes);
             if !attributes.is_null() {
-                GdipSetImageAttributesColorKeys(
+                attributes_ok = GdipSetImageAttributesColorKeys(
                     attributes,
                     ColorAdjustTypeBitmap,
                     1,
                     0xff000000,
                     0xff404040,
-                );
+                ) == 0;
+            } else {
+                attributes_ok = false;
             }
         }
         GdipSetInterpolationMode(g, InterpolationModeHighQualityBicubic);
         let dest = super::swim::contain([source[2], source[3]], dest);
-        GdipDrawImageRectRect(
+        let status = GdipDrawImageRectRect(
             g,
             self.image,
             dest[0],
@@ -61,6 +64,7 @@ impl Image {
         if !attributes.is_null() {
             GdipDisposeImageAttributes(attributes);
         }
+        status == 0 && attributes_ok
     }
 }
 impl Drop for Image {
@@ -244,7 +248,7 @@ pub(super) unsafe fn ring(g: *mut GpGraphics, dest: [f32; 4]) {
     });
 }
 // The original dry-brush underline; colour-key only removes its dark paper.
-pub(super) unsafe fn stroke(dc: HDC, r: RECT, red: bool) {
+pub(super) unsafe fn stroke(dc: HDC, r: RECT, red: bool) -> bool {
     MAIN.with(|cache| {
         let mut cache = cache.borrow_mut();
         let image = cache.get_or_insert_with(|| {
@@ -257,7 +261,7 @@ pub(super) unsafe fn stroke(dc: HDC, r: RECT, red: bool) {
             } else {
                 packed::STROKE_INK
             };
-            image.draw(
+            let success = image.draw(
                 g,
                 [
                     r.left as f32,
@@ -269,8 +273,11 @@ pub(super) unsafe fn stroke(dc: HDC, r: RECT, red: bool) {
                 true,
             );
             GdipDeleteGraphics(g);
+            success
+        } else {
+            false
         }
-    });
+    })
 }
 
 // Drop cached images/streams while ordinary thread execution is still active.

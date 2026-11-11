@@ -56,6 +56,7 @@ unsafe extern "system" fn procedure(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LR
             let cache = GetPropW(h, wide("DunYu.BackBuffer").as_ptr()) as *mut RestBuffers;
             if !cache.is_null() {
                 (*cache).key = None;
+                (*cache).stroke_key = None;
             }
             update_animation(h);
             InvalidateRect(h, null(), 0);
@@ -164,6 +165,109 @@ struct RestBuffers {
     frame: Option<super::buffering::BackBuffer>,
     backdrop: Option<super::buffering::BackBuffer>,
     key: Option<(i32, i32)>,
+    stroke: Option<super::buffering::BackBuffer>,
+    stroke_key: Option<(i32, i32, usize)>,
+    #[cfg(test)]
+    activity: [u64; 6],
+    #[cfg(test)]
+    examples: std::collections::BTreeMap<&'static str, serde_json::Value>,
+}
+fn stroke_rects(r: RECT) -> (RECT, RECT, bool) {
+    let l = super::swim::Layout::new(r.right as f32, r.bottom as f32);
+    let [x, y, w, tall] = l.rect(699., 220., 140., 10.);
+    let target = RECT {
+        left: x as i32,
+        top: y as i32,
+        right: (x + w) as i32,
+        bottom: (y + tall) as i32,
+    };
+    let patch = RECT {
+        left: target.left - 2,
+        top: target.top - 2,
+        right: target.right + 2,
+        bottom: target.bottom + 2,
+    };
+    let area = animation_rect(r);
+    let supported = patch.left >= area.left
+        && patch.top >= area.top
+        && patch.right <= area.right
+        && patch.bottom <= area.bottom
+        && patch.left >= 0
+        && patch.top >= 0
+        && patch.right <= r.right
+        && patch.bottom <= r.bottom
+        && patch.bottom as f32 <= l.y + 258. * l.scale;
+    (target, patch, supported)
+}
+// Construct from authoritative static pixels at the original device coordinates.
+// The frame's old scratch pixels and the screen's update region are irrelevant.
+unsafe fn prepare_stroke(frame: HDC, backdrop: HDC, r: RECT, dpi: usize, cache: &mut RestBuffers) {
+    let (target, patch, supported) = stroke_rects(r);
+    let key = (r.right, r.bottom, dpi);
+    if !supported || cache.stroke_key == Some(key) {
+        return;
+    }
+    cache.stroke_key = None;
+    #[cfg(test)]
+    let _timing = super::rest_profile::stage("stroke.build");
+    #[cfg(test)]
+    let _measure = super::ui::diagnostics::measure("paint.rest.stroke_build");
+    let area = animation_rect(r);
+    let width = patch.right - patch.left;
+    let height = patch.bottom - patch.top;
+    #[cfg(test)]
+    if STROKE_BUILD_FAIL.get() {
+        cache.activity[4] += 1;
+        return;
+    }
+    let saved = SaveDC(frame);
+    IntersectClipRect(frame, 0, 0, r.right, r.bottom);
+    let restored = BitBlt(
+        frame,
+        patch.left,
+        patch.top,
+        width,
+        height,
+        backdrop,
+        patch.left - area.left,
+        patch.top - area.top,
+        SRCCOPY,
+    ) != 0;
+    let mut built = false;
+    if restored
+        && super::assets::stroke(frame, target, false)
+        && let Some(dest) =
+            super::buffering::BackBuffer::prepare(&mut cache.stroke, frame, width, height)
+    {
+        built = BitBlt(
+            dest, 0, 0, width, height, frame, patch.left, patch.top, SRCCOPY,
+        ) != 0;
+    }
+    // This patch is above the ring. Restore even after a failed/partial draw.
+    // No precomposed stroke may remain underneath the upcoming dynamic layers.
+    if BitBlt(
+        frame,
+        patch.left,
+        patch.top,
+        width,
+        height,
+        backdrop,
+        patch.left - area.left,
+        patch.top - area.top,
+        SRCCOPY,
+    ) == 0
+    {
+        theme::paper(frame, patch);
+        built = false;
+    }
+    RestoreDC(frame, saved);
+    if built {
+        cache.stroke_key = Some(key);
+    }
+    #[cfg(test)]
+    {
+        cache.activity[if built { 0 } else { 4 }] += 1;
+    }
 }
 fn animation_rect(r: RECT) -> RECT {
     let l = super::swim::Layout::new(r.right as f32, r.bottom as f32);
@@ -236,6 +340,8 @@ thread_local! {
     static PAINT_CLOCK: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static PAINT_DIRTY: std::cell::Cell<Option<RECT>> = const { std::cell::Cell::new(None) };
     static PAINT_MOVING: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static STROKE_BUILD_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static STROKE_COPY_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static REFERENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 unsafe fn paint_clock() -> u64 {
@@ -298,6 +404,15 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
     } else {
         None
     };
+    if let Some(source) = backdrop {
+        prepare_stroke(
+            memory,
+            source,
+            r,
+            GetPropW(h, wide("DunYu.LayoutDpi").as_ptr()) as usize,
+            &mut *cache,
+        );
+    }
     // Keep offscreen rasterization identical to a full frame. A small graphics
     // clip changes GDI+ image sampling even when the world coordinates match.
     // Only the final copy is limited to dirty; every subsequently submitted
@@ -347,6 +462,7 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
     let mut state = Some(super::rest_profile::stage("graphics.state"));
     let full = !GetPropW(h, wide("DunYu.Full").as_ptr()).is_null();
     let scale = GetPropW(h, wide("DunYu.LayoutDpi").as_ptr()) as usize as f32 / 96.;
+    let mut koi_bounds = None;
     let mut g = null_mut();
     if GdipCreateFromHDC(memory, &mut g) == 0 {
         GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
@@ -420,6 +536,16 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
         if full {
             #[cfg(test)]
             let _koi = super::rest_profile::stage("koi");
+            let (ox, oy, _) = super::swim::orbit(progress);
+            let cx = r.right as f32 / 2. + ox * 175. * layout.scale;
+            let cy = layout.y + (436. + oy * 175.) * layout.scale;
+            let half = 96. * layout.scale + 2.;
+            koi_bounds = Some(RECT {
+                left: (cx - half).floor() as i32,
+                top: (cy - half).floor() as i32,
+                right: (cx + half).ceil() as i32,
+                bottom: (cy + half).ceil() as i32,
+            });
             rest_art::koi(
                 g,
                 (r.right as f32 / 2., layout.y + 436. * layout.scale),
@@ -439,18 +565,93 @@ unsafe fn paint(h: HWND, message: u32, w: WPARAM) {
     #[cfg(test)]
     let stroke = super::rest_profile::stage("stroke");
     if full && !theme::high_contrast() {
-        let l = super::swim::Layout::new(r.right as f32, r.bottom as f32);
-        let [x, y, w, h] = l.rect(699., 220., 140., 10.);
-        super::assets::stroke(
-            memory,
-            RECT {
-                left: x as i32,
-                top: y as i32,
-                right: (x + w) as i32,
-                bottom: (y + h) as i32,
-            },
-            false,
+        let (target, patch, supported) = stroke_rects(r);
+        let overlaps = koi_bounds.is_none_or(|fish| clipped_dirty(patch, fish).is_some());
+        let safe =
+            use_cache && buffered && static_cached && !cache.is_null() && supported && !overlaps;
+        let key = (
+            r.right,
+            r.bottom,
+            GetPropW(h, wide("DunYu.LayoutDpi").as_ptr()) as usize,
         );
+        let mut copied = false;
+        if safe
+            && (*cache).stroke_key == Some(key)
+            && let Some(source) = (*cache).stroke.as_ref()
+        {
+            #[cfg(test)]
+            let _measure = super::ui::diagnostics::measure("paint.rest.stroke_copy");
+            #[cfg(test)]
+            let _profile = super::rest_profile::stage("stroke.copy");
+            copied = BitBlt(
+                memory,
+                patch.left,
+                patch.top,
+                patch.right - patch.left,
+                patch.bottom - patch.top,
+                source.dc(),
+                0,
+                0,
+                SRCCOPY,
+            ) != 0;
+            #[cfg(test)]
+            if STROKE_COPY_FAIL.get() {
+                copied = false;
+            }
+            #[cfg(test)]
+            {
+                (*cache).activity[if copied { 1 } else { 5 }] += 1;
+            }
+            if !copied {
+                (*cache).stroke_key = None;
+                theme::paper(memory, patch);
+            }
+        }
+        if !copied {
+            #[cfg(test)]
+            let draw = super::rest_profile::stage("stroke.draw");
+            #[cfg(test)]
+            let measure = super::ui::diagnostics::measure("paint.rest.stroke_draw");
+            super::assets::stroke(memory, target, false);
+            #[cfg(test)]
+            {
+                drop((draw, measure));
+                if !cache.is_null() {
+                    (*cache).activity[2] += 1;
+                    if overlaps {
+                        (*cache).activity[3] += 1;
+                    }
+                }
+            }
+        }
+        #[cfg(test)]
+        if !cache.is_null() && super::rest_profile::enabled() {
+            let reason = if (*cache).activity[4] > 0 {
+                "build_failure"
+            } else if (*cache).activity[5] > 0 {
+                "copy_failure"
+            } else if !supported {
+                "geometry"
+            } else if !buffered {
+                "no_buffer"
+            } else if !static_cached {
+                "no_backdrop"
+            } else if overlaps {
+                "overlap"
+            } else if dirty.top > patch.top
+                || dirty.left > patch.left
+                || dirty.right < patch.right
+                || dirty.bottom < patch.bottom
+            {
+                "partial_update"
+            } else {
+                "full_update"
+            };
+            (*cache).examples.entry(reason).or_insert_with(|| {
+                let rect = |a:RECT| [a.left,a.top,a.right,a.bottom];
+                serde_json::json!({"message":message,"dirty":rect(dirty),"patch":rect(patch),"fish":koi_bounds.map(rect),"safe":safe,"ready":(*cache).stroke_key.is_some()})
+            });
+        }
     }
     #[cfg(test)]
     drop(stroke);
@@ -518,6 +719,34 @@ unsafe extern "system" fn monitor(_: HMONITOR, _: HDC, r: *mut RECT, data: LPARA
     1
 }
 impl Runtime {
+    #[cfg(test)]
+    pub(super) unsafe fn resident_cache_snapshot(&self, reset: bool) -> serde_json::Value {
+        let mut windows = serde_json::Map::new();
+        for &h in &self.windows {
+            let cache = GetPropW(h, wide("DunYu.BackBuffer").as_ptr()) as *mut RestBuffers;
+            let mut bounds: RECT = std::mem::zeroed();
+            GetWindowRect(h, &mut bounds);
+            let mut client: RECT = std::mem::zeroed();
+            GetClientRect(h, &mut client);
+            let supported = stroke_rects(client).2 && !theme::high_contrast() && motion_enabled();
+            let (counts, ready, examples) = if cache.is_null() {
+                ([0; 6], false, serde_json::json!({}))
+            } else {
+                (
+                    (*cache).activity,
+                    (*cache).stroke_key.is_some(),
+                    serde_json::json!((*cache).examples),
+                )
+            };
+            windows.insert(format!("{},{},{}x{}@{}",bounds.left,bounds.top,client.right,client.bottom,GetDpiForWindow(h)),
+                serde_json::json!({"applicable":supported,"ready":ready,"builds":counts[0],"hits":counts[1],"draws":counts[2],"overlap_fallbacks":counts[3],"build_failures":counts[4],"copy_failures":counts[5],"examples":examples}));
+            if reset && !cache.is_null() {
+                (*cache).activity = [0; 6];
+                (*cache).examples.clear();
+            }
+        }
+        serde_json::Value::Object(windows)
+    }
     #[cfg(test)]
     pub(super) unsafe fn resident_visible_windows(&self) -> usize {
         self.windows
@@ -1469,6 +1698,174 @@ mod tests {
         }
     }
 
+    unsafe fn visible_cache_cases(
+        runtime: &mut Runtime,
+        host: HWND,
+        directory: &std::path::Path,
+    ) -> Vec<serde_json::Value> {
+        let mut bounds = Vec::<RECT>::new();
+        EnumDisplayMonitors(
+            null_mut(),
+            null(),
+            Some(monitor),
+            &mut bounds as *mut _ as isize,
+        );
+        let mut results = Vec::new();
+        let mut probes = Vec::new();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                PAINT_CLOCK.set(None);
+                PAINT_MOVING.set(None);
+                PAINT_DIRTY.set(None);
+                REFERENCE.set(false);
+                STROKE_BUILD_FAIL.set(false);
+                STROKE_COPY_FAIL.set(false);
+                super::super::rest_profile::finish();
+            }
+        }
+        let _reset = Reset;
+        for (screen_index, bounds) in bounds.into_iter().enumerate() {
+            runtime.create(bounds, true, Phase::Resting, host, theme::Theme::new());
+            let h = runtime.windows[0];
+            KillTimer(h, ANIMATION_TIMER);
+            KillTimer(host, TIMER_ID);
+            let mut client: RECT = std::mem::zeroed();
+            GetClientRect(h, &mut client);
+            for (key, value) in [
+                ("DunYu.Duration", 20000usize),
+                ("DunYu.Left", 20000),
+                ("DunYu.Stamp", 10000),
+                ("DunYu.MotionStart", 10000),
+            ] {
+                SetPropW(h, wide(key).as_ptr(), value as HANDLE);
+            }
+            for (id, text) in [
+                (12, "遁鱼 · 小憩"),
+                (10, "00:10"),
+                (13, "看看远处，让视线歇一会儿。"),
+            ] {
+                SetWindowTextW(GetDlgItem(h, id), wide(text).as_ptr());
+            }
+            PAINT_CLOCK.set(Some(10000));
+            ShowWindow(h, SW_SHOWNOACTIVATE);
+            for (kind, length) in [
+                ("cold_overlap", 1),
+                ("partial", 2),
+                ("hit", 3),
+                ("overlap", 4),
+                ("rebuild", 6),
+                ("build_failure", 3),
+                ("copy_failure", 3),
+                ("motion_off", 3),
+            ] {
+                let name = format!("visible-{screen_index}-{kind}");
+                let mut observations = Vec::new();
+                let mut gate = true;
+                let mut result = theme::diagnose_frames_for_test(
+                    client.right,
+                    client.bottom,
+                    &directory.join(&name),
+                    |dest, reference| {
+                        let cache =
+                            GetPropW(h, wide("DunYu.BackBuffer").as_ptr()) as *mut RestBuffers;
+                        *cache = RestBuffers::default();
+                        REFERENCE.set(reference);
+                        PAINT_DIRTY.set(None);
+                        PAINT_MOVING.set(Some(kind != "motion_off"));
+                        STROKE_BUILD_FAIL.set(kind == "build_failure");
+                        STROKE_COPY_FAIL.set(kind == "copy_failure");
+                        super::super::rest_profile::start();
+                        for (index, left) in [20000usize, 10000, 9000, 20000, 10000, 10000]
+                            .into_iter()
+                            .take(length)
+                            .enumerate()
+                        {
+                            SetPropW(h, wide("DunYu.Left").as_ptr(), left as HANDLE);
+                            if index == 5 {
+                                SendMessageW(h, WM_THEMECHANGED, 0, 0);
+                                KillTimer(h, ANIMATION_TIMER);
+                            }
+                            if index == 0 || reference {
+                                InvalidateRect(h, null(), 0);
+                            } else {
+                                let mut dirty = animation_rect(client);
+                                let mut header: RECT = std::mem::zeroed();
+                                GetWindowRect(GetDlgItem(h, 12), &mut header);
+                                MapWindowPoints(
+                                    null_mut(),
+                                    h,
+                                    &mut header as *mut _ as *mut POINT,
+                                    2,
+                                );
+                                // Retain all visible animation pixels, excluding only the title-covered band.
+                                // Real invalidation, never PAINT_DIRTY or WM_PRINTCLIENT.
+                                dirty.top = dirty.top.max(header.bottom);
+                                InvalidateRect(h, &dirty, 0);
+                            }
+                            RedrawWindow(h, null(), null_mut(), RDW_UPDATENOW | RDW_ALLCHILDREN);
+                            UpdateWindow(h);
+                        }
+                        windows_sys::Win32::Graphics::Dwm::DwmFlush();
+                        let screen = GetDC(null_mut());
+                        let copied = BitBlt(
+                            dest,
+                            0,
+                            0,
+                            client.right,
+                            client.bottom,
+                            screen,
+                            bounds.left,
+                            bounds.top,
+                            SRCCOPY,
+                        );
+                        ReleaseDC(null_mut(), screen);
+                        assert_ne!(copied, 0);
+                        if !reference && !theme::high_contrast() && stroke_rects(client).2 {
+                            let a = (*cache).activity;
+                            gate &= match kind {
+                                "build_failure" => a[4] > 0 && a[1] == 0 && a[2] > 0,
+                                "copy_failure" => a[5] > 0 && a[2] > 0,
+                                "cold_overlap" => a[0] > 0 && a[3] > 0,
+                                _ => {
+                                    a[1] > 0
+                                        && a[4] == 0
+                                        && a[5] == 0
+                                        && (kind != "rebuild" || a[0] >= 2)
+                                }
+                            };
+                        }
+                        observations.push(serde_json::json!({"reference":reference,"cache":runtime.resident_cache_snapshot(false)}));
+                        super::super::rest_profile::finish();
+                        for buffer in [
+                            &mut (*cache).frame,
+                            &mut (*cache).backdrop,
+                            &mut (*cache).stroke,
+                        ]
+                        .into_iter()
+                        .flatten()
+                        {
+                            probes.push(buffer.observe_release());
+                        }
+                    },
+                );
+                result["scenario"] = name.into();
+                result["cache_gate_passed"] = gate.into();
+                result["passed"] = (result["passed"] == true && gate).into();
+                result["observations"] = observations.into();
+                results.push(result);
+                STROKE_BUILD_FAIL.set(false);
+                STROKE_COPY_FAIL.set(false);
+                REFERENCE.set(false);
+            }
+            runtime.close();
+        }
+        for probe in probes {
+            probe.assert_released("visible rest cache");
+        }
+        results
+    }
+
     #[test]
     #[ignore = "requires an interactive Windows desktop"]
     fn cached_rest_matches_original() {
@@ -1521,7 +1918,7 @@ mod tests {
             println!("Rest pixel artifacts: {}", directory.display());
             let mut report = serde_json::json!({"protocol":"rest-pixels-v1",
                 "build":option_env!("DUNYU_DIAGNOSTIC_REVISION"),"high_contrast":theme::high_contrast(),
-                "clock_base_ms":10000,"motion_enabled_in_test":true,"expected_cases":96,"complete":false,"cases":[]});
+                "clock_base_ms":10000,"motion_enabled_in_test":true,"expected_cases":128,"complete":false,"cases":[]});
             let save = |report: &serde_json::Value| {
                 std::fs::write(
                     directory.join("report.json"),
@@ -1590,8 +1987,20 @@ mod tests {
                         "clip_outside",
                         "clip_bounds",
                         "cached_rebuild",
+                        "stroke_sequence96",
+                        "stroke_sequence120",
+                        "stroke_sequence144",
+                        "stroke_sequence192",
+                        "stroke_overlap96",
+                        "stroke_overlap120",
+                        "stroke_overlap144",
+                        "stroke_overlap192",
                     ] {
-                        if offset != 0 && (kind.starts_with("clip_") || kind == "cached_rebuild") {
+                        if offset != 0
+                            && (kind.starts_with("clip_")
+                                || kind.starts_with("stroke_")
+                                || kind == "cached_rebuild")
+                        {
                             continue;
                         }
                         let name = format!("{width}x{height}-{offset}-{kind}");
@@ -1606,6 +2015,12 @@ mod tests {
                                 assert!(!cache.is_null());
                                 // Independent buffers for the two sides and each case.
                                 *cache = RestBuffers::default();
+                                SetPropW(h, wide("DunYu.Left").as_ptr(), 20000usize as HANDLE);
+                                SetPropW(
+                                    h,
+                                    wide("DunYu.LayoutDpi").as_ptr(),
+                                    GetDpiForWindow(h) as usize as HANDLE,
+                                );
                                 REFERENCE.set(
                                     reference
                                         || matches!(kind, "reference_repeat" | "uncached_partial"),
@@ -1618,6 +2033,49 @@ mod tests {
                                 let mut steps = Vec::new();
                                 let counters = super::super::ui::diagnostics::capture_counters(
                                     || {
+                                        if let Some(dpi) = kind
+                                            .strip_prefix("stroke_sequence")
+                                            .or_else(|| kind.strip_prefix("stroke_overlap"))
+                                        {
+                                            SetPropW(
+                                                h,
+                                                wide("DunYu.LayoutDpi").as_ptr(),
+                                                dpi.parse::<usize>().unwrap() as HANDLE,
+                                            );
+                                            for (index, remaining) in
+                                                [20000usize, 10000, 9000, 20000, 10000, 10000, 9000]
+                                                    .into_iter()
+                                                    .enumerate()
+                                            {
+                                                let remaining = if index == 6
+                                                    && kind.starts_with("stroke_overlap")
+                                                {
+                                                    20000
+                                                } else {
+                                                    remaining
+                                                };
+                                                SetPropW(
+                                                    h,
+                                                    wide("DunYu.Left").as_ptr(),
+                                                    remaining as HANDLE,
+                                                );
+                                                if index == 5 {
+                                                    SendMessageW(h, WM_THEMECHANGED, 0, 0);
+                                                    KillTimer(h, ANIMATION_TIMER);
+                                                }
+                                                if !reference && index > 0 {
+                                                    PAINT_DIRTY.set(Some(animation_rect(r)));
+                                                }
+                                                paint(h, WM_PRINTCLIENT, dc as usize);
+                                            }
+                                            if !reference && !theme::high_contrast() {
+                                                assert!(
+                                                    (*cache).stroke_key.is_some(),
+                                                    "stroke cache was not built"
+                                                );
+                                            }
+                                            return;
+                                        }
                                         if kind.starts_with("clip_") {
                                             // A black destination makes any writes outside the requested
                                             // damage visible. Reference renders a full frame and clips only
@@ -1714,6 +2172,7 @@ mod tests {
                                 if !reference
                                     && !REFERENCE.get()
                                     && !theme::high_contrast()
+                                    && !kind.starts_with("stroke_")
                                     && !kind.starts_with("clip_")
                                 {
                                     assert!(
@@ -1726,12 +2185,46 @@ mod tests {
                                         "unexpected cache build count"
                                     );
                                 }
+                                if !reference
+                                    && kind.starts_with("stroke_")
+                                    && !theme::high_contrast()
+                                {
+                                    for (name, expected) in [
+                                        ("paint.rest.stroke_build", 2),
+                                        (
+                                            "paint.rest.stroke_copy",
+                                            if kind.starts_with("stroke_overlap") {
+                                                4
+                                            } else {
+                                                5
+                                            },
+                                        ),
+                                        (
+                                            "paint.rest.stroke_draw",
+                                            if kind.starts_with("stroke_overlap") {
+                                                3
+                                            } else {
+                                                2
+                                            },
+                                        ),
+                                    ] {
+                                        assert_eq!(
+                                            counters.get(name).map(|v| v.0),
+                                            Some(expected),
+                                            "{name}"
+                                        );
+                                    }
+                                }
                                 measurements.push(
                                     serde_json::json!({"reference":reference,"counters":counters,"steps":steps}),
                                 );
-                                for buffer in [&mut (*cache).frame, &mut (*cache).backdrop]
-                                    .into_iter()
-                                    .flatten()
+                                for buffer in [
+                                    &mut (*cache).frame,
+                                    &mut (*cache).backdrop,
+                                    &mut (*cache).stroke,
+                                ]
+                                .into_iter()
+                                .flatten()
                                 {
                                     probes.push(buffer.observe_release());
                                 }
@@ -1763,9 +2256,17 @@ mod tests {
             }
             assert_eq!(
                 report["cases"].as_array().unwrap().len(),
-                96,
+                128,
                 "incomplete rest pixel coverage"
             );
+            for result in visible_cache_cases(runtime, host.0, &directory) {
+                if result["passed"] != true {
+                    failed += 1;
+                }
+                report["cases"].as_array_mut().unwrap().push(result);
+                save(&report);
+            }
+            report["expected_cases"] = report["cases"].as_array().unwrap().len().into();
             report["complete"] = true.into();
             report["failed_cases"] = failed.into();
             save(&report);

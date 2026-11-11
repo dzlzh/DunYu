@@ -90,6 +90,9 @@ pub(super) struct BackBuffer {
     release_probe: Option<ReleaseProbe>,
 }
 impl BackBuffer {
+    pub(super) fn dc(&self) -> HDC {
+        self.dc
+    }
     #[cfg(test)]
     pub(super) fn dc_for_test(&self) -> HDC {
         self.dc

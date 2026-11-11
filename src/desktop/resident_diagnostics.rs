@@ -203,6 +203,13 @@ fn resident_baseline() {
             &mut monitors as *mut _ as isize,
         );
         pump(if pending { 1 } else { 5 });
+        let cache_warmup = APP.with(|a| {
+            a.borrow()
+                .as_ref()
+                .unwrap()
+                .rest
+                .resident_cache_snapshot(true)
+        });
         for c in &COUNTS {
             c.store(0, Ordering::Relaxed);
         }
@@ -218,6 +225,30 @@ fn resident_baseline() {
         let wall_ms = wall.elapsed().as_secs_f64() * 1000.;
         let cpu_ms = (cpu() - begin) as f64 / 10000.;
         let end_ms = timestamp();
+        let cache_measurement = APP.with(|a| {
+            a.borrow()
+                .as_ref()
+                .unwrap()
+                .rest
+                .resident_cache_snapshot(false)
+        });
+        let cache_passed = cache_measurement
+            .as_object()
+            .unwrap()
+            .iter()
+            .all(|(key, w)| {
+                let warm = &cache_warmup[key];
+                w["applicable"] != true
+                    || (w["hits"].as_u64().unwrap() > 0
+                        && w["build_failures"] == 0
+                        && w["copy_failures"] == 0
+                        && w["ready"] == true
+                        && warm["build_failures"] == 0
+                        && warm["copy_failures"] == 0
+                        && warm["builds"].as_u64().unwrap() + w["builds"].as_u64().unwrap() > 0)
+            });
+        let stroke_cache =
+            json!({"warmup":cache_warmup,"measurement":cache_measurement,"passed":cache_passed});
         let profile = if profiling {
             Some(rest_profile::finish())
         } else {
@@ -255,7 +286,11 @@ fn resident_baseline() {
         });
         let cleanup_ms = timestamp();
         pump(2);
-        let report = json!({"protocol":if profiling {"resident-profile-v1"} else {"resident-v1"},"profile":profile,"complete":true,"build":option_env!("DUNYU_DIAGNOSTIC_REVISION"),"scenario":scenario,"start_ms":start_ms,"end_ms":end_ms,"cleanup_ms":cleanup_ms,"wall_ms":wall_ms,"cpu_ms":cpu_ms,"cpu_percent_one_core":cpu_ms/wall_ms*100.,"monitors":monitors,"multi_monitor_covered":monitors.len()>1,"dpi":GetDpiForWindow(host),"high_contrast":theme::high_contrast(),"motion_enabled":rest_ui::motion_enabled(),"parameters":{"poll_seconds":10,"delay_seconds":60,"sample_seconds":if pending {5}else{60}},"counts":{"process_queries":counts[0],"window_enumerations":counts[1],"startup_ticks":counts[6],"database_scans":counts[2],"message_wait_timeouts":counts[3],"rest_ticks":counts[4],"rest_paints":counts[5]}});
+        let report = json!({"protocol":if profiling {"resident-profile-v1"} else {"resident-v1"},"profile":profile,"stroke_cache":stroke_cache,"complete":cache_passed,"build":option_env!("DUNYU_DIAGNOSTIC_REVISION"),"scenario":scenario,"start_ms":start_ms,"end_ms":end_ms,"cleanup_ms":cleanup_ms,"wall_ms":wall_ms,"cpu_ms":cpu_ms,"cpu_percent_one_core":cpu_ms/wall_ms*100.,"monitors":monitors,"multi_monitor_covered":monitors.len()>1,"dpi":GetDpiForWindow(host),"high_contrast":theme::high_contrast(),"motion_enabled":rest_ui::motion_enabled(),"parameters":{"poll_seconds":10,"delay_seconds":60,"sample_seconds":if pending {5}else{60}},"counts":{"process_queries":counts[0],"window_enumerations":counts[1],"startup_ticks":counts[6],"database_scans":counts[2],"message_wait_timeouts":counts[3],"rest_ticks":counts[4],"rest_paints":counts[5]}});
         std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        assert!(
+            cache_passed,
+            "Fullscreen stroke cache validation failed; raw report contains reasons"
+        );
     }
 }
