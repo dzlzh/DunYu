@@ -3281,6 +3281,53 @@ mod capture_tests {
         }
     }
 
+    unsafe fn startup_query_regression(f: &mut Fixture) {
+        let app = &mut f.app;
+        let saved = app.config.clone();
+        ShowWindow(f.external, SW_SHOWNOACTIVATE);
+        let identity = process(f.external).unwrap();
+        let rule = SummonRule {
+            name: "Pending fixture".into(),
+            enabled: false,
+            executable: "unused.exe".into(),
+            arguments: String::new(),
+            working_directory: String::new(),
+            process_path: identity.2,
+            class: class(f.external),
+            title: title(f.external),
+            hotkey: Hotkey::new(3, 65),
+            minimize: false,
+            priority_hotkey: false,
+        };
+        app.config.rules = vec![rule; 5];
+        app.config.rules[4].title = "unmatched pending fixture".into();
+        app.pending = (0..5)
+            .map(|rule| Pending {
+                rule,
+                started: Instant::now(),
+            })
+            .collect();
+        SetTimer(app.host, TIMER, 100, None);
+        app.tick();
+        assert_eq!(app.pending.len(), 1);
+        assert_eq!(app.pending[0].rule, 4);
+        for i in 0..4 {
+            assert_eq!(app.targets[&i].hwnd, f.external as usize);
+        }
+        app.config.rules[4].title = title(f.external);
+        app.tick();
+        assert!(app.pending.is_empty());
+        assert_eq!(app.targets[&4].hwnd, f.external as usize);
+        assert_eq!(
+            KillTimer(app.host, TIMER),
+            0,
+            "completed scan stops its timer"
+        );
+        app.config = saved;
+        app.targets.clear();
+        ShowWindow(f.external, SW_HIDE);
+    }
+
     #[test]
     fn editor_drafts_selection_layout_and_target_state() {
         unsafe {
@@ -3288,6 +3335,7 @@ mod capture_tests {
             selection_idle_regression(&mut f);
             summon_target_survives_settings_save(&mut f);
             multiple_hidden_targets_survive_rule_edits_and_deletion(&mut f);
+            startup_query_regression(&mut f);
             let external = f.external;
             let app = &mut f.app;
             let h = app.ui.as_ref().unwrap().window;

@@ -3,6 +3,7 @@ pub mod message;
 pub mod priority_hotkey;
 pub mod rule_targets;
 pub mod scroll;
+pub mod window_search;
 use serde::{Deserialize, Serialize};
 pub mod rest;
 use std::{collections::HashSet, fs, io, path::Path};

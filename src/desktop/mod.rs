@@ -629,8 +629,35 @@ impl App {
     }
     unsafe fn tick(&mut self) {
         let ids: Vec<_> = self.pending.iter().map(|p| p.rule).collect();
+        let mut scan = (ids.len() > 1).then(|| dunyu::window_search::Scan::new(windows()));
         for i in ids {
-            if let Some(h) = self.find(i) {
+            let found = if let Some(scan) = &mut scan {
+                let rule = &self.config.rules[i];
+                scan.find(
+                    GetForegroundWindow() as usize,
+                    |hwnd| {
+                        let h = handle(hwnd);
+                        process(h).map(|identity| (identity, class(h), title(h)))
+                    },
+                    |hwnd, ((pid, created, path), cls, caption)| {
+                        if !matches(rule, path, cls, caption) {
+                            return false;
+                        }
+                        let h = handle(hwnd);
+                        eligible(h)
+                            && IsWindowVisible(h) != 0
+                            && process(h).is_some_and(|(p, c, path)| {
+                                p == *pid
+                                    && c == *created
+                                    && matches(rule, &path, &class(h), &title(h))
+                            })
+                    },
+                )
+                .map(handle)
+            } else {
+                self.find(i)
+            };
+            if let Some(h) = found {
                 if let Ok(n) = self.track(h) {
                     self.targets.insert(i, self.records[n].token.clone());
                     ShowWindowAsync(h, SW_SHOW);
