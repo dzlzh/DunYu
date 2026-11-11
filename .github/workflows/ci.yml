@@ -21,6 +21,10 @@ jobs:
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/run-ui-diagnostics.ps1 -SelfTest
       - if: runner.os == 'Windows'
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-compare-performance.ps1
+      - if: runner.os == 'Windows'
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/run-resident-diagnostics.ps1 -SelfTest
+      - if: runner.os == 'Windows'
+        run: pwsh -NoProfile -File scripts/run-resident-diagnostics.ps1 -SelfTest
       - run: cargo test --locked --all-targets
         env:
           DUNYU_UI_SCREENSHOTS: '1'
@@ -78,4 +82,11 @@ jobs:
         with:
           name: DunYu-ui-diagnostics
           path: target/DunYu-ui-diagnostics.zip
+          if-no-files-found: error
+
+      - if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: DunYu-resident-diagnostics
+          path: target/DunYu-resident-diagnostics.zip
           if-no-files-found: error

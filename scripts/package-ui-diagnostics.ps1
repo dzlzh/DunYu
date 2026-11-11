@@ -1,4 +1,4 @@
-param([string]$Baseline)
+param([string]$Baseline, [string]$ResidentBaseline)
 $ErrorActionPreference = 'Stop'
 $previousRevision = $env:DUNYU_DIAGNOSTIC_REVISION
 Push-Location (Join-Path $PSScriptRoot '..')
@@ -27,6 +27,16 @@ try {
     $inputs = @("$package/dunyu-ui-tests.exe", "$package/run-ui-diagnostics.cmd", "$package/run-ui-diagnostics.ps1", "$package/LICENSE", "$package/OFL.txt", "$package/README.md", "$package/compare-ui-diagnostics.py") + $extra
     Compress-Archive -Path $inputs -DestinationPath target/DunYu-ui-diagnostics.zip -Force
     Write-Host 'Created target/DunYu-ui-diagnostics.zip'
+    $resident = 'target/resident-diagnostic-package'
+    New-Item $resident -ItemType Directory -Force | Out-Null
+    Copy-Item $test.executable "$resident/dunyu-ui-tests.exe"
+    Copy-Item scripts/run-resident-diagnostics.cmd,scripts/run-resident-diagnostics.ps1,LICENSE $resident
+    Copy-Item resources/fonts/OFL.txt $resident
+    Copy-Item docs/RESIDENT-DIAGNOSTICS.md "$resident/README.md"
+    if ($ResidentBaseline) { Copy-Item $ResidentBaseline "$resident/dunyu-resident-baseline.exe" }
+    else { Remove-Item "$resident/dunyu-resident-baseline.exe" -ErrorAction SilentlyContinue }
+    Compress-Archive -Path "$resident/*" -DestinationPath target/DunYu-resident-diagnostics.zip -Force
+
 } finally {
     $env:DUNYU_DIAGNOSTIC_REVISION = $previousRevision
     Pop-Location
