@@ -1,4 +1,5 @@
 use super::*;
+use dunyu::rule_targets::{RuleChange, retained};
 pub(super) const PAGES: [&str; 6] = ["召唤", "绑定", "隐现", "休憩", "传讯", "设置"];
 use windows_sys::Win32::System::SystemServices::SS_PATHELLIPSIS;
 use windows_sys::Win32::UI::Controls::Dialogs::*;
@@ -2337,15 +2338,23 @@ impl App {
         self.layout_ui();
     }
     pub(super) unsafe fn apply_config(&mut self, c: AppConfig) -> Result<(), String> {
+        self.apply_config_change(c, RuleChange::Unchanged)
+    }
+    unsafe fn apply_config_change(
+        &mut self,
+        c: AppConfig,
+        change: RuleChange,
+    ) -> Result<(), String> {
         if !self.pending.is_empty() {
             return Err("程序正在启动，请稍后保存".into());
         }
+        let mapping = retained(&self.config.rules, &c.rules, change)?;
         self.register(&c, true)?;
-        // Hidden targets cannot be rediscovered by find(); unrelated settings
-        // must preserve their tokens. Rule changes can invalidate index mappings.
-        if self.config.rules != c.rules {
-            self.targets.clear();
-        }
+        let previous = std::mem::take(&mut self.targets);
+        self.targets = mapping
+            .into_iter()
+            .filter_map(|(old, new)| previous.get(&old).cloned().map(|token| (new, token)))
+            .collect();
         self.config = c;
         self.slots.resize(self.config.slots.len(), None);
         self.refresh_list();
@@ -2531,7 +2540,7 @@ impl App {
                     }
                     let mut c = self.config.clone();
                     c.rules.remove(i);
-                    self.apply_config(c)?;
+                    self.apply_config_change(c, RuleChange::Delete(i))?;
                     self.fill_rule(None);
                 }
             }
@@ -2580,7 +2589,14 @@ impl App {
                     .unwrap()
                     .selected
                     .unwrap_or(c.rules.len() - 1);
-                self.apply_config(c)?;
+                let change = self
+                    .ui
+                    .as_ref()
+                    .unwrap()
+                    .selected
+                    .map(RuleChange::Update)
+                    .unwrap_or(RuleChange::Append);
+                self.apply_config_change(c, change)?;
                 self.fill_rule(Some(selected));
                 self.status_success("规则已保存");
             }
@@ -3113,7 +3129,7 @@ mod capture_tests {
                 minimize: false,
                 priority_hotkey: false,
             });
-            app.apply_config(config).unwrap();
+            app.apply_config_change(config, RuleChange::Append).unwrap();
             ShowWindow(external, SW_SHOWNOACTIVATE);
             assert_eq!(app.find(0), Some(external));
             app.summon(0).unwrap();
@@ -3154,23 +3170,115 @@ mod capture_tests {
             let blocked = dir.join("blocked-target-save");
             std::fs::write(&blocked, b"not a directory").unwrap();
             app.dir = blocked;
-            let result = app.apply_config(changed.clone());
+            let result = app.apply_config_change(changed.clone(), RuleChange::Update(0));
             app.dir = dir;
             assert!(result.is_err());
             assert_eq!(app.targets[&0].tag, tag, "failed save keeps the target");
             assert_eq!(app.config.rules[0].title, config.rules[0].title);
 
-            app.apply_config(changed).unwrap();
+            app.apply_config_change(changed, RuleChange::Update(0))
+                .unwrap();
             assert!(app.targets.is_empty(), "edited rules invalidate targets");
-            app.apply_config(config).unwrap();
+            app.apply_config_change(config, RuleChange::Update(0))
+                .unwrap();
             ShowWindow(external, SW_SHOWNOACTIVATE);
             app.summon(0).unwrap();
             assert!(app.targets.contains_key(&0));
-            app.apply_config(original.clone()).unwrap();
+            app.apply_config_change(original.clone(), RuleChange::Delete(0))
+                .unwrap();
             assert!(app.targets.is_empty(), "deleted rules invalidate targets");
             app.fill_rule(None);
         });
         ShowWindow(external, SW_HIDE);
+    }
+
+    unsafe fn multiple_hidden_targets_survive_rule_edits_and_deletion(f: &mut Fixture) {
+        unsafe {
+            let app = &mut f.app;
+            let original_records = app.records.len();
+            let mut handles = Vec::new();
+            struct Windows(Vec<HWND>);
+            impl Drop for Windows {
+                fn drop(&mut self) {
+                    unsafe {
+                        for &h in &self.0 {
+                            DestroyWindow(h);
+                        }
+                    }
+                }
+            }
+            let mut owned = Windows(Vec::new());
+            for i in 0..3 {
+                let h = CreateWindowExW(
+                    0,
+                    wide("STATIC").as_ptr(),
+                    wide(&format!("Retention fixture {i}")).as_ptr(),
+                    WS_OVERLAPPEDWINDOW,
+                    0,
+                    0,
+                    100,
+                    100,
+                    null_mut(),
+                    null_mut(),
+                    GetModuleHandleW(null()),
+                    null(),
+                );
+                assert!(!h.is_null());
+                owned.0.push(h);
+                handles.push(h as usize);
+                let mut c = app.config.clone();
+                c.rules.push(SummonRule {
+                    name: "Same name".into(),
+                    enabled: false,
+                    executable: "unused.exe".into(),
+                    arguments: String::new(),
+                    working_directory: String::new(),
+                    process_path: process(h).unwrap().2,
+                    class: class(h),
+                    title: title(h),
+                    hotkey: Hotkey::new(3, 65),
+                    minimize: false,
+                    priority_hotkey: false,
+                });
+                app.apply_config_change(c, RuleChange::Append).unwrap();
+                let record = app.track(h).unwrap();
+                app.targets.insert(i, app.records[record].token.clone());
+                ShowWindow(h, SW_HIDE);
+            }
+            let mut c = app.config.clone();
+            c.rules[1].name = "Renamed".into();
+            c.rules[1].arguments = "--new".into();
+            app.apply_config_change(c, RuleChange::Update(1)).unwrap();
+            for (i, &h) in handles.iter().enumerate() {
+                assert_eq!(app.targets[&i].hwnd, h);
+            }
+            let mut c = app.config.clone();
+            c.rules.remove(0);
+            app.apply_config_change(c, RuleChange::Delete(0)).unwrap();
+            assert_eq!(app.targets[&0].hwnd, handles[1]);
+            assert_eq!(app.targets[&1].hwnd, handles[2]);
+            assert_eq!(
+                app.records.len(),
+                original_records + 3,
+                "deletion retains recovery records"
+            );
+            app.summon(1).unwrap();
+            assert!(app.pending.is_empty());
+            assert_ne!(IsWindowVisible(handle(handles[2])), 0);
+            let mut c = app.config.clone();
+            c.rules[0].class.push_str(" changed");
+            app.apply_config_change(c, RuleChange::Update(0)).unwrap();
+            assert!(!app.targets.contains_key(&0));
+            assert_eq!(app.targets[&1].hwnd, handles[2]);
+            while !app.config.rules.is_empty() {
+                let mut c = app.config.clone();
+                c.rules.remove(0);
+                app.apply_config_change(c, RuleChange::Delete(0)).unwrap();
+            }
+            drop(owned);
+            app.records.retain(|r| r.token.valid());
+            app.fill_rule(None);
+        }
     }
 
     #[test]
@@ -3179,6 +3287,7 @@ mod capture_tests {
             let mut f = fixture();
             selection_idle_regression(&mut f);
             summon_target_survives_settings_save(&mut f);
+            multiple_hidden_targets_survive_rule_edits_and_deletion(&mut f);
             let external = f.external;
             let app = &mut f.app;
             let h = app.ui.as_ref().unwrap().window;
@@ -3286,9 +3395,13 @@ mod capture_tests {
             priority.rules[0].enabled = true;
             priority.rules[0].hotkey = Hotkey::new(7, 0x7a);
             assert_ne!(RegisterHotKey(app.host, 0x7ffe, 7 | MOD_NOREPEAT, 0x7a), 0);
-            assert!(app.apply_config(priority.clone()).is_err());
+            assert!(
+                app.apply_config_change(priority.clone(), RuleChange::Update(0))
+                    .is_err()
+            );
             priority.rules[0].priority_hotkey = true;
-            app.apply_config(priority.clone()).unwrap();
+            app.apply_config_change(priority.clone(), RuleChange::Update(0))
+                .unwrap();
             assert_eq!(
                 app.priority_hotkeys.as_ref().unwrap().command(1, 0),
                 Some(Command::Summon(0))
@@ -3298,14 +3411,18 @@ mod capture_tests {
             std::fs::write(&blocked, b"blocked").unwrap();
             app.dir = blocked;
             priority.rules[0].hotkey = Hotkey::new(7, 0x79);
-            assert!(app.apply_config(priority).is_err());
+            assert!(
+                app.apply_config_change(priority, RuleChange::Update(0))
+                    .is_err()
+            );
             app.dir = dir;
             assert_eq!(app.config.rules[0].hotkey, Hotkey::new(7, 0x7a));
             assert_eq!(
                 app.priority_hotkeys.as_ref().unwrap().command(1, 0),
                 Some(Command::Summon(0))
             );
-            app.apply_config(base).unwrap();
+            app.apply_config_change(base, RuleChange::Update(0))
+                .unwrap();
             assert_eq!(app.priority_hotkeys.as_ref().unwrap().command(1, 0), None);
             UnregisterHotKey(app.host, 0x7ffe);
             let saved_rules = app.config.rules.clone();

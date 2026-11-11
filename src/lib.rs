@@ -1,6 +1,7 @@
 pub mod hotkey_trace;
 pub mod message;
 pub mod priority_hotkey;
+pub mod rule_targets;
 pub mod scroll;
 use serde::{Deserialize, Serialize};
 pub mod rest;
