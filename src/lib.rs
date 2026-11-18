@@ -140,9 +140,7 @@ impl AppConfig {
     }
 }
 pub fn matches(rule: &SummonRule, path: &str, class: &str, title: &str) -> bool {
-    rule.process_path.to_lowercase() == path.to_lowercase()
-        && (rule.class.is_empty() || rule.class == class)
-        && title.contains(&rule.title)
+    window_search::ProcessPaths::default().matches(rule, path, class, title)
 }
 pub mod policy;
 pub use policy::*;
@@ -236,9 +234,8 @@ mod tests {
         config.validate().unwrap();
         assert!(!config.hide_tray);
     }
-    #[test]
-    fn match_requires_process() {
-        let r = SummonRule {
+    fn editor_rule() -> SummonRule {
+        SummonRule {
             name: "a".into(),
             enabled: true,
             executable: "a.exe".into(),
@@ -250,7 +247,52 @@ mod tests {
             hotkey: Hotkey::new(3, 65),
             minimize: false,
             priority_hotkey: false,
-        };
+        }
+    }
+    #[test]
+    fn match_follows_current_directory() {
+        let dir = std::env::temp_dir().join(format!("dunyu-current-{}", std::process::id()));
+        let current = dir.join("current");
+        let mut rule = editor_rule();
+        rule.process_path = current.join("Telegram.exe").to_str().unwrap().into();
+        let mut results = Vec::new();
+        for version in ["7.4.4", "7.5"] {
+            let target = dir.join(version);
+            fs::create_dir_all(&target).unwrap();
+            let exe = target.join("Telegram.exe");
+            fs::write(&exe, []).unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, &current).unwrap();
+            #[cfg(windows)]
+            assert!(
+                std::process::Command::new("cmd")
+                    .args(["/D", "/C", "mklink", "/J", "current", version])
+                    .current_dir(&dir)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            results.push(matches(&rule, exe.to_str().unwrap(), "Editor", "文档"));
+            if version == "7.5" {
+                assert!(!matches(
+                    &rule,
+                    dir.join("7.4.4/Telegram.exe").to_str().unwrap(),
+                    "Editor",
+                    "文档"
+                ));
+            }
+            #[cfg(unix)]
+            fs::remove_file(&current).unwrap();
+            #[cfg(windows)]
+            fs::remove_dir(&current).unwrap();
+            assert!(!matches(&rule, exe.to_str().unwrap(), "Editor", "文档"));
+        }
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(results, [true, true]);
+    }
+    #[test]
+    fn match_requires_process() {
+        let r = editor_rule();
         let mut old = serde_json::to_value(&r).unwrap();
         old.as_object_mut().unwrap().remove("priority_hotkey");
         assert!(

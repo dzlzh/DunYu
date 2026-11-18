@@ -1,4 +1,42 @@
 //! A single polling round. Failed metadata reads are cached too.
+use crate::SummonRule;
+use std::{collections::HashMap, fs, path::Path};
+
+/// Keep filesystem lookups local to a scan so retargeted junctions are seen next time.
+#[derive(Default)]
+pub struct ProcessPaths {
+    resolved: HashMap<String, Option<String>>,
+}
+
+impl ProcessPaths {
+    fn resolve(&mut self, path: &str) -> Option<&str> {
+        if !self.resolved.contains_key(path) {
+            let resolved = fs::canonicalize(path)
+                .ok()
+                .and_then(|p| p.to_str().map(str::to_lowercase));
+            self.resolved.insert(path.to_owned(), resolved);
+        }
+        self.resolved[path].as_deref()
+    }
+
+    pub fn equivalent(&mut self, expected: &str, actual: &str) -> bool {
+        if expected.to_lowercase() == actual.to_lowercase() {
+            return true;
+        }
+        Path::new(expected).is_absolute()
+            && Path::new(actual).is_absolute()
+            && self.resolve(expected).is_some()
+            && self.resolve(actual).is_some()
+            && self.resolved[expected] == self.resolved[actual]
+    }
+
+    pub fn matches(&mut self, rule: &SummonRule, path: &str, class: &str, title: &str) -> bool {
+        (rule.class.is_empty() || rule.class == class)
+            && title.contains(&rule.title)
+            && self.equivalent(&rule.process_path, path)
+    }
+}
+
 pub struct Scan<T> {
     entries: Vec<(usize, Option<Option<T>>)>,
 }

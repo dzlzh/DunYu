@@ -5,6 +5,39 @@ use windows_sys::Win32::System::SystemServices::SS_PATHELLIPSIS;
 use windows_sys::Win32::UI::Controls::Dialogs::*;
 use windows_sys::Win32::UI::Controls::*;
 
+impl Ui {
+    unsafe fn capture_program(&mut self, reported_path: String) {
+        let h = self.window;
+        let mut exe = text_at(h, 201);
+        let entered = text_at(h, 204);
+        let mut paths = ProcessPaths::default();
+        let matched = if !self.follows_program(&entered)
+            && paths.equivalent(&entered, &reported_path)
+        {
+            entered
+        } else if exe.to_lowercase().ends_with(".exe") && paths.equivalent(&exe, &reported_path) {
+            exe.clone()
+        } else {
+            reported_path
+        };
+        if exe.is_empty() {
+            exe = matched.clone();
+            set_text(h, 201, &exe);
+        }
+        set_text(h, 204, &matched);
+        self.default_process_path =
+            (exe.to_lowercase() == matched.to_lowercase()).then_some(matched);
+    }
+
+    fn follows_program(&self, path: &str) -> bool {
+        path.trim().is_empty()
+            || self
+                .default_process_path
+                .as_ref()
+                .is_some_and(|p| p.to_lowercase() == path.to_lowercase())
+    }
+}
+
 pub(super) unsafe fn item(window: HWND, id: i32) -> HWND {
     if matches!(id, 100 | 118) {
         return GetDlgItem(GetDlgItem(GetDlgItem(window, 9000), 119), id);
@@ -411,6 +444,7 @@ impl App {
                 .unwrap_or(super::design::SPLIT),
             dragging: false,
             baseline: vec![],
+            default_process_path: None,
         };
         let tab = control(
             &mut u,
@@ -2299,6 +2333,9 @@ impl App {
             priority_hotkey: false,
         };
         let r = index.map(|i| &self.config.rules[i]).unwrap_or(&default);
+        u.default_process_path = (r.executable.to_lowercase().ends_with(".exe")
+            && r.executable.to_lowercase() == r.process_path.to_lowercase())
+        .then(|| r.process_path.clone());
         for (id, s) in [
             (200, r.name.clone()),
             (201, r.executable.clone()),
@@ -2348,7 +2385,21 @@ impl App {
         if !self.pending.is_empty() {
             return Err("程序正在启动，请稍后保存".into());
         }
-        let mapping = retained(&self.config.rules, &c.rules, change)?;
+        let mut mapping = retained(&self.config.rules, &c.rules, change)?;
+        // A hidden window cannot be rediscovered when its rule switches to a junction.
+        if let RuleChange::Update(i) = change
+            && !mapping.contains(&(i, i))
+            && self.config.rules[i].class == c.rules[i].class
+            && self.config.rules[i].title == c.rules[i].title
+            && let Some(token) = self.targets.get(&i)
+            && process(handle(token.hwnd)).is_some_and(|(pid, created, path)| {
+                pid == token.pid
+                    && created == token.created
+                    && ProcessPaths::default().equivalent(&c.rules[i].process_path, &path)
+            })
+        {
+            mapping.push((i, i));
+        }
         self.register(&c, true)?;
         let previous = std::mem::take(&mut self.targets);
         self.targets = mapping
@@ -2512,8 +2563,11 @@ impl App {
                     let end = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
                     let path = String::from_utf16_lossy(&buffer[..end]);
                     set_text(h, 201, &path);
-                    if path.to_lowercase().ends_with(".exe") && text_at(h, 204).is_empty() {
+                    let u = self.ui.as_mut().unwrap();
+                    if path.to_lowercase().ends_with(".exe") && u.follows_program(&text_at(h, 204))
+                    {
                         set_text(h, 204, &path);
+                        u.default_process_path = Some(path.clone());
                     }
                     if path.to_lowercase().ends_with(".lnk") {
                         self.ui.as_mut().unwrap().advanced = true;
@@ -2566,7 +2620,9 @@ impl App {
                     executable: exe.clone(),
                     arguments: text_at(h, 202),
                     working_directory: text_at(h, 203),
-                    process_path: if path.is_empty() && exe.to_lowercase().ends_with(".exe") {
+                    process_path: if self.ui.as_ref().unwrap().follows_program(&path)
+                        && exe.to_lowercase().ends_with(".exe")
+                    {
                         exe
                     } else {
                         path
@@ -2673,10 +2729,7 @@ impl App {
         } else if id == 112 {
             if let Some((_, _, p)) = process(target) {
                 self.status_success("窗口信息已捕获，请核对后保存");
-                set_text(h, 204, &p);
-                if text_at(h, 201).is_empty() {
-                    set_text(h, 201, &p);
-                }
+                self.ui.as_mut().unwrap().capture_program(p);
                 set_text(h, 205, &class(target));
                 set_text(h, 206, &title(target));
                 if text_at(h, 200).is_empty() {
@@ -3285,18 +3338,82 @@ mod capture_tests {
         }
     }
 
-    unsafe fn startup_query_regression(f: &mut Fixture) {
+    unsafe fn junction_rule_regression(f: &mut Fixture) -> String {
+        use std::os::windows::process::CommandExt;
+        let app = &mut f.app;
+        let saved = app.config.clone();
+        let actual = process(f.external).unwrap().2;
+        let executable = std::path::Path::new(&actual);
+        std::fs::create_dir_all(&app.dir).unwrap();
+        assert!(
+            std::process::Command::new("cmd")
+                .raw_arg(r#"/D /V:OFF /C mklink /J current "%DUNYU_TEST_TARGET%""#)
+                .env("DUNYU_TEST_TARGET", executable.parent().unwrap())
+                .current_dir(&app.dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let alias = app
+            .dir
+            .join("current")
+            .join(executable.file_name().unwrap())
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let h = app.ui.as_ref().unwrap().window;
+        app.fill_rule(None);
+        set_text(h, 201, &actual);
+        set_text(h, 205, &class(f.external));
+        set_text(h, 206, &title(f.external));
+        check(h, 208, false);
+        app.ui_action(113).unwrap();
+        let index = app.ui.as_ref().unwrap().selected.unwrap();
+        ShowWindow(f.external, SW_SHOWNOACTIVATE);
+        assert_eq!(app.find(index), Some(f.external));
+        app.summon(index).unwrap();
+        ShowWindow(f.external, SW_HIDE);
+        set_text(h, 201, &alias);
+        app.ui_action(113).unwrap();
+        assert_eq!(app.config.rules[index].process_path, alias);
+        assert_eq!(app.targets[&index].hwnd, f.external as usize);
+        app.summon(index).unwrap();
+        assert_ne!(IsWindowVisible(f.external), 0);
+
+        app.ui.as_mut().unwrap().capture_program(actual.clone());
+        app.ui_action(113).unwrap();
+        let persisted = load(&app.dir.join("config.json")).unwrap();
+        assert_eq!(persisted.rules[index].process_path, alias);
+        assert_eq!(persisted.rules[index].executable, alias);
+        ShowWindow(f.external, SW_SHOWNOACTIVATE);
+        assert_eq!(app.find(index), Some(f.external));
+        app.summon(index).unwrap();
+        assert_eq!(app.targets[&index].hwnd, f.external as usize);
+        assert!(app.pending.is_empty());
+
+        set_text(h, 204, &actual);
+        set_text(h, 201, "launcher.exe");
+        app.ui_action(113).unwrap();
+        set_text(h, 201, "another-launcher.exe");
+        app.ui_action(113).unwrap();
+        assert_eq!(app.config.rules[index].process_path, actual);
+        app.apply_config_change(saved, RuleChange::Delete(index))
+            .unwrap();
+        app.fill_rule(None);
+        alias
+    }
+
+    unsafe fn startup_query_regression(f: &mut Fixture, process_path: String) {
         let app = &mut f.app;
         let saved = app.config.clone();
         ShowWindow(f.external, SW_SHOWNOACTIVATE);
-        let identity = process(f.external).unwrap();
         let rule = SummonRule {
             name: "Pending fixture".into(),
             enabled: false,
             executable: "unused.exe".into(),
             arguments: String::new(),
             working_directory: String::new(),
-            process_path: identity.2,
+            process_path,
             class: class(f.external),
             title: title(f.external),
             hotkey: Hotkey::new(3, 65),
@@ -3339,7 +3456,9 @@ mod capture_tests {
             selection_idle_regression(&mut f);
             summon_target_survives_settings_save(&mut f);
             multiple_hidden_targets_survive_rule_edits_and_deletion(&mut f);
-            startup_query_regression(&mut f);
+            let alias = junction_rule_regression(&mut f);
+            startup_query_regression(&mut f, alias);
+            std::fs::remove_dir(f.app.dir.join("current")).unwrap();
             let external = f.external;
             let app = &mut f.app;
             let h = app.ui.as_ref().unwrap().window;

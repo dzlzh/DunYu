@@ -15,6 +15,7 @@ mod scroll_ui;
 mod swim;
 mod theme;
 mod ui;
+use dunyu::window_search::ProcessPaths;
 use dunyu::*;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -166,6 +167,7 @@ struct Ui {
     split_ratio: f64,
     dragging: bool,
     baseline: Vec<String>,
+    default_process_path: Option<String>,
     list: HWND,
     selected: Option<usize>,
     target: Option<Token>,
@@ -427,13 +429,13 @@ impl App {
     }
     unsafe fn find(&self, i: usize) -> Option<HWND> {
         let r = &self.config.rules[i];
+        let mut paths = ProcessPaths::default();
         let foreground = GetForegroundWindow();
         let mut candidates = windows();
         candidates.sort_by_key(|h| *h != foreground as usize);
-        candidates
-            .into_iter()
-            .map(handle)
-            .find(|h| process(*h).is_some_and(|(_, _, p)| matches(r, &p, &class(*h), &title(*h))))
+        candidates.into_iter().map(handle).find(|h| {
+            process(*h).is_some_and(|(_, _, p)| paths.matches(r, &p, &class(*h), &title(*h)))
+        })
     }
     unsafe fn summon(&mut self, i: usize) -> Result<(), String> {
         if self.pending.iter().any(|p| p.rule == i) {
@@ -638,6 +640,7 @@ impl App {
         ui::resident_diagnostics::count(6);
         let ids: Vec<_> = self.pending.iter().map(|p| p.rule).collect();
         let mut scan = (ids.len() > 1).then(|| dunyu::window_search::Scan::new(windows()));
+        let mut paths = ProcessPaths::default();
         for i in ids {
             let found = if let Some(scan) = &mut scan {
                 let rule = &self.config.rules[i];
@@ -648,7 +651,7 @@ impl App {
                         process(h).map(|identity| (identity, class(h), title(h)))
                     },
                     |hwnd, ((pid, created, path), cls, caption)| {
-                        if !matches(rule, path, cls, caption) {
+                        if !paths.matches(rule, path, cls, caption) {
                             return false;
                         }
                         let h = handle(hwnd);
@@ -657,7 +660,7 @@ impl App {
                             && process(h).is_some_and(|(p, c, path)| {
                                 p == *pid
                                     && c == *created
-                                    && matches(rule, &path, &class(h), &title(h))
+                                    && paths.matches(rule, &path, &class(h), &title(h))
                             })
                     },
                 )
